@@ -25,9 +25,7 @@ GUILD_ID = os.getenv("GUILD_ID", "0")
 # Review this list for the new server!
 ADMIN_IDS = [
     790588177240555561,
-    210551397278679050,  # Joker
-    724281461053849641,  # Zem
-    200759921912840193,  # Rhythm
+    1416546676189167796,  # Pao
 ]
 
 # ==================== PORTS & SERVICES ====================
