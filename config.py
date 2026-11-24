@@ -47,11 +47,11 @@ DASHBOARD_SERVICE = os.getenv("DASHBOARD_SERVICE", "idvdashboard")  # env
 CURRENCIES = {
     "main": {
         "name": "Clues",
-        "emoji": "🔍",
+        "emoji": "<:clues:1574857663613903061>",
     },
     "premium": {
-        "name": "Echoes",   # <- or "Fragments", decide here; nothing else needs to change
-        "emoji": "💠",
+        "name": "Echoes",   
+        "emoji": "<:echoes:1574854253816582257>",
     },
 }
 
@@ -78,14 +78,14 @@ MATCH_REWARDS = {
 # Result line shown in the /match embed
 MATCH_RESULT_TEXT = {
     "Hunter": {
-        0: "0 Eliminations (Total Defeat)",
+        0: "0 Eliminations (Defeat)",
         1: "1 Elimination",
         2: "2 Eliminations (Draw)",
         3: "3 Eliminations",
-        4: "4 Eliminations (Perfect Victory!)",
+        4: "4 Eliminations (Perfect Victory)",
     },
     "Survivor": {
-        0: "0 Survivors Escaped (Total Defeat)",
+        0: "0 Survivors Escaped (Defeat)",
         1: "1 Survivor Escaped",
         2: "2 Survivors Escaped (Draw)",
         3: "3 Survivors Escaped",
