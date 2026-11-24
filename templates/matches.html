@@ -1,0 +1,132 @@
+{% extends "base.html" %}
+
+{% block title %}Match Messages{% endblock %}
+
+{% block content %}
+{% set level_names = {0: 'Total Defeat', 1: 'Poor', 2: 'Draw', 3: 'Good', 4: 'Perfect'} %}
+<h1><i class="bi bi-trophy-fill"></i> Match Messages</h1>
+<p class="lead">The story text <code>/match</code> shows. Each match rolls a result from 0 to 4 and picks a random message for the character's role and that result.</p>
+
+<div class="card mb-4">
+    <div class="card-header">
+        <i class="bi bi-plus-circle"></i> Add New Match Message
+    </div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('add_match_message') }}">
+            <div class="row g-3">
+                <div class="col-md-2">
+                    <select name="role" class="form-select" required>
+                        <option value="">Role...</option>
+                        {% for role in roles %}
+                        <option value="{{ role }}">{{ role }}</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <select name="performance_level" class="form-select" required>
+                        <option value="">Result...</option>
+                        {% for level, label in level_names.items() %}
+                        <option value="{{ level }}">{{ level }} ({{ label }})</option>
+                        {% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-6">
+                    <textarea name="message" class="form-control" placeholder="What happened in the match..." rows="2" required></textarea>
+                </div>
+                <div class="col-md-2">
+                    <button type="submit" class="btn btn-primary w-100 h-100">
+                        <i class="bi bi-plus"></i> Add
+                    </button>
+                </div>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="row">
+    {% for role in roles %}
+    <div class="col-md-6">
+        <div class="card mb-3">
+            <div class="card-header">
+                <i class="bi {{ 'bi-crosshair' if loop.first else 'bi-person-walking' }}"></i> {{ role }} Messages
+            </div>
+            <div class="card-body">
+                <div class="table-responsive">
+                    <table class="table table-dark table-sm">
+                        <thead>
+                            <tr>
+                                <th>Result</th>
+                                <th>Message</th>
+                                <th class="text-end">Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for msg in messages if msg[1] == role %}
+                            <tr>
+                                <td><span class="badge bg-warning text-dark" title="{{ result_text.get(role, {}).get(msg[2], '') }}">{{ msg[2] }}</span></td>
+                                <td>{{ msg[3] }}</td>
+                                <td class="text-end text-nowrap">
+                                    <button class="btn btn-sm btn-warning" data-bs-toggle="modal" data-bs-target="#editModal{{ msg[0] }}" title="Edit">
+                                        <i class="bi bi-pencil"></i>
+                                    </button>
+                                    <form method="POST" action="{{ url_for('delete_match_message', message_id=msg[0]) }}" style="display:inline;" onsubmit="return confirm('Delete this message?');">
+                                        <button type="submit" class="btn btn-sm btn-danger" title="Delete">
+                                            <i class="bi bi-trash"></i>
+                                        </button>
+                                    </form>
+                                </td>
+                            </tr>
+                            {% else %}
+                            <tr><td colspan="3" class="text-muted">No messages yet. The bot will use a generic line instead.</td></tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+</div>
+
+<!-- Edit Modals -->
+{% for msg in messages %}
+<div class="modal fade" id="editModal{{ msg[0] }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Edit Match Message</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" action="{{ url_for('edit_match_message', message_id=msg[0]) }}">
+                <div class="modal-body">
+                    <div class="mb-3">
+                        <label class="form-label">Role</label>
+                        <select name="role" class="form-select" required>
+                            {% for role in roles %}
+                            <option value="{{ role }}" {% if msg[1] == role %}selected{% endif %}>{{ role }}</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Result</label>
+                        <select name="performance_level" class="form-select" required>
+                            {% for level, label in level_names.items() %}
+                            <option value="{{ level }}" {% if msg[2] == level %}selected{% endif %}>{{ level }} ({{ label }})</option>
+                            {% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Message</label>
+                        <textarea name="message" class="form-control" rows="3" required>{{ msg[3] }}</textarea>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endfor %}
+{% endblock %}

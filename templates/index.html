@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+
+{% block title %}Home{% endblock %}
+
+{% block content %}
+<div class="text-center mb-5">
+    <h1 class="display-4">{{ bot_name }}</h1>
+    <p class="lead">Everything the bot uses can be managed here. Changes apply in Discord immediately.</p>
+    <form action="{{ url_for('admin_update') }}" method="POST" class="mt-3" onsubmit="return confirm('Pull the latest code from GitHub and restart the bot?');">
+        <button type="submit" class="btn btn-primary">
+            <i class="bi bi-arrow-repeat"></i> Pull Updates &amp; Restart
+        </button>
+    </form>
+</div>
+
+<div class="row g-4">
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-people-fill dashboard-icon"></i>
+                <h3 class="mt-3">Profiles</h3>
+                <p>All characters with their {{ currencies['main']['name'] }}, {{ currencies['premium']['name'] }} and levels</p>
+                <a href="{{ url_for('profiles') }}" class="btn btn-primary">View Profiles</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-person-lines-fill dashboard-icon"></i>
+                <h3 class="mt-3">Roster</h3>
+                <p>Who plays which character, reservations, and the roster layout</p>
+                <a href="{{ url_for('roster') }}" class="btn btn-primary">Manage Roster</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-geo-alt-fill dashboard-icon"></i>
+                <h3 class="mt-3">Locations</h3>
+                <p>Places characters can travel to with <code>/location</code></p>
+                <a href="{{ url_for('locations') }}" class="btn btn-primary">Manage Locations</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-shop dashboard-icon"></i>
+                <h3 class="mt-3">Shop</h3>
+                <p>Items, prices and currencies for <code>/buy</code></p>
+                <a href="{{ url_for('shop') }}" class="btn btn-primary">Manage Shop</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-trophy-fill dashboard-icon"></i>
+                <h3 class="mt-3">Match Messages</h3>
+                <p>{{ roles|join(' and ') }} stories for <code>/match</code></p>
+                <a href="{{ url_for('matches') }}" class="btn btn-primary">Manage Matches</a>
+            </div>
+        </div>
+    </div>
+
+    {% for game, cfg in minigames.items() %}
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi {{ cfg.dashboard_icon }} dashboard-icon"></i>
+                <h3 class="mt-3">{{ cfg.label }}</h3>
+                <p>What characters can find with <code>/{{ game }}</code></p>
+                <a href="{{ url_for('minigame', game=game) }}" class="btn btn-primary">Manage {{ cfg.label }}</a>
+            </div>
+        </div>
+    </div>
+    {% endfor %}
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-clipboard-check dashboard-icon"></i>
+                <h3 class="mt-3">Activity Check</h3>
+                <p>Track monthly muse activity</p>
+                <a href="{{ url_for('activity_check') }}" class="btn btn-primary">Open Activity Check</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-chat-square-text dashboard-icon"></i>
+                <h3 class="mt-3">Embeds</h3>
+                <p>Custom embeds and the welcome message</p>
+                <a href="{{ url_for('embeds') }}" class="btn btn-primary">Manage Embeds</a>
+            </div>
+        </div>
+    </div>
+
+    <div class="col-md-4">
+        <div class="card stat-card">
+            <div class="card-body">
+                <i class="bi bi-emoji-smile dashboard-icon"></i>
+                <h3 class="mt-3">Reaction Roles</h3>
+                <p>Let members pick roles by reacting with an emoji</p>
+                <a href="{{ url_for('reaction_roles') }}" class="btn btn-primary">Manage Reaction Roles</a>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mt-5">
+    <div class="card-header">
+        Quick Info
+    </div>
+    <div class="card-body">
+        <h5>Welcome to the {{ bot_name }} Dashboard!</h5>
+        <ul>
+            <li><strong>Profiles:</strong> See every character and delete ones that are no longer needed</li>
+            <li><strong>Locations:</strong> Add, rename or remove the places <code>/location</code> can send characters to</li>
+            <li><strong>Shop:</strong> Set what can be bought, for how much and in which currency</li>
+            <li><strong>Match Messages:</strong> Write the {{ roles|join(' and ') }} stories for each match result (0–4)</li>
+            {% for game, cfg in minigames.items() %}
+            <li><strong>{{ cfg.label }}:</strong> Configure what can be found, how rare it is and how hard it is to get</li>
+            {% endfor %}
+            <li><strong>Roster:</strong> Who plays which character, reservations and their end dates, and how the roster looks in Discord</li>
+            <li><strong>Activity Check:</strong> Track monthly muse activity and flag inactive characters</li>
+            <li><strong>Embeds:</strong> Create and send custom embeds, and choose the welcome message</li>
+            <li><strong>Reaction Roles:</strong> Set up automatic role assignment via emoji reactions</li>
+        </ul>
+        <p class="mb-0 text-muted">Names, currencies, emojis and rewards that aren't on these pages are set in <code>config.py</code>.</p>
+    </div>
+</div>
+{% endblock %}

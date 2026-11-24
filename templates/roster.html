@@ -1,0 +1,378 @@
+{% extends "base.html" %}
+
+{% block title %}Roster{% endblock %}
+
+{% block content %}
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+    <div>
+        <h1 class="mb-1"><i class="bi bi-person-lines-fill"></i> Roster</h1>
+        <p class="text-muted mb-0">Who plays which character. Changes here update the roster messages in Discord automatically.</p>
+    </div>
+    <div class="d-flex gap-2 align-items-center">
+        <span class="badge bg-success fs-6">{{ counts.free }} free</span>
+        <span class="badge bg-warning fs-6">{{ counts.reserved }} reserved</span>
+        <span class="badge bg-danger fs-6">{{ counts.taken }} taken</span>
+        <form method="POST" action="{{ url_for('roster_refresh') }}" class="mb-0">
+            <button class="btn btn-sm btn-outline-light" title="Post / update the roster messages in Discord">
+                <i class="bi bi-arrow-repeat"></i> Update in Discord
+            </button>
+        </form>
+    </div>
+</div>
+
+{% if not roster_channel %}
+<div class="alert alert-warning">
+    <i class="bi bi-exclamation-triangle"></i> No roster channel is set yet, so the roster isn't posted in Discord.
+    Add <code>ROSTER_CHANNEL_ID=...</code> to the <code>.env</code> file and restart the bot and dashboard.
+</div>
+{% endif %}
+
+<div class="row g-3 mb-4">
+    <div class="col-lg-6">
+        <div class="card h-100 mb-0">
+            <div class="card-header"><i class="bi bi-plus-circle"></i> Add Character</div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('add_roster_character') }}">
+                    <div class="row g-2">
+                        <div class="col-md-5"><input type="text" name="name" class="form-control" placeholder="Name, e.g. Norton Campbell" required></div>
+                        <div class="col-md-4"><input type="text" name="title" class="form-control" placeholder="Title (optional)"></div>
+                        <div class="col-md-3">
+                            <select name="role" class="form-select" required>
+                                {% for role in roles %}<option value="{{ role }}">{{ role }}</option>{% endfor %}
+                            </select>
+                        </div>
+                    </div>
+                    <button type="submit" class="btn btn-primary mt-2"><i class="bi bi-plus"></i> Add</button>
+                </form>
+            </div>
+        </div>
+    </div>
+    <div class="col-lg-6">
+        <div class="card h-100 mb-0">
+            <div class="card-header"><i class="bi bi-person-x"></i> Player Left or Dropped Everything</div>
+            <div class="card-body">
+                <form method="POST" action="{{ url_for('roster_release_player') }}"
+                      onsubmit="return confirm('Free ALL characters of this player and cancel their reservations?');">
+                    <div class="input-group">
+                        <input type="text" name="player_id" class="form-control" placeholder="Their Discord user ID" required>
+                        <button class="btn btn-danger" type="submit">Release all</button>
+                    </div>
+                    <small class="text-muted">Frees every character of this player and cancels their reservations and requests.</small>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center" role="button"
+         data-bs-toggle="collapse" data-bs-target="#importBox">
+        <span><i class="bi bi-list-columns"></i> Import Many Characters at Once</span>
+        <i class="bi bi-chevron-down"></i>
+    </div>
+    <div class="collapse" id="importBox">
+        <div class="card-body">
+            <form method="POST" action="{{ url_for('import_roster') }}">
+                <p class="text-muted small mb-2">
+                    One character per line as <code>Name | Title</code> or just <code>Name</code>.
+                    You can also paste lines straight from an old roster message, since the <code>﹕﹒</code> and everything after <code>―</code> are ignored.
+                    Characters that already exist are skipped.
+                </p>
+                <textarea name="lines" class="form-control mb-2" rows="8" placeholder="Norton Campbell | The Prospector&#10;Emma Woods | The Gardener" required></textarea>
+                <div class="d-flex gap-2">
+                    <select name="role" class="form-select" style="max-width:200px;" required>
+                        <option value="">Add them as...</option>
+                        {% for role in roles %}<option value="{{ role }}">{{ role }}s</option>{% endfor %}
+                    </select>
+                    <button type="submit" class="btn btn-primary"><i class="bi bi-upload"></i> Import</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center" role="button"
+         data-bs-toggle="collapse" data-bs-target="#layoutBox">
+        <span><i class="bi bi-palette"></i> Roster Layout in Discord</span>
+        <i class="bi bi-chevron-down"></i>
+    </div>
+    <div class="collapse" id="layoutBox">
+        <div class="card-body">
+            <div class="row g-4">
+                <div class="col-lg-6">
+                    <form method="POST" action="{{ url_for('roster_layout') }}">
+                        <label class="form-label fw-bold">Show the roster as</label>
+                        <div class="mb-3">
+                            <div class="form-check form-check-inline">
+                                <input class="form-check-input" type="radio" name="style" id="styleEmbed" value="embed" {% if layout['style'] == 'embed' %}checked{% endif %}>
+                                <label class="form-check-label" for="styleEmbed">Embed</label>
+                            </div>
+                            <div class="form-check form-check-inline">
+                                <input class="form-check-input" type="radio" name="style" id="styleMessage" value="message" {% if layout['style'] == 'message' %}checked{% endif %}>
+                                <label class="form-check-label" for="styleMessage">Plain message</label>
+                            </div>
+                        </div>
+
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Line per character</label>
+                            <input type="text" name="line_format" class="form-control" value="{{ layout['line_format'] }}" required>
+                            <small class="text-muted">
+                                <code>{character}</code> = Name | Title &nbsp;·&nbsp; <code>{name}</code> = only the name &nbsp;·&nbsp;
+                                <code>{title}</code> = only the title &nbsp;·&nbsp; <code>{player}</code> = the player (empty if free)
+                            </small>
+                        </div>
+                        <div class="row g-2 mb-3">
+                            <div class="col-md-6">
+                                <label class="form-label fw-bold">Added to reserved characters</label>
+                                <input type="text" name="reserved_suffix" class="form-control" value="{{ layout['reserved_suffix'] }}">
+                            </div>
+                            <div class="col-md-6">
+                                <label class="form-label fw-bold">Text when a list is empty</label>
+                                <input type="text" name="empty_text" class="form-control" value="{{ layout['empty_text'] }}">
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="alternate_indent" id="altIndent" {% if layout['alternate_indent'] == '1' %}checked{% endif %}>
+                                <label class="form-check-label" for="altIndent">Indent every second line</label>
+                            </div>
+                            <div class="form-check">
+                                <input class="form-check-input" type="checkbox" name="blank_lines" id="blankLines" {% if layout['blank_lines'] == '1' %}checked{% endif %}>
+                                <label class="form-check-label" for="blankLines">Empty line between characters</label>
+                            </div>
+                        </div>
+
+                        <ul class="nav nav-tabs mb-3" role="tablist">
+                            {% for role in roles %}
+                            <li class="nav-item"><button class="nav-link {% if loop.first %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#layout-{{ role }}" type="button">{{ role }}s</button></li>
+                            {% endfor %}
+                        </ul>
+                        <div class="tab-content">
+                            {% for role in roles %}
+                            <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="layout-{{ role }}">
+                                <div class="row g-2">
+                                    <div class="col-9">
+                                        <label class="form-label">Title</label>
+                                        <input type="text" name="{{ role }}_title" class="form-control" value="{{ layout[role ~ '_title'] }}" maxlength="256">
+                                    </div>
+                                    <div class="col-3">
+                                        <label class="form-label">Color</label>
+                                        <input type="color" name="{{ role }}_color" class="form-control form-control-color w-100" value="{{ layout[role ~ '_color'] or '#000000' }}">
+                                    </div>
+                                    <div class="col-12">
+                                        <label class="form-label">Intro text (above the list)</label>
+                                        <textarea name="{{ role }}_intro" class="form-control" rows="2">{{ layout[role ~ '_intro'] }}</textarea>
+                                    </div>
+                                    <div class="col-12">
+                                        <label class="form-label">Footer (below the list)</label>
+                                        <input type="text" name="{{ role }}_footer" class="form-control" value="{{ layout[role ~ '_footer'] }}" maxlength="2048">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">Thumbnail URL <small class="text-muted">(embed only)</small></label>
+                                        <input type="url" name="{{ role }}_thumbnail" class="form-control" value="{{ layout[role ~ '_thumbnail'] }}">
+                                    </div>
+                                    <div class="col-md-6">
+                                        <label class="form-label">Image URL <small class="text-muted">(embed only)</small></label>
+                                        <input type="url" name="{{ role }}_image" class="form-control" value="{{ layout[role ~ '_image'] }}">
+                                    </div>
+                                </div>
+                            </div>
+                            {% endfor %}
+                        </div>
+                        <button type="submit" class="btn btn-primary mt-3"><i class="bi bi-check-circle"></i> Save &amp; Update in Discord</button>
+                    </form>
+                </div>
+
+                <div class="col-lg-6">
+                    <label class="form-label fw-bold">Preview <small class="text-muted fw-normal">(current saved layout · Discord formatting like **bold** is shown as typed)</small></label>
+                    {% for part in preview %}
+                    <div class="roster-preview mb-3" style="border-left-color: {{ part.color or '#000000' }};">
+                        {% if part.thumbnail %}<img src="{{ part.thumbnail }}" class="roster-thumb" alt="">{% endif %}
+                        {% if part.title %}<div class="fw-bold mb-1">{{ part.title }}</div>{% endif %}
+                        <div class="roster-text">{{ part.text }}</div>
+                        {% if part.image %}<img src="{{ part.image }}" class="img-fluid mt-2 rounded" alt="">{% endif %}
+                        {% if part.footer %}<div class="small text-muted mt-2">{{ part.footer }}</div>{% endif %}
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span><i class="bi bi-list-ul"></i> All Characters</span>
+        <div class="d-flex gap-2 flex-wrap">
+            <select id="filterRole" class="form-select form-select-sm" style="width:auto;">
+                <option value="">All roles</option>
+                {% for role in roles %}<option value="{{ role }}">{{ role }}s</option>{% endfor %}
+            </select>
+            <select id="filterStatus" class="form-select form-select-sm" style="width:auto;">
+                <option value="">All statuses</option>
+                <option value="free">Free</option>
+                <option value="reserved">Reserved</option>
+                <option value="taken">Taken</option>
+            </select>
+            <input type="text" id="rosterSearch" class="form-control form-control-sm" placeholder="Search name, title, player..." style="width:220px;">
+        </div>
+    </div>
+    <div class="card-body p-0">
+        <div class="table-responsive">
+            <table class="table table-dark table-hover table-sm mb-0 align-middle">
+                <thead>
+                    <tr>
+                        <th>Name</th>
+                        <th>Title</th>
+                        <th>Role</th>
+                        <th>Status</th>
+                        <th>Player</th>
+                        <th class="text-end">Actions</th>
+                    </tr>
+                </thead>
+                <tbody id="rosterBody">
+                    {% for c in characters %}
+                    <tr data-role="{{ c.role }}" data-status="{{ c.status }}">
+                        <td>
+                            <strong>{{ c.name }}</strong>
+                            {% if c.linked_id %}<br><small class="text-muted"><i class="bi bi-link-45deg"></i> linked with {{ names.get(c.linked_id, '?') }}</small>{% endif %}
+                        </td>
+                        <td>{{ c.title or '' }}</td>
+                        <td>{{ c.role }}</td>
+                        <td>
+                            {% if c.status == 'free' %}<span class="badge bg-success">Free</span>
+                            {% elif c.status == 'reserved' %}<span class="badge bg-warning">Reserved</span>
+                                {% if end_dates.get(c.id) %}<br><small class="text-muted">until {{ end_dates[c.id] }}</small>{% endif %}
+                            {% else %}<span class="badge bg-danger">Taken</span>{% endif %}
+                        </td>
+                        <td>
+                            {% if c.player_id %}
+                                {{ c.player_name or 'Unknown name' }}<br><small class="text-muted">{{ c.player_id }}</small>
+                            {% else %}<span class="text-muted">—</span>{% endif %}
+                        </td>
+                        <td class="text-end text-nowrap">
+                            {% if c.status != 'taken' %}
+                            <button class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#takenModal{{ c.id }}" title="Submission approved: mark as taken">
+                                <i class="bi bi-check-lg"></i> Taken
+                            </button>
+                            {% endif %}
+                            {% if c.status != 'free' %}
+                            <form method="POST" action="{{ url_for('roster_release', character_id=c.id) }}" style="display:inline;"
+                                  onsubmit="return confirm('Make this character free again? Any reservation for it is cancelled.');">
+                                <button class="btn btn-sm btn-outline-warning" title="Make free again"><i class="bi bi-unlock"></i> Release</button>
+                            </form>
+                            {% endif %}
+                            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#editModal{{ c.id }}" title="Edit"><i class="bi bi-pencil"></i></button>
+                            <form method="POST" action="{{ url_for('roster_delete', character_id=c.id) }}" style="display:inline;"
+                                  onsubmit="return confirm('Remove this character from the roster completely?');">
+                                <button class="btn btn-sm btn-outline-danger" title="Remove from roster"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="6" class="text-muted p-3">No characters yet. Add them above, or import a whole list at once.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+{% for c in characters %}
+<div class="modal fade" id="editModal{{ c.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Edit {{ c.name }}</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" action="{{ url_for('edit_roster_character', character_id=c.id) }}">
+                <div class="modal-body">
+                    <div class="mb-3"><label class="form-label">Name</label><input type="text" name="name" class="form-control" value="{{ c.name }}" required></div>
+                    <div class="mb-3"><label class="form-label">Title</label><input type="text" name="title" class="form-control" value="{{ c.title or '' }}" placeholder="Optional"></div>
+                    <div class="mb-3">
+                        <label class="form-label">Role</label>
+                        <select name="role" class="form-select">
+                            {% for role in roles %}<option value="{{ role }}" {% if c.role == role %}selected{% endif %}>{{ role }}</option>{% endfor %}
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label"><i class="bi bi-link-45deg"></i> Linked identity</label>
+                        <select name="linked_id" class="form-select">
+                            <option value="">— not linked —</option>
+                            {% for other in characters if other.id != c.id %}
+                            <option value="{{ other.id }}" {% if c.linked_id == other.id %}selected{% endif %}>{{ other.display }} ({{ other.role }})</option>
+                            {% endfor %}
+                        </select>
+                        <small class="text-muted">For identity switches (e.g. Prospector ↔ Fool's Gold): linked characters are always reserved, taken and released together.</small>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Save</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
+{% if c.status != 'taken' %}
+<div class="modal fade" id="takenModal{{ c.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">Mark {{ c.name }} as taken</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" action="{{ url_for('roster_mark_taken', character_id=c.id) }}">
+                <div class="modal-body">
+                    {% if c.status == 'reserved' %}
+                    <p>Reserved by <strong>{{ c.player_name or c.player_id }}</strong>. Their reservation ends now, with no expiry ping.</p>
+                    <p class="text-muted small mb-2">Leave the fields empty to give it to them, or fill them in to give it to someone else.</p>
+                    {% else %}
+                    <p class="text-muted small mb-2">This character isn't reserved, so enter who plays them.</p>
+                    {% endif %}
+                    <div class="mb-3">
+                        <label class="form-label">Discord user ID</label>
+                        <input type="text" name="player_id" class="form-control" {% if c.status == 'free' %}required{% endif %} placeholder="e.g. 790588177240555561">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Name (only shown here in the dashboard)</label>
+                        <input type="text" name="player_name" class="form-control" placeholder="e.g. Lark">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-success">Mark as taken</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+{% endif %}
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<style>
+.roster-preview { background:#2b2d31; border-left:4px solid #000; border-radius:4px; padding:10px 12px; overflow:hidden; }
+.roster-text { white-space: pre-wrap; font-size: 0.9rem; max-height: 420px; overflow-y: auto; }
+.roster-thumb { float:right; max-width:64px; max-height:64px; margin-left:8px; border-radius:4px; }
+</style>
+<script>
+function filterRoster() {
+    const role = document.getElementById('filterRole').value;
+    const status = document.getElementById('filterStatus').value;
+    const q = document.getElementById('rosterSearch').value.toLowerCase();
+    document.querySelectorAll('#rosterBody tr[data-role]').forEach(row => {
+        const show = (!role || row.dataset.role === role)
+                  && (!status || row.dataset.status === status)
+                  && (!q || row.innerText.toLowerCase().includes(q));
+        row.style.display = show ? '' : 'none';
+    });
+}
+['filterRole', 'filterStatus'].forEach(id => document.getElementById(id).addEventListener('change', filterRoster));
+document.getElementById('rosterSearch').addEventListener('input', filterRoster);
+</script>
+{% endblock %}
