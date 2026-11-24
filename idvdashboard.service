@@ -1,0 +1,14 @@
+[Unit]
+Description=Identity V Bot Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=jay
+WorkingDirectory=/home/jay/idv
+ExecStart=/home/jay/idv/venv/bin/python dashboard_secure.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

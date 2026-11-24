@@ -1,275 +1,121 @@
-# The Entity
-# 🎮 Dead by Daylight Discord Bot
+# Identity V Discord Bot
 
-A Discord bot with RPG elements based on Dead by Daylight, including a web dashboard for management.
+A Discord roleplay bot themed on Identity V, with a web dashboard for managing its content.
 
-## 📋 Features
+## Features
 
-### Discord Bot
-- ✅ **Character Profiles** - Killer and Survivor roles
-- ✅ **Currency System** - Bloodpoints & Auric Cells
-- ✅ **Inventory System** - Collect and manage items
-- ✅ **Shop System** - Buy items with Bloodpoints
-- ✅ **Trial System** - Earn rewards through trials
-- ✅ **Mini-Games** - Hunting, Fishing, Scavenging
-- ✅ **Utility Commands** - Dice rolls, random choice, travel
+### Discord bot
+- **Characters**: Hunter and Survivor profiles with owners, levels and an inventory
+- **Two currencies**: names and emojis are set in `config.py` (currently Clues and Echoes)
+- **Shop & inventory**: buy, use, sell, value and trade items
+- **Matches**: `/match` for random results with rewards, `/matchreward` for rewards by count
+- **Minigames**: `/scavenging` and `/foraging` with d20 rolls, XP and levels
+- **Utility**: dice rolls, random choice, `/location`, reservations, welcome messages, reaction roles
 
-### Web Dashboard
-- 🌐 **Manage Realms** - Locations for travel command
-- 🛒 **Shop Items** - Adjust prices and descriptions
-- 🏆 **Trial Messages** - Configure Killer/Survivor messages
-- 🎣 **Minigame Loot** - Items for Hunting/Fishing/Scavenging
-- 👥 **Profile Overview** - View all created characters
-- 🔐 **Login System** - Password-protected access
+### Web dashboard
+Manage profiles, locations, the shop, match messages, minigame outcomes, reservations,
+activity checks, embeds, the welcome message and reaction roles.
 
-## 🚀 Installation
-
-### Prerequisites
-- Raspberry Pi (3/4/5) or other Linux server
-- Python 3.8+
-- Discord Bot Token ([Guide](https://discord.com/developers/applications))
-
-### Quick Setup
+## Installation (Raspberry Pi / Linux)
 
 ```bash
-# Clone repository
-git clone https://github.com/YOUR-USERNAME/entity.git
-cd cosmos
+git clone https://github.com/mothsnyx/idv.git ~/idv
+cd ~/idv
 
-# Create virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# Install dependencies
 pip install -r requirements.txt
 
-# Create .env file
 cp .env.example .env
-nano .env  # Insert token
+nano .env          # add DISCORD_TOKEN and the other values
 
-# Start bot
-python main.py
-
-# Start dashboard (in new terminal)
-python dashboard_secure.py
+python main.py               # bot
+python dashboard_secure.py   # dashboard (in a second terminal)
 ```
 
-## ⚙️ Configuration
+On first start the bot creates `game_database.db` with a few `[Placeholder]` entries
+(shop, locations, match messages, minigame outcomes). Replace them in the dashboard.
 
-### Discord Bot Token
+## Configuration
 
-1. Create `.env` file:
-```env
-DISCORD_TOKEN=your-bot-token-here
-DASHBOARD_SECRET=your-secure-random-key
-```
+| What | Where |
+|------|-------|
+| Bot token, secrets, IDs, ports | `.env` (see `.env.example`) |
+| Currency names & emojis, roles, rewards, exchange rates | `config.py` |
+| Minigames (texts, buttons, XP) | `config.py` → `MINIGAMES` |
+| Custom Discord emojis | `config.py` → `EMOJI` (paste e.g. `<:name:123456789>`) |
+| Admin Discord IDs | `config.py` → `ADMIN_IDS` |
+| Shop items, locations, match messages, loot | Dashboard |
+| Dashboard logins | `.env` → `DASHBOARD_USERS=admin:password,mod:password` |
 
-2. **IMPORTANT:** `.env` is in `.gitignore` and will NOT be uploaded!
+To add another minigame, add an entry to `MINIGAMES` in `config.py` and restart both
+services. The slash command, database table and dashboard page are created automatically.
 
-### Dashboard Password
+## Discord commands
 
-Edit `dashboard_secure.py`:
-```python
-users = {
-    "admin": generate_password_hash("YOUR-PASSWORD-HERE"),
-}
-```
+| Area | Commands |
+|------|----------|
+| Profiles | `/create`, `/profile`, `/list`, `/editname`, `/editrole`, `/deleteprofile`, `/claim` |
+| Currency | `/givecurrency`, `/exchange` (admins: `/addcurrency`, `/removecurrency`) |
+| Items | `/shop`, `/buy`, `/additem`, `/removeitem`, `/use`, `/giveitem`, `/value`, `/sell` |
+| Gameplay | `/match`, `/matchreward`, `/scavenging`, `/foraging`, `/location` |
+| Utility | `/roll`, `/choose`, `/help` |
+| Reservations | `/reserve`, `/myreservations`, `/reservations` |
+| Staff | `/approvecharacter`, `/releasecharacter` (and the buttons on requests) |
+| Admin | `/addcurrency`, `/removecurrency`, `/assignowner`, `/cancelreservation`, `/restart`, `/testwelcome` |
 
-## 📱 Discord Commands
+Items accept quantities: `/buy name:Norton items:Lantern:2, Bandage`.
 
-### Profile Management
-- `/create [name] [role]` - Create profile (Role: Killer or Survivor)
-- `/editname [name] [new_name]` - Change name
-- `/editrole [name] [new_role]` - Change role
-- `/deleteprofile [name]` - Delete profile
-- `/profile [name]` - View profile
+## Roster & reservations
 
-### Currency
-- `/addcurrency [name] [currency] [amount]` - Add currency (Bloodpoints/Auric Cells)
-- `/removecurrency [name] [currency] [amount]` - Remove currency
+1. A member uses `/reserve` in the reserve channel (autocomplete shows only free characters).
+2. The request appears in the staff channel with **Approve**, **Approve (custom length)** and **Deny**.
+3. On approval the member is pinged with the expiry date, and the character shows as *(reserved)* on the roster.
+4. 24 hours before the end, the member gets a reminder with an **Extend** button (which asks staff again).
+5. When the submission is accepted, staff run `/approvecharacter` (or click **Taken** in the dashboard):
+   the character becomes taken and the reservation ends without an expiry ping.
+6. If the reservation runs out instead, the member is pinged and the character is free again.
 
-### Inventory & Shop
-- `/additem [name] [item]` - Add item
-- `/removeitem [name] [item]` - Remove item
-- `/buy [name] [item]` - Buy item
+If someone with characters leaves the server, staff get an alert with a **Release all** button.
+The roster messages in `ROSTER_CHANNEL_ID` (a forum post works) are kept up to date automatically.
+Their look (embed or plain message, titles, colors, line format, ...) is set on the dashboard
+under **Roster → Roster Layout in Discord**.
 
-### Gameplay
-- `/trial [name]` - Complete trial (Earn rewards!)
-- `/hunting [name]` - Go hunting
-- `/fishing [name]` - Go fishing
-- `/scavenging [name]` - Go scavenging
-- `/travel [name]` - Travel to random realm
-
-### Utility
-- `/roll [dice]` - Roll dice (e.g. 1d20, 2d6)
-- `/choose [options]` - Random choice (comma separated)
-
-## 🌐 Dashboard
-
-### Access
-
-**Local:**
-```
-http://localhost:5000
-```
-
-**On Network:**
-```
-http://RASPBERRY-PI-IP:5000
-```
-
-### Default Login
-- Username: `admin`
-- Password: (see `dashboard_secure.py`)
-
-## 🔧 Systemd Services (Optional)
-
-For automatic startup on boot:
+## Running as a service
 
 ```bash
-# Setup services
-sudo cp systemd/discord-bot.service /etc/systemd/system/
-sudo cp systemd/discord-dashboard.service /etc/systemd/system/
+sudo cp idvbot.service idvdashboard.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now idvbot idvdashboard
 
-# Enable services
-sudo systemctl enable discord-bot
-sudo systemctl enable discord-dashboard
-
-# Start services
-sudo systemctl start discord-bot
-sudo systemctl start discord-dashboard
+sudo journalctl -u idvbot -f    # logs
 ```
 
-## 💾 Backup
+The service files assume the bot lives in `/home/jay/idv`. Adjust `WorkingDirectory`
+and `ExecStart` if it doesn't.
 
-### Automatic Backup
+The dashboard's **Pull Updates & Restart** button runs `git pull` and restarts the
+services with `sudo systemctl`, so the user needs passwordless sudo for those two commands.
 
-```bash
-# Make backup script executable
-chmod +x backup-bot.sh
+### Running next to the old bot
 
-# Setup cronjob (daily at 3 AM)
-crontab -e
-# Add: 0 3 * * * /path/to/backup-bot.sh
-```
+This bot uses ports 5010 (dashboard) and 5012 (internal API), so it runs next to the
+old bot (5000/5002) without any extra setup. The dashboard is at `http://PI-IP:5010`.
 
-### Manual Backup
+## Backup
 
 ```bash
 cp game_database.db game_database_backup_$(date +%Y%m%d).db
 ```
 
-## 🗄️ Database
+## Security notes
 
-- **Engine:** SQLite
-- **File:** `game_database.db`
-- **Capacity:** Up to 1000+ users easily
-- **ACID-compliant:** Data preserved during power outages
-
-### Reset Database
-
-```bash
-# WARNING: Deletes all data!
-rm game_database.db
-python main.py  # Creates new empty DB
-```
-
-## 📊 Technology Stack
-
-- **Bot:** Discord.py 2.3+
-- **Web Framework:** Flask 3.0+
-- **Database:** SQLite3
-- **Auth:** Flask-HTTPAuth
-- **Frontend:** Bootstrap 5 + Bootstrap Icons
-
-## 🔒 Security
-
-### Important Notes
-
-- ⚠️ **NEVER** push Discord token!
-- ⚠️ **NEVER** commit passwords in code!
-- ✅ `.env` is in `.gitignore` → safe
-- ✅ Dashboard has login protection
-- ✅ Passwords are hashed
-
-### .gitignore Entries
-
-```gitignore
-.env
-*.db
-__pycache__/
-venv/
-*.pyc
-```
-
-## 🐛 Troubleshooting
-
-### Bot won't start
-```bash
-# Check logs
-python main.py
-# Check .env token
-```
-
-### Commands don't appear
-- Wait 1 hour (Discord sync)
-- Or use guild-specific commands (see code comments)
-
-### Dashboard not accessible
-```bash
-# Check if port 5000 is free
-sudo netstat -tulpn | grep 5000
-
-# Allow port in firewall
-sudo ufw allow 5000
-```
-
-## 📈 Performance
-
-### Tested for:
-- ✅ 1-50 users: Perfect
-- ✅ 50-100 users: Very good
-- ✅ 100-500 users: Good
-- ⚠️ 500+ users: PostgreSQL migration recommended
-
-### Resources (Raspberry Pi 4)
-- **RAM:** ~100-200 MB
-- **CPU:** < 5% idle
-- **Disk:** ~50 MB + database (~1 MB per 100 users)
-
-## 🤝 Contributing
-
-As this is a private project:
-- Fork the repo
-- Create feature branch
-- Commit your changes
-- Push and create pull request
-
-## 📝 License
-
-Private project - All rights reserved.
-
-Dead by Daylight™ is a trademark of Behaviour Interactive Inc.
-
-## 🆘 Support
-
-If you have issues:
-1. Check logs: `sudo journalctl -u discord-bot -f`
-2. Verify `.env` configuration
-3. See Troubleshooting section above
-
-## 📚 Documentation
-
-Additional guides:
-- [Raspberry Pi Setup](docs/raspberry-pi-setup.md)
-- [Dashboard Guide](docs/dashboard-guide.md)
-- [Performance Guide](docs/performance-guide.md)
-
-## ✨ Credits
-
-Created with ❤️ for the DBD community
+- `.env` and `*.db` are in `.gitignore` and never committed.
+- The bot's internal API only listens on `127.0.0.1`, so only the dashboard can reach it.
+- Dashboard logins live only in `.env`. Without `DASHBOARD_USERS` nobody can log in.
+- When exposing the dashboard (e.g. with ngrok), add ngrok's own login in front:
+  `ngrok http 5010 --basic-auth "user:password"`.
 
 ---
 
-**Version:** 1.0.0  
-**Last Update:** January 2026
+Identity V is a trademark of NetEase Games. This is an unofficial fan project.

@@ -1,1957 +1,1388 @@
+import asyncio
+import io
+import itertools
+import os
+import random
+import re
+import threading
+
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
-from discord.ui import View, Button
-import random
-import itertools
-import re
-from database import Database, ADMIN_IDS
-import os
-from dotenv import load_dotenv
 from flask import Flask, request, jsonify
-import threading
 
-# Bot Setup
+import config
+import roster_format
+from config import EMOJI, CURRENCIES, MINIGAMES, currency_label
+from database import Database, ADMIN_IDS
+
+# ==================== SETUP ====================
+
+COLOR_DEFAULT = discord.Color.from_rgb(*config.COLOR_DEFAULT)
+COLOR_ERROR = discord.Color.from_rgb(*config.COLOR_ERROR)
+MAX_ITEM_QUANTITY = 1000  # per item per command, protects against "Item:9999999"
+
 intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True  # Required to detect member joins!
-intents.guilds = True  # Required for guild information
-intents.guild_reactions = True  # Required for reaction events!
-bot = commands.Bot(command_prefix="!", intents=intents)
+intents.members = True           # member joins (welcome message)
+intents.guilds = True
+intents.guild_reactions = True   # reaction roles
+
+
+class GameBot(commands.Bot):
+    async def setup_hook(self):
+        # Runs once per process (on_ready can fire again after every reconnect,
+        # which used to re-sync commands and crash on "task already launched").
+        self.roster_lock = asyncio.Lock()
+        # Buttons on request/reminder/leave messages keep working after a restart
+        self.add_dynamic_items(ReservationButton, ReleasePlayerButton)
+        try:
+            synced = await self.tree.sync()
+            print(f"Synced {len(synced)} command(s)")
+        except Exception as e:
+            print(f"Failed to sync commands: {e}")
+        rotate_status.start()
+        daily_checkpoint.start()
+        check_reservations.start()
+
+
+# Slash commands only; a prefix is required by discord.py but no prefix commands exist
+bot = GameBot(command_prefix=commands.when_mentioned, intents=intents)
 db = Database()
+api = Flask(__name__)  # internal API used by the dashboard
 
-# Flask API for dashboard communication
-api = Flask(__name__)
+CURRENCY_CHOICES = [app_commands.Choice(name=c["name"], value=key) for key, c in CURRENCIES.items()]
+ROLE_CHOICES = [app_commands.Choice(name=r, value=r) for r in config.ROLES]
 
-# Profile Commands
+
+# ==================== HELPERS ====================
+
+def error_embed(description, title="Error!"):
+    return discord.Embed(title=f"{EMOJI['error']} ┃ {title}", description=description, color=COLOR_ERROR)
+
+
+def success_embed(title, description=None):
+    return discord.Embed(title=f"{EMOJI['success']} ┃ {title}", description=description, color=COLOR_DEFAULT)
+
+
+def amount_text(key, amount):
+    """'🔍 **1,000** Clues'"""
+    c = CURRENCIES[key]
+    return f"{c['emoji']} **{amount:,}** {c['name']}"
+
+
+async def require_owner(interaction, name):
+    """Send 'Access Denied' and return False if the user doesn't own the character."""
+    is_owner, msg = db.check_ownership(name, interaction.user.id)
+    if not is_owner:
+        await interaction.response.send_message(embed=error_embed(msg, "Access Denied!"), ephemeral=True)
+    return is_owner
+
+
+async def require_admin(interaction):
+    if interaction.user.id in ADMIN_IDS:
+        return True
+    await interaction.response.send_message(
+        embed=error_embed("❌ Only admins can use this command!", "Access Denied!"), ephemeral=True)
+    return False
+
+
+def parse_item_quantities(text):
+    """'Item:3, Other Item' -> ({'Item': 3, 'Other Item': 1}, None) or (None, error message).
+
+    The same item typed twice (any capitalisation) is merged.
+    """
+    quantities, spelling = {}, {}
+    for entry in text.split(','):
+        entry = entry.strip()
+        if not entry:
+            continue
+        if ':' in entry:
+            item_name, _, qty_text = entry.rpartition(':')
+            item_name = item_name.strip()
+            try:
+                qty = int(qty_text.strip())
+            except ValueError:
+                return None, f"Invalid quantity for **{item_name}**! Use format: Item:Number (e.g., Lantern:3)"
+            if qty < 1:
+                return None, f"Quantity must be at least 1 for **{item_name}**!"
+        else:
+            item_name, qty = entry, 1
+        if not item_name:
+            return None, "An item name is missing! Use format: Item:Number (e.g., Lantern:3)"
+        key = spelling.setdefault(item_name.lower(), item_name)
+        quantities[key] = quantities.get(key, 0) + qty
+        if quantities[key] > MAX_ITEM_QUANTITY:
+            return None, f"You can only handle up to {MAX_ITEM_QUANTITY:,} of **{key}** at once!"
+    if not quantities:
+        return None, "Please name at least one item!"
+    return quantities, None
+
+
+def format_items(item_quantities):
+    """{'A': 2, 'B': 1} -> '**A** x2, **B**'"""
+    return ", ".join(f"**{name}** x{qty}" if qty > 1 else f"**{name}**" for name, qty in item_quantities.items())
+
+
+async def resolve_channel(channel_id):
+    """Find a channel, thread or forum post by ID (also archived/uncached ones)."""
+    channel = bot.get_channel(channel_id)
+    if channel:
+        return channel
+    for guild in bot.guilds:
+        thread = guild.get_thread(channel_id)
+        if thread:
+            return thread
+    try:
+        return await bot.fetch_channel(channel_id)
+    except discord.DiscordException:
+        return None
+
+
+# ==================== PROFILE COMMANDS ====================
+
 @bot.tree.command(name="create", description="Create a character profile")
-@app_commands.describe(
-    name="Character name",
-    role="Character role (Killer or Survivor)"
-)
-@app_commands.choices(role=[
-    app_commands.Choice(name="Killer", value="Killer"),
-    app_commands.Choice(name="Survivor", value="Survivor")
-])
+@app_commands.describe(name="Character name", role="Character role")
+@app_commands.choices(role=ROLE_CHOICES)
 async def create_profile(interaction: discord.Interaction, name: str, role: app_commands.Choice[str]):
     success, message = db.create_profile(name, role.value, interaction.user.id)
     if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Profile Created!",
-            description=f"Successfully created profile for **{name}** as **{role.value}**!",
-            color=discord.Color.from_rgb(0, 0, 0) 
-        )
+        embed = success_embed("Profile Created!", f"Successfully created profile for **{name}** as **{role.value}**!")
     else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
+        embed = error_embed(message)
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="editname", description="Edit a character's name")
-@app_commands.describe(
-    name="Current character name",
-    new_name="New character name"
-)
+@app_commands.describe(name="Current character name", new_name="New character name")
 async def edit_profile_name(interaction: discord.Interaction, name: str, new_name: str):
+    if not await require_owner(interaction, name):
+        return
     success, message = db.edit_profile_name(name, new_name)
     if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Name updated!",
-            description=f"Successfully renamed **{name}** to **{new_name}**!",
-            color=discord.Color.from_rgb(0, 0, 0) 
-        )
+        embed = success_embed("Name updated!", f"Successfully renamed **{name}** to **{new_name.strip()}**!")
     else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
+        embed = error_embed(message)
     await interaction.response.send_message(embed=embed)
 
+
 @bot.tree.command(name="editrole", description="Edit a character's role")
-@app_commands.describe(
-    name="Character name",
-    new_role="New role (Killer or Survivor)"
-)
-@app_commands.choices(new_role=[
-    app_commands.Choice(name="Killer", value="Killer"),
-    app_commands.Choice(name="Survivor", value="Survivor")
-])
+@app_commands.describe(name="Character name", new_role="New role")
+@app_commands.choices(new_role=ROLE_CHOICES)
 async def edit_profile_role(interaction: discord.Interaction, name: str, new_role: app_commands.Choice[str]):
+    if not await require_owner(interaction, name):
+        return
     success, message = db.edit_profile_role(name, new_role.value)
     if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Role updated!",
-            description=f"Successfully changed **{name}**'s role to **{new_role.value}**!",
-            color=discord.Color.from_rgb(0, 0, 0) 
-        )
+        embed = success_embed("Role updated!", f"Successfully changed **{name}**'s role to **{new_role.value}**!")
     else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
+        embed = error_embed(message)
     await interaction.response.send_message(embed=embed)
+
 
 @bot.tree.command(name="deleteprofile", description="Delete a character profile")
 @app_commands.describe(name="Character name to delete")
 async def delete_profile(interaction: discord.Interaction, name: str):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+    if not await require_owner(interaction, name):
         return
-    
     success, message = db.delete_profile(name)
     if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Profile deleted!",
-            description=f"Successfully deleted profile for **{name}**!",
-            color=discord.Color.from_rgb(0, 0, 0) 
-        )
+        embed = success_embed("Profile deleted!", f"Successfully deleted profile for **{name}**!")
     else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
+        embed = error_embed(message)
     await interaction.response.send_message(embed=embed)
 
-# Profile View with Pages
+
+def _progress_bar(level, xp):
+    xp_needed = level * 100
+    filled = min(10, int(xp / xp_needed * 10)) if xp_needed > 0 else 0
+    return "█" * filled + "░" * (10 - filled)
+
+
 class ProfileView(discord.ui.View):
+    """Profile with 'Main Info' / 'Inventory' pages and an NSFW toggle."""
+
     def __init__(self, profile_data, inventory_data):
         super().__init__(timeout=180)
         self.profile_data = profile_data
         self.inventory_data = inventory_data
         self.current_page = 0
-        self.show_nsfw = False  # NSFW hidden by default
-        
-    @discord.ui.button(label="Main Info", style=discord.ButtonStyle.danger, custom_id="main_info")
+        self.show_nsfw = False
+
+    @discord.ui.button(label="Main Info", style=discord.ButtonStyle.danger)
     async def main_info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 0
-        embed = self.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-    
-    @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary, custom_id="inventory")
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 1
-        embed = self.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-    
-    @discord.ui.button(label="🔞 Show NSFW", style=discord.ButtonStyle.secondary, custom_id="toggle_nsfw")
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="🔞 Show NSFW", style=discord.ButtonStyle.secondary)
     async def toggle_nsfw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.show_nsfw = not self.show_nsfw
-        
-        # Update button label and style
-        if self.show_nsfw:
-            button.label = "👁️ Hide NSFW"
-            button.style = discord.ButtonStyle.danger
-        else:
-            button.label = "🔞 Show NSFW"
-            button.style = discord.ButtonStyle.secondary
-        
-        embed = self.create_embed()
-        await interaction.response.edit_message(embed=embed, view=self)
-    
+        button.label = "👁️ Hide NSFW" if self.show_nsfw else "🔞 Show NSFW"
+        button.style = discord.ButtonStyle.danger if self.show_nsfw else discord.ButtonStyle.secondary
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
     def create_embed(self):
+        p = self.profile_data
         if self.current_page == 0:
-            # Main Info Page
-            embed = discord.Embed(
-                color=discord.Color.from_rgb(0, 0, 0) 
-            )
-            # Profile Name
-            embed.add_field(
-                name=f"<:15824redneonstar:1467170916017639615> ┃ **{self.profile_data['name']}**'s Profile", 
-                value="", 
-                inline=False
-            )
-            # Role
-            embed.add_field(
-                name=".✦ Role:", 
-                value=self.profile_data['role'], 
-                inline=True
-            )
-            
-            # Minigame Levels (compact, all 3 in one field)
-            hunting_lvl = self.profile_data.get('hunting_level', 1)
-            hunting_xp = self.profile_data.get('hunting_xp', 0)
-            fishing_lvl = self.profile_data.get('fishing_level', 1)
-            fishing_xp = self.profile_data.get('fishing_xp', 0)
-            scav_lvl = self.profile_data.get('scavenging_level', 1)
-            scav_xp = self.profile_data.get('scavenging_xp', 0)
-            
-            # Create compact progress bars for each
-            def make_bar(level, xp):
-                xp_needed = level * 100
-                percent = int((xp / xp_needed) * 100) if xp_needed > 0 else 0
-                filled = min(10, int(percent / 10))
-                return "█" * filled + "░" * (10 - filled)
-            
-            levels_text = (
-                f"<:DailyRitualIcon_hunter:1467234763495571477> **Lv.{hunting_lvl}** {make_bar(hunting_lvl, hunting_xp)}\n"
-                f"<:DailyRitualIcon_sacrifice:1467234766053970055> **Lv.{fishing_lvl}** {make_bar(fishing_lvl, fishing_xp)}\n"
-                f"<:DailyRitualIcon_objectives:1467234764795809842> **Lv.{scav_lvl}** {make_bar(scav_lvl, scav_xp)}"
-            )
-            embed.add_field(
-                name=".✦ Levels:", 
-                value=levels_text, 
-                inline=True
-            )
-            
-            # Currency
-            currency_text = (
-                f"<:bp:1467159740797681716> {self.profile_data['bloodpoints']:,} bp\n"
-                f"<:ac:1467159725870154021> {self.profile_data['auric_cells']:,} ac"
-            )
-            embed.add_field(
-                name=".✦ Currency:", 
-                value=currency_text, 
-                inline=True
-            )
+            embed = discord.Embed(color=COLOR_DEFAULT)
+            embed.add_field(name=f"{EMOJI['profile']} ┃ **{p['name']}**'s Profile", value="", inline=False)
+            embed.add_field(name=".✦ Role:", value=p['role'], inline=True)
+            levels_text = "\n".join(
+                f"{cfg['emoji']} **Lv.{p[f'{game}_level']}** {_progress_bar(p[f'{game}_level'], p[f'{game}_xp'])}"
+                for game, cfg in MINIGAMES.items())
+            embed.add_field(name=".✦ Levels:", value=levels_text or "—", inline=True)
+            currency_text = "\n".join(f"{c['emoji']} {p[key]:,} {c['name']}" for key, c in CURRENCIES.items())
+            embed.add_field(name=".✦ Currency:", value=currency_text, inline=True)
             return embed
-            
-        else:
-            # Inventory Page with categories (NO EMOJIS)
-            embed = discord.Embed(
-                title=f"<:15824redneonstar:1467170916017639615> ┃ **{self.profile_data['name']}**'s Inventory",
-                color=discord.Color.from_rgb(0, 0, 0) 
-            )
-            
-            # Check if inventory has any items
-            total_items = 0
-            has_items = False
-            has_nsfw_items = False
-            
-            for category, items in self.inventory_data.items():
-                if items:
-                    has_items = True
-                    total_items += sum(item['quantity'] for item in items)
-                    if category == 'NSFW':
-                        has_nsfw_items = True
-            
-            if has_items:
-                # Add each category as a field
-                for category, items in self.inventory_data.items():
-                    if items:  # Only show categories with items
-                        # Handle NSFW category specially
-                        if category == 'NSFW':
-                            if self.show_nsfw:
-                                # Show NSFW items with spoiler tags
-                                items_list = "\n".join([
-                                    f"||{item['item_name']}|| ― `{item['quantity']}`"
-                                    for item in items
-                                ])
-                                embed.add_field(
-                                    name=f"·········•✦ {category}",
-                                    value=items_list,
-                                    inline=False
-                                )
-                            else:
-                                # Show hidden message
-                                embed.add_field(
-                                    name=f"·········•✦ {category}",
-                                    value=f"*{len(items)} NSFW item(s) hidden. Click '🔞 Show NSFW' to reveal.*",
-                                    inline=False
-                                )
-                        else:
-                            # Regular categories (no spoiler tags)
-                            items_list = "\n".join([
-                                f"{item['item_name']} ― `{item['quantity']}`"
-                                for item in items
-                            ])
-                            embed.add_field(
-                                name=f"·········•✦ {category}",
-                                value=items_list,
-                                inline=False
-                            )
-                
-                # Add total count (removed unique items)
-                embed.set_footer(text=f"Total: {total_items} items")
+
+        embed = discord.Embed(title=f"{EMOJI['profile']} ┃ **{p['name']}**'s Inventory", color=COLOR_DEFAULT)
+        total_items = sum(item['quantity'] for items in self.inventory_data.values() for item in items)
+        if not total_items:
+            embed.description = "*Inventory is empty*\n\nUse `/buy` to purchase items or play minigames to collect loot!"
+            return embed
+        for category, items in self.inventory_data.items():
+            if not items:
+                continue
+            if category == 'NSFW' and not self.show_nsfw:
+                value = f"*{len(items)} NSFW item(s) hidden. Click '🔞 Show NSFW' to reveal.*"
+            elif category == 'NSFW':
+                value = "\n".join(f"||{item['item_name']}|| ― `{item['quantity']}`" for item in items)
             else:
-                embed.description = "*Inventory is empty*\n\nUse `/buy` to purchase items or play minigames to collect loot!"
-            
-            return embed
+                value = "\n".join(f"{item['item_name']} ― `{item['quantity']}`" for item in items)
+            embed.add_field(name=f"·········•✦ {category}", value=value[:1024], inline=False)
+        embed.set_footer(text=f"Total: {total_items} items")
+        return embed
+
 
 @bot.tree.command(name="profile", description="Show a character's profile")
 @app_commands.describe(name="Character name")
 async def show_profile(interaction: discord.Interaction, name: str):
     profile = db.get_profile(name)
-    if profile:
-        inventory = db.get_inventory(name)
-        view = ProfileView(profile, inventory)
-        embed = view.create_embed()
-        await interaction.response.send_message(embed=embed, view=view)
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Profile **{name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)  # #74070E
-        )
-        await interaction.response.send_message(embed=embed)
-
-# Currency Commands
-@bot.tree.command(name="addcurrency", description="Add Bloodpoints or Auric Cells to a character")
-@app_commands.describe(
-    name="Character name",
-    currency="Currency type",
-    amount="Amount to add"
-)
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Bloodpoints", value="bloodpoints"),
-    app_commands.Choice(name="Auric Cells", value="auric_cells")
-])
-async def add_currency(interaction: discord.Interaction, name: str, currency: app_commands.Choice[str], amount: int):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    success, message = db.add_currency(name, currency.value, amount)
-    if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Currency added!",
-            description=f"Added **{amount:,}** {currency.name} to **{name}**!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="trialreward", description="Give trial rewards (Bloodpoints & Auric Cells) based on escapes or deaths")
-@app_commands.describe(
-    name="Character name",
-    count="Number of escapes or deaths (1–8)"
-)
-@app_commands.choices(count=[
-    app_commands.Choice(name="1", value=1),
-    app_commands.Choice(name="2", value=2),
-    app_commands.Choice(name="3", value=3),
-    app_commands.Choice(name="4", value=4),
-    app_commands.Choice(name="5", value=5),
-    app_commands.Choice(name="6", value=6),
-    app_commands.Choice(name="7", value=7),
-    app_commands.Choice(name="8", value=8),
-])
-async def trial_reward(interaction: discord.Interaction, name: str, count: app_commands.Choice[int]):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    bp_reward = count.value * 5000
-    ac_reward = count.value * 1
-
-    success_bp, msg_bp = db.add_currency(name, "bloodpoints", bp_reward)
-    if not success_bp:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=msg_bp,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    success_ac, msg_ac = db.add_currency(name, "auric_cells", ac_reward)
-    if not success_ac:
-        # Rollback bloodpoints
-        db.remove_currency(name, "bloodpoints", bp_reward)
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=msg_ac,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="<a:check:1467157700831088773> ┃ Trial Rewards Granted!",
-        description=f"**{name}** received their trial rewards!",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    embed.add_field(
-        name="Rewards",
-        value=(
-            f"<:bp:1467159740797681716> **{bp_reward:,}** Bloodpoints\n"
-            f"<:ac:1467159725870154021> **{ac_reward}** Auric Cell{'s' if ac_reward > 1 else ''}"
-        ),
-        inline=False
-    )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="removecurrency", description="Remove Bloodpoints or Auric Cells from a character")
-@app_commands.describe(
-    name="Character name",
-    currency="Currency type",
-    amount="Amount to remove"
-)
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Bloodpoints", value="bloodpoints"),
-    app_commands.Choice(name="Auric Cells", value="auric_cells")
-])
-async def remove_currency(interaction: discord.Interaction, name: str, currency: app_commands.Choice[str], amount: int):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    success, message = db.remove_currency(name, currency.value, amount)
-    if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Currency removed!",
-            description=f"Removed **{amount:,}** {currency.name} from **{name}**!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="givecurrency", description="Give Bloodpoints or Auric Cells from your character to another character")
-@app_commands.describe(
-    sender_name="Your character's name",
-    currency="Currency type",
-    amount="Amount to give",
-    receiver_name="The receiver's character name"
-)
-@app_commands.choices(currency=[
-    app_commands.Choice(name="Bloodpoints", value="bloodpoints"),
-    app_commands.Choice(name="Auric Cells", value="auric_cells")
-])
-async def give_currency(interaction: discord.Interaction, sender_name: str, currency: app_commands.Choice[str], amount: int, receiver_name: str):
-    # Check that sender owns their character
-    is_owner, msg = db.check_ownership(sender_name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    if amount <= 0:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description="Amount must be greater than 0!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    # Check receiver exists
-    receiver_profile = db.get_profile(receiver_name)
-    if not receiver_profile:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Receiver character **{receiver_name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    # Remove from sender
-    success, message = db.remove_currency(sender_name, currency.value, amount)
-    if not success:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-
-    # Add to receiver
-    success2, message2 = db.add_currency(receiver_name, currency.value, amount)
-    if not success2:
-        # Rollback: give sender their currency back
-        db.add_currency(sender_name, currency.value, amount)
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Failed to give currency to **{receiver_name}**: {message2}",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-
-    embed = discord.Embed(
-        title="<a:check:1467157700831088773> ┃ Currency Transferred!",
-        description=f"**{sender_name}** gave **{amount:,}** {currency.name} to **{receiver_name}**!",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="exchange", description="Exchange Bloodpoints for Auric Cells or vice versa")
-@app_commands.describe(
-    name="Character name",
-    from_currency="Currency you want to spend",
-    amount="Amount to spend"
-)
-@app_commands.choices(from_currency=[
-    app_commands.Choice(name="Bloodpoints", value="bloodpoints"),
-    app_commands.Choice(name="Auric Cells", value="auric_cells")
-])
-async def exchange_currency(interaction: discord.Interaction, name: str, from_currency: app_commands.Choice[str], amount: int):
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    success, message, received, to_currency = db.exchange_currency(name, from_currency.value, amount)
-    if not success:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    to_emoji = "<:ac:1467159725870154021>" if to_currency == "auric_cells" else "<:bp:1467159740797681716>"
-    to_name = "Auric Cells" if to_currency == "auric_cells" else "Bloodpoints"
-
-    embed = discord.Embed(
-        title="<a:check:1467157700831088773> ┃ Exchange Complete!",
-        description=f"**{name}** exchanged currency!",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    embed.add_field(
-        name="Received",
-        value=f"{to_emoji} **{received:,}** {to_name}",
-        inline=False
-    )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="giveitem", description="Give item(s) from your character to another character")
-@app_commands.describe(
-    sender_name="Your character's name",
-    items="Items with optional quantities (e.g., 'Medkit:3, Flashlight' or just 'Medkit')",
-    receiver_name="The receiver's character name"
-)
-async def give_item(interaction: discord.Interaction, sender_name: str, items: str, receiver_name: str):
-    # Check that sender owns their character
-    is_owner, msg = db.check_ownership(sender_name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    # Check receiver exists
-    receiver_profile = db.get_profile(receiver_name)
-    if not receiver_profile:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Receiver character **{receiver_name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    # Parse items with quantities
-    item_quantities = {}
-    item_list = [item.strip() for item in items.split(',')]
-
-    for item_entry in item_list:
-        if ':' in item_entry:
-            parts = item_entry.split(':')
-            item_name = parts[0].strip()
-            try:
-                quantity = int(parts[1].strip())
-                if quantity < 1:
-                    embed = discord.Embed(
-                        title="<a:error:1467157734817398946> ┃ Error!",
-                        description=f"Quantity must be at least 1 for **{item_name}**!",
-                        color=discord.Color.from_rgb(116, 7, 14)
-                    )
-                    await interaction.response.send_message(embed=embed)
-                    return
-                item_quantities[item_name] = quantity
-            except ValueError:
-                embed = discord.Embed(
-                    title="<a:error:1467157734817398946> ┃ Error!",
-                    description=f"Invalid quantity for **{item_name}**! Use format: Item:Number (e.g., Medkit:3)",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                await interaction.response.send_message(embed=embed)
-                return
-        else:
-            item_quantities[item_entry.strip()] = 1
-
-    # Remove items from sender
-    success, message, items_removed = db.remove_items_with_quantity(sender_name, item_quantities)
-    if not success:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-
-    # Normalise item names before adding to receiver
-    item_quantities = {db.normalise(k): v for k, v in item_quantities.items()}
-    # Add items to receiver
-    success2, message2, items_added = db.add_items_with_quantity(receiver_name, item_quantities)
-    if not success2:
-        # Rollback: return items to sender
-        db.add_items_with_quantity(sender_name, item_quantities)
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Failed to give items to **{receiver_name}**: {message2}",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-
-    # Format display
-    items_display_list = []
-    for item_name, qty in items_removed.items():
-        if qty > 1:
-            items_display_list.append(f"**{item_name}** x{qty}")
-        else:
-            items_display_list.append(f"**{item_name}**")
-    items_display = ", ".join(items_display_list)
-
-    embed = discord.Embed(
-        title="<a:check:1467157700831088773> ┃ Items Transferred!",
-        description=f"**{sender_name}** gave {items_display} to **{receiver_name}**!",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    await interaction.response.send_message(embed=embed)
-
-# Shop Command (NO EMOJIS)
-@bot.tree.command(name="shop", description="View available items for purchase")
-async def shop(interaction: discord.Interaction):
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT item_name, price, description, currency_type FROM shop_items ORDER BY price")
-    items = cursor.fetchall()
-    conn.close()
-    
-    if items:
-        embed = discord.Embed(
-            title="Shop",  # No emoji
-            description="Purchase items with `/buy [name] [item]`",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        items_text = []
-        for item in items:
-            item_name = item[0]
-            price = item[1]
-            description = item[2]
-            # Handle currency_type (might be NULL or not exist in old databases)
-            currency_type = item[3] if len(item) > 3 and item[3] else 'bloodpoints'
-            
-            # Determine currency abbreviation
-            if currency_type == 'auric_cells':
-                currency_abbr = "AC"
-            else:
-                currency_abbr = "BP"
-            
-            items_text.append(f"**{item_name}** - {price:,} {currency_abbr}\n*{description}*")
-        
-        embed.add_field(
-            name="Available Items",  # No emoji
-            value="\n".join(items_text),
-            inline=False
-        )
-    else:
-        embed = discord.Embed(
-            title="Shop",  # No emoji
-            description="No items available.",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-    
-    await interaction.response.send_message(embed=embed)
-
-# Buy Command
-@bot.tree.command(name="buy", description="Purchase items from the shop")
-@app_commands.describe(
-    name="Character name",
-    items="Items with optional quantities (e.g., 'Medkit:3, Flashlight:2' or just 'Medkit, Flashlight')"
-)
-async def buy_item(interaction: discord.Interaction, name: str, items: str):
-    """
-    Buy items with quantity support
-    Format: 
-      - "Medkit:3" = 3 Medkits
-      - "Medkit:3, Flashlight:2" = 3 Medkits and 2 Flashlights
-      - "Medkit, Flashlight" = 1 of each (backward compatible)
-    """
-    await interaction.response.defer()
-
-    # Parse items with quantities
-    item_quantities = {}
-    item_list = [item.strip() for item in items.split(',')]
-    
-    for item_entry in item_list:
-        if ':' in item_entry:
-            # Format: "Item:Quantity"
-            parts = item_entry.split(':')
-            item_name = parts[0].strip()
-            try:
-                quantity = int(parts[1].strip())
-                if quantity < 1:
-                    embed = discord.Embed(
-                        title="<a:error:1467157734817398946> ┃ Error!",
-                        description=f"Quantity must be at least 1 for **{item_name}**!",
-                        color=discord.Color.from_rgb(116, 7, 14)
-                    )
-                    await interaction.followup.send(embed=embed)
-                    return
-                item_quantities[item_name] = quantity
-            except ValueError:
-                embed = discord.Embed(
-                    title="<a:error:1467157734817398946> ┃ Error!",
-                    description=f"Invalid quantity for **{item_name}**! Use format: Item:Number (e.g., Medkit:3)",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                await interaction.followup.send(embed=embed)
-                return
-        else:
-            # No quantity specified, default to 1
-            item_quantities[item_entry.strip()] = 1
-    
-    # Buy items with quantities
-    success, message, total_price, currency_type, items_purchased = db.buy_items_with_quantity(name, item_quantities)
-    
-    if success:
-        # Determine currency display
-        if currency_type == 'auric_cells':
-            currency_name = "Auric Cells"
-            currency_abbr = "AC"
-        else:
-            currency_name = "Bloodpoints"
-            currency_abbr = "BP"
-        
-        # Format items list with quantities
-        items_display_list = []
-        total_items = 0
-        for item_name, qty in items_purchased.items():
-            if qty > 1:
-                items_display_list.append(f"**{item_name}** x{qty}")
-            else:
-                items_display_list.append(f"**{item_name}**")
-            total_items += qty
-        
-        items_display = ", ".join(items_display_list)
-        
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Purchase successful!",
-            description=f"**{name}** purchased {items_display} for **{total_price:,}** {currency_name}!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        if total_items > 1:
-            embed.add_field(
-                name="Total Items",
-                value=f"{total_items} items",
-                inline=True
-            )
-            embed.add_field(
-                name="Total Cost",
-                value=f"{total_price:,} {currency_abbr}",
-                inline=True
-            )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    
-    await interaction.followup.send(embed=embed)
-
-# Inventory Management
-@bot.tree.command(name="additem", description="Add items to a character's inventory")
-@app_commands.describe(
-    name="Character name",
-    items="Items with optional quantities (e.g., 'Medkit:3, Flashlight:2' or just 'Medkit')"
-)
-async def add_item(interaction: discord.Interaction, name: str, items: str):
-    """
-    Add items with quantity support
-    Format: Same as buy command
-    """
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Parse items with quantities
-    item_quantities = {}
-    item_list = [item.strip() for item in items.split(',')]
-    
-    for item_entry in item_list:
-        if ':' in item_entry:
-            parts = item_entry.split(':')
-            item_name = parts[0].strip()
-            try:
-                quantity = int(parts[1].strip())
-                if quantity < 1:
-                    embed = discord.Embed(
-                        title="<a:error:1467157734817398946> ┃ Error!",
-                        description=f"Quantity must be at least 1 for **{item_name}**!",
-                        color=discord.Color.from_rgb(116, 7, 14)
-                    )
-                    await interaction.response.send_message(embed=embed)
-                    return
-                item_quantities[item_name] = quantity
-            except ValueError:
-                embed = discord.Embed(
-                    title="<a:error:1467157734817398946> ┃ Error!",
-                    description=f"Invalid quantity for **{item_name}**! Use format: Item:Number (e.g., Medkit:3)",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                await interaction.response.send_message(embed=embed)
-                return
-        else:
-            item_quantities[item_entry.strip()] = 1
-    
-    # Normalise item names to Title Case before adding
-    item_quantities = {db.normalise(k): v for k, v in item_quantities.items()}
-    
-    # Add items
-    success, message, items_added = db.add_items_with_quantity(name, item_quantities)
-    
-    if success:
-        # Format items list
-        items_display_list = []
-        total_items = 0
-        for item_name, qty in items_added.items():
-            if qty > 1:
-                items_display_list.append(f"**{item_name}** x{qty}")
-            else:
-                items_display_list.append(f"**{item_name}**")
-            total_items += qty
-        
-        items_display = ", ".join(items_display_list)
-        
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Items added!",
-            description=f"Added {items_display} to **{name}**'s inventory!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        if total_items > 1:
-            embed.add_field(
-                name="Total Items Added",
-                value=f"{total_items} items",
-                inline=True
-            )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="removeitem", description="Remove items from a character's inventory")
-@app_commands.describe(
-    name="Character name",
-    items="Items with optional quantities (e.g., 'Medkit:3, Flashlight:2' or just 'Medkit')"
-)
-async def remove_item(interaction: discord.Interaction, name: str, items: str):
-    """
-    Remove items with quantity support
-    Format: Same as buy command
-    """
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Parse items with quantities
-    item_quantities = {}
-    item_list = [item.strip() for item in items.split(',')]
-    
-    for item_entry in item_list:
-        if ':' in item_entry:
-            parts = item_entry.split(':')
-            item_name = parts[0].strip()
-            try:
-                quantity = int(parts[1].strip())
-                if quantity < 1:
-                    embed = discord.Embed(
-                        title="<a:error:1467157734817398946> ┃ Error!",
-                        description=f"Quantity must be at least 1 for **{item_name}**!",
-                        color=discord.Color.from_rgb(116, 7, 14)
-                    )
-                    await interaction.response.send_message(embed=embed)
-                    return
-                item_quantities[item_name] = quantity
-            except ValueError:
-                embed = discord.Embed(
-                    title="<a:error:1467157734817398946> ┃ Error!",
-                    description=f"Invalid quantity for **{item_name}**! Use format: Item:Number (e.g., Medkit:3)",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                await interaction.response.send_message(embed=embed)
-                return
-        else:
-            item_quantities[item_entry.strip()] = 1
-    
-    # Remove items
-    success, message, items_removed = db.remove_items_with_quantity(name, item_quantities)
-    
-    if success:
-        # Format items list
-        items_display_list = []
-        total_items = 0
-        for item_name, qty in items_removed.items():
-            if qty > 1:
-                items_display_list.append(f"**{item_name}** x{qty}")
-            else:
-                items_display_list.append(f"**{item_name}**")
-            total_items += qty
-        
-        items_display = ", ".join(items_display_list)
-        
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Items removed!",
-            description=f"Removed {items_display} from **{name}**'s inventory!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        if total_items > 1:
-            embed.add_field(
-                name="Total Items Removed",
-                value=f"{total_items} items",
-                inline=True
-            )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="use", description="Use items from your character's inventory")
-@app_commands.describe(
-    name="Character name",
-    items="Items with optional quantities (e.g., 'Medkit:3, Flashlight:2' or just 'Medkit, Flashlight')"
-)
-async def use_items(interaction: discord.Interaction, name: str, items: str):
-    """
-    Use items with quantity support
-    Format: Same as buy command
-    """
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Parse items with quantities
-    item_quantities = {}
-    item_list = [item.strip() for item in items.split(',')]
-    
-    for item_entry in item_list:
-        if ':' in item_entry:
-            parts = item_entry.split(':')
-            item_name = parts[0].strip()
-            try:
-                quantity = int(parts[1].strip())
-                if quantity < 1:
-                    embed = discord.Embed(
-                        title="<a:error:1467157734817398946> ┃ Error!",
-                        description=f"Quantity must be at least 1 for **{item_name}**!",
-                        color=discord.Color.from_rgb(116, 7, 14)
-                    )
-                    await interaction.response.send_message(embed=embed)
-                    return
-                item_quantities[item_name] = quantity
-            except ValueError:
-                embed = discord.Embed(
-                    title="<a:error:1467157734817398946> ┃ Error!",
-                    description=f"Invalid quantity for **{item_name}**! Use format: Item:Number (e.g., Medkit:3)",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                await interaction.response.send_message(embed=embed)
-                return
-        else:
-            item_quantities[item_entry.strip()] = 1
-    
-    # Use items
-    success, message, items_used = db.use_items_with_quantity(name, item_quantities)
-    
-    if success:
-        # Format items list
-        items_display_list = []
-        total_items = 0
-        for item_name, qty in items_used.items():
-            if qty > 1:
-                items_display_list.append(f"**{item_name}** x{qty}")
-            else:
-                items_display_list.append(f"**{item_name}**")
-            total_items += qty
-        
-        items_display = ", ".join(items_display_list)
-        
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Items used!",
-            description=f"**{name}** used {items_display}!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        if total_items > 1:
-            embed.add_field(
-                name="Total Items Used",
-                value=f"{total_items} items",
-                inline=True
-            )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    
-    await interaction.response.send_message(embed=embed)
-
-#  Command
-@bot.tree.command(name="trial", description="Complete a trial and earn rewards")
-@app_commands.describe(name="Character name")
-async def trial(interaction: discord.Interaction, name: str):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    result = db.complete_trial(name)
-    if result:
-        embed = discord.Embed(
-            title=f"<a:loading:1467153150015180800> ┃ {name}'s {result['role']} Trial",
-            description=result['message'],
-            color=discord.Color.from_rgb(116, 7, 14)  # #74070E
-        )
-        embed.add_field(
-            name="Result:",
-            value=result['performance_text'],
-            inline=True
-        )
-        embed.add_field(
-            name="Rewards",
-            value=f"<:bp:1467159740797681716> **{result['bloodpoints']:,}** Bloodpoints\n<:ac:1467159725870154021> **{result['auric_cells']}** Auric Cells",
-            inline=True
-        )
-        await interaction.response.send_message(embed=embed)
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Profile **{name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14) 
-        )
-        await interaction.response.send_message(embed=embed)
-
-# Dice Roll Command
-@bot.tree.command(name="roll", description="Roll dice (e.g., 1d20, 2d6)")
-@app_commands.describe(dice="Dice notation (e.g., 1d20, 2d6+5)")
-async def roll_dice(interaction: discord.Interaction, dice: str):
-    try:
-        # Parse dice notation (e.g., "2d6+3")
-        match = re.match(r'(\d+)d(\d+)([+-]\d+)?', dice.lower())
-        if not match:
-            await interaction.response.send_message("Invalid dice format! Use format like: 1d20, 2d6, or 1d20+5")
-            return
-        
-        num_dice = int(match.group(1))
-        num_sides = int(match.group(2))
-        modifier = int(match.group(3)) if match.group(3) else 0
-        
-        if num_dice > 100 or num_sides > 1000:
-            await interaction.response.send_message("Too many dice or sides! Keep it reasonable.")
-            return
-        
-        # Roll the dice
-        rolls = [random.randint(1, num_sides) for _ in range(num_dice)]
-        total = sum(rolls) + modifier
-        
-        # Format the result
-        rolls_str = ", ".join(map(str, rolls))
-        modifier_str = f" {modifier:+d}" if modifier != 0 else ""
-        
-        embed = discord.Embed(
-            title="<a:40586diceroll:1467250239181295657> ┃ Roll",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        # Show result first - big and prominent
-        if num_dice > 1 or modifier != 0:
-            embed.add_field(name="Result:", value=f"**{total}**", inline=False)
-            # Show details below in small text - using lowercase d
-            embed.add_field(name="", value=f"-# Rolling {dice.lower()}\n-# Rolls: {rolls_str}{modifier_str}", inline=False)
-        else:
-            # Single die, no modifier - just show the result
-            embed.add_field(name="Result:", value=f"**{rolls[0]}**", inline=False)
-            embed.add_field(name="", value=f"-# Rolling {dice.lower()}", inline=False)
-        
-        await interaction.response.send_message(embed=embed)
-    except Exception as e:
-        await interaction.response.send_message(f"Error rolling dice: {str(e)}")
-
-# Prefix command version of roll (works with Tupperbot!)
-@bot.command(name="roll", aliases=["r"])
-async def roll_prefix(ctx, *, dice: str):
-    """Roll dice using prefix command with optional text (e.g., !roll [1d20], !roll Attack [1d20+5])"""
-    try:
-        # Extract all dice rolls in brackets [1d20], [2d6+5], etc.
-        dice_pattern = r'\[(\d+d\d+(?:[+-]\d+)?)\]'
-        matches = re.findall(dice_pattern, dice.lower())
-        
-        if not matches:
-            await ctx.send("No dice found! Use brackets like: `!roll [1d20]` or `!roll Attack [1d20+5]`")
-            return
-        
-        # Keep the original text for display
-        display_text = dice
-        
-        embed = discord.Embed(
-            title="<a:40586diceroll:1467250239181295657> ┃ Roll",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        
-        # Roll each dice expression found
-        for dice_expr in matches:
-            # Parse dice notation (e.g., "2d6+3")
-            match = re.match(r'(\d+)d(\d+)([+-]\d+)?', dice_expr)
-            if not match:
-                continue
-            
-            num_dice = int(match.group(1))
-            num_sides = int(match.group(2))
-            modifier = int(match.group(3)) if match.group(3) else 0
-            
-            if num_dice > 100 or num_sides > 1000:
-                await ctx.send("Too many dice or sides! Keep it reasonable.")
-                return
-            
-            # Roll the dice
-            rolls = [random.randint(1, num_sides) for _ in range(num_dice)]
-            total = sum(rolls) + modifier
-            
-            # Format the result
-            rolls_str = ", ".join(map(str, rolls))
-            modifier_str = f" {modifier:+d}" if modifier != 0 else ""
-            
-            # Replace the bracketed dice with the result in display text
-            result_str = f"**{total}**" if (num_dice > 1 or modifier != 0) else f"**{rolls[0]}**"
-            display_text = display_text.replace(f"[{dice_expr}]", result_str, 1)
-            
-            # Add result field - big and prominent
-            field_name = f"-# Rolling: {dice_expr.upper()}"
-            if num_dice > 1 or modifier != 0:
-                field_value = f"-# Rolls: {rolls_str}{modifier_str}"
-            else:
-                field_value = f"-# {rolls[0]}"
-            
-            embed.add_field(name=field_name, value=field_value, inline=False)
-        
-        # Set description to show the text with results
-        embed.description = display_text
-        
-        await ctx.send(embed=embed)
-    except Exception as e:
-        await ctx.send(f"Error rolling dice: {str(e)}")
-
-
-# Choose Command
-@bot.tree.command(name="choose", description="Pick a random option from a list")
-@app_commands.describe(options="Comma-separated list of options")
-async def choose(interaction: discord.Interaction, options: str):
-    choices = [choice.strip() for choice in options.split(',') if choice.strip()]
-    
-    if len(choices) < 2:
-        await interaction.response.send_message("Please provide at least 2 options separated by commas!")
-        return
-    
-    chosen = random.choice(choices)
-    
-    embed = discord.Embed(
-        title="<:IconAddon_bloodiedWater:1468241349856722944> ┃ Random Choice",
-        description=f"I choose: **{chosen}**",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    embed.set_footer(text=f"Options: {', '.join(choices)}")
-    
-    await interaction.response.send_message(embed=embed)
-
-# Travel Command
-@bot.tree.command(name="travel", description="Travel to a random realm")
-@app_commands.describe(name="Character name")
-async def travel(interaction: discord.Interaction, name: str):
-    profile = db.get_profile(name)
     if not profile:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Profile **{name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
         return
-    
-    realm = db.get_random_realm()
-    
-    embed = discord.Embed(
-        title="<:IconSkills_ScoutInnate:1468241348594503791> ┃ Travel",
-        description=f"**{name}** steps into the Fog and arrives in **{realm}**.",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    
-    await interaction.response.send_message(embed=embed)
+    view = ProfileView(profile, db.get_inventory(name))
+    await interaction.response.send_message(embed=view.create_embed(), view=view)
 
-# Interactive Hunting Command with XP
-@bot.tree.command(name="hunting", description="Go hunting for resources!")
-@app_commands.describe(name="Character name")
-async def hunting(interaction: discord.Interaction, name: str):
-    result = db.hunting_minigame(name)
-    if not result:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Profile **{name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    # Get character's current level for display
-    profile = db.get_profile(name)
-    char_level = profile.get('hunting_level', 1) if profile else 1
-    
-    difficulty = result.get('difficulty', 10)
-    item_name = result.get('item')
-    
-    if not item_name:
-        embed = discord.Embed(
-            title="<:DailyRitualIcon_hunter:1467234763495571477> ┃ Hunting",
-            description=result.get('description', result['message']),
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    embed = discord.Embed(
-        title="<:DailyRitualIcon_hunter:1467234763495571477> ┃ Hunting",
-        description=result.get('description', result['message']),
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    embed.add_field(name="Animal", value=f"**{item_name}**", inline=True)
-    embed.add_field(name="Difficulty", value=f"**{difficulty}**", inline=True)
-    embed.set_footer(text=f"{name} (Level {char_level})")
-    
-    class HuntingView(View):
-        def __init__(self):
-            super().__init__(timeout=60)
-            self.character_name = name
-            self.item_name = item_name
-            self.difficulty = difficulty
-            self.flee_message = result.get('flee_message') or f"You decided to leave the {item_name} alone. It ran off into the Fog."
-            self.fail_message = result.get('fail_message') or f"The **{item_name}** managed to escape before you could kill it."
-            
-        @discord.ui.button(label="Attempt to Kill", style=discord.ButtonStyle.danger)
-        async def attempt_button(self, interaction: discord.Interaction, button: Button):
-            level_bonus = db.get_level_bonus(self.character_name, 'hunting')
-            base_roll = random.randint(1, 20)
-            total_roll = base_roll + level_bonus
-            success = total_roll >= self.difficulty
-            
-            # XP rewards: 10 base + 5 per difficulty point
-            xp_reward = 10 + (self.difficulty * 5)
-            
-            if success:
-                db.add_minigame_item(self.character_name, self.item_name)
-                xp_result = db.add_xp(self.character_name, xp_reward, 'hunting')
-                
-                result_embed = discord.Embed(
-                    title="<:DailyRitualIcon_hunter:1467234763495571477> ┃ Successful Hunt",
-                    description=f"**{self.character_name}** rolled **{base_roll}**{f' +{level_bonus}' if level_bonus > 0 else ''}\n\n Successfully killed **{self.item_name}**!",
-                    color=discord.Color.from_rgb(0, 0, 0)
-                )
-                result_embed.add_field(name="Obtained", value=f"**{self.item_name}**", inline=True)
-                result_embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
-                
-                if xp_result and xp_result['leveled_up']:
-                    result_embed.add_field(
-                        name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                        value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                        inline=False
-                    )
-                    result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-                elif xp_result:
-                    result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            else:
-                xp_reward_fail = xp_reward // 4
-                xp_result = db.add_xp(self.character_name, xp_reward_fail, 'hunting')
-                
-                result_embed = discord.Embed(
-                    title="<:DailyRitualIcon_hunter:1467234763495571477> ┃ Failed Hunt",
-                    description=f"**{self.character_name}** rolled **{base_roll}**{f' +{level_bonus}' if level_bonus > 0 else ''}\n\n {self.fail_message}",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                result_embed.add_field(name="Result", value="No item obtained", inline=True)
-                result_embed.add_field(name="XP Gained", value=f"+{xp_reward_fail} XP", inline=True)
-                
-                if xp_result and xp_result['leveled_up']:
-                    result_embed.add_field(
-                        name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                        value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                        inline=False
-                    )
-                    result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-                elif xp_result:
-                    result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            
-            for item in self.children:
-                item.disabled = True
-            
-            await interaction.response.edit_message(embed=result_embed, view=self)
-        
-        @discord.ui.button(label="Leave it", style=discord.ButtonStyle.gray)
-        async def leave_button(self, interaction: discord.Interaction, button: Button):
-            # Small XP reward for leaving it alone (peaceful option)
-            xp_reward_peaceful = 5
-            xp_result = db.add_xp(self.character_name, xp_reward_peaceful, 'hunting')
-            
-            result_embed = discord.Embed(
-                title="<:DailyRitualIcon_hunter:1467234763495571477> ┃ Peaceful Choice",
-                description=f"**{self.character_name}** chose to leave the **{self.item_name}** alone.\n\n{self.flee_message}",
-                color=discord.Color.from_rgb(0, 0, 0)
-            )
-            result_embed.add_field(name="Result", value="No item obtained", inline=True)
-            result_embed.add_field(name="XP Gained", value=f"+{xp_reward_peaceful} XP", inline=True)
-            
-            if xp_result and xp_result['leveled_up']:
-                result_embed.add_field(
-                    name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                    value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                    inline=False
-                )
-                result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-            elif xp_result:
-                result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            
-            for item in self.children:
-                item.disabled = True
-            
-            await interaction.response.edit_message(embed=result_embed, view=self)
-    
-    await interaction.response.send_message(embed=embed, view=HuntingView())
-    
 
-# Fishing Minigame
-@bot.tree.command(name="fishing", description="Go fishing for resources!")
-@app_commands.describe(name="Character name")
-async def fishing(interaction: discord.Interaction, name: str):
-    result = db.fishing_minigame(name)
-    if not result:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Profile **{name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    profile = db.get_profile(name)
-    char_level = profile.get('fishing_level', 1) if profile else 1
-    level_bonus = db.get_level_bonus(name, 'fishing')
-    
-    difficulty = result.get('difficulty', 10)
-    item_name = result.get('item')
-    
-    if not item_name:
-        embed = discord.Embed(
-            title="<:DailyRitualIcon_sacrifice:1467234766053970055> ┃ Fishing",
-            description=result.get('description', result['message']),
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    embed = discord.Embed(
-        title="<:DailyRitualIcon_sacrifice:1467234766053970055> ┃ Fishing",
-        description=result.get('description', result['message']),
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    embed.add_field(name="Catch", value=f"**{item_name}**", inline=True)
-    embed.add_field(name="Difficulty", value=f"**{difficulty}**", inline=True)
-    embed.set_footer(text=f"{name} (Level {char_level})")
-    
-    class FishingView(View):
-        def __init__(self):
-            super().__init__(timeout=60)
-            self.character_name = name
-            self.item_name = item_name
-            self.difficulty = difficulty
-            self.flee_message = result.get('flee_message') or f"You decided to let the {item_name} go. It swims into the depths of the water."
-            self.fail_message = result.get('fail_message') or f"The **{item_name}** got away before you could reel it in."
-            
-        @discord.ui.button(label="Reel In", style=discord.ButtonStyle.danger)
-        async def attempt_button(self, interaction: discord.Interaction, button: Button):
-            level_bonus = db.get_level_bonus(self.character_name, 'fishing')
-            base_roll = random.randint(1, 20)
-            total_roll = base_roll + level_bonus
-            success = total_roll >= self.difficulty
-            
-            xp_reward = 10 + (self.difficulty * 5)
-            
-            if success:
-                db.add_minigame_item(self.character_name, self.item_name)
-                xp_result = db.add_xp(self.character_name, xp_reward, 'fishing')
-                
-                result_embed = discord.Embed(
-                    title="<:DailyRitualIcon_sacrifice:1467234766053970055> ┃ Successful Catch!",
-                    description=f"**{self.character_name}** rolled **{base_roll}**{f' +{level_bonus}' if level_bonus > 0 else ''} \n\n Successfully caught **{self.item_name}**!",
-                    color=discord.Color.from_rgb(0, 0, 0)
-                )
-                result_embed.add_field(name="Obtained", value=f"**{self.item_name}**", inline=True)
-                result_embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
-                
-                if xp_result and xp_result['leveled_up']:
-                    result_embed.add_field(
-                        name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                        value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                        inline=False
-                    )
-                    result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-                elif xp_result:
-                    result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            else:
-                xp_reward_fail = xp_reward // 4
-                xp_result = db.add_xp(self.character_name, xp_reward_fail, 'fishing')
-                
-                result_embed = discord.Embed(
-                    title="<:DailyRitualIcon_sacrifice:1467234766053970055> ┃ Failed Catch!",
-                    description=f"**{self.character_name}** rolled **{base_roll}**{f' +{level_bonus}' if level_bonus > 0 else ''} \n\n {self.fail_message}",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                result_embed.add_field(name="Result", value="No item obtained", inline=True)
-                result_embed.add_field(name="XP Gained", value=f"+{xp_reward_fail} XP", inline=True)
-                
-                if xp_result and xp_result['leveled_up']:
-                    result_embed.add_field(
-                        name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                        value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                        inline=False
-                    )
-                    result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-                elif xp_result:
-                    result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            
-            for item in self.children:
-                item.disabled = True
-            
-            await interaction.response.edit_message(embed=result_embed, view=self)
-        
-        @discord.ui.button(label="Leave it", style=discord.ButtonStyle.gray)
-        async def leave_button(self, interaction: discord.Interaction, button: Button):
-            xp_reward_peaceful = 5
-            xp_result = db.add_xp(self.character_name, xp_reward_peaceful, 'fishing')
-            
-            result_embed = discord.Embed(
-                title="<:DailyRitualIcon_sacrifice:1467234766053970055> ┃ Peaceful Choice",
-                description=f"**{self.character_name}** decided to leave the **{self.item_name}** alone.\n\n {self.flee_message}",
-                color=discord.Color.from_rgb(0, 0, 0)
-            )
-            result_embed.add_field(name="Result", value="No item obtained", inline=True)
-            result_embed.add_field(name="XP Gained", value=f"+{xp_reward_peaceful} XP", inline=True)
-            
-            if xp_result and xp_result['leveled_up']:
-                result_embed.add_field(
-                    name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                    value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                    inline=False
-                )
-                result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-            elif xp_result:
-                result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            
-            for item in self.children:
-                item.disabled = True
-            
-            await interaction.response.edit_message(embed=result_embed, view=self)
-    
-    await interaction.response.send_message(embed=embed, view=FishingView())
-
-# Scavenging Minigame
-@bot.tree.command(name="scavenging", description="Go scavenging for resources!")
-@app_commands.describe(name="Character name")
-async def scavenging(interaction: discord.Interaction, name: str):
-    result = db.scavenging_minigame(name)
-    if not result:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=f"Profile **{name}** not found!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    profile = db.get_profile(name)
-    char_level = profile.get('scavenging_level', 1) if profile else 1
-    level_bonus = db.get_level_bonus(name, 'scavenging')
-    
-    difficulty = result.get('difficulty', 10)
-    item_name = result.get('item')
-    
-    if not item_name:
-        embed = discord.Embed(
-            title="<:DailyRitualIcon_objectives:1467234764795809842> ┃ Scavenging",
-            description=result.get('description', result['message']),
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        await interaction.response.send_message(embed=embed)
-        return
-    
-    embed = discord.Embed(
-        title="<:DailyRitualIcon_objectives:1467234764795809842> ┃ Scavenging",
-        description=result.get('description', result['message']),
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    embed.add_field(name="Found", value=f"**{item_name}**", inline=True)
-    embed.add_field(name="Difficulty", value=f"**{difficulty}**", inline=True)
-    embed.set_footer(text=f"{name} (Level {char_level})")
-    
-    class ScavengingView(View):
-        def __init__(self):
-            super().__init__(timeout=60)
-            self.character_name = name
-            self.item_name = item_name
-            self.difficulty = difficulty
-            self.flee_message = result.get('flee_message') or f"You decided to leave the {item_name} where it was."
-            self.fail_message = result.get('fail_message') or f"The **{item_name}** was too damaged or out of reach to retrieve."
-            
-        @discord.ui.button(label="Retrieve Item", style=discord.ButtonStyle.danger)
-        async def attempt_button(self, interaction: discord.Interaction, button: Button):
-            level_bonus = db.get_level_bonus(self.character_name, 'scavenging')
-            base_roll = random.randint(1, 20)
-            total_roll = base_roll + level_bonus
-            success = total_roll >= self.difficulty
-            
-            xp_reward = 10 + (self.difficulty * 5)
-            
-            if success:
-                db.add_minigame_item(self.character_name, self.item_name)
-                xp_result = db.add_xp(self.character_name, xp_reward, 'scavenging')
-                
-                result_embed = discord.Embed(
-                    title="<:DailyRitualIcon_objectives:1467234764795809842> ┃ Successful Retrieval!",
-                    description=f"**{self.character_name}** rolled **{base_roll}**{f' +{level_bonus}' if level_bonus > 0 else ''} \n\n Successfully retrieved **{self.item_name}**!",
-                    color=discord.Color.from_rgb(0, 0, 0)
-                )
-                result_embed.add_field(name="Obtained", value=f"**{self.item_name}**", inline=True)
-                result_embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
-                
-                if xp_result and xp_result['leveled_up']:
-                    result_embed.add_field(
-                        name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                        value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                        inline=False
-                    )
-                    result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-                elif xp_result:
-                    result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            else:
-                xp_reward_fail = xp_reward // 4
-                xp_result = db.add_xp(self.character_name, xp_reward_fail, 'scavenging')
-                
-                result_embed = discord.Embed(
-                    title="<:DailyRitualIcon_objectives:1467234764795809842> ┃ Failed Retrieval!",
-                    description=f"**{self.character_name}** rolled **{base_roll}**{f' +{level_bonus}' if level_bonus > 0 else ''} \n\n {self.fail_message}",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                result_embed.add_field(name="Result", value="No item obtained", inline=True)
-                result_embed.add_field(name="XP Gained", value=f"+{xp_reward_fail} XP", inline=True)
-                
-                if xp_result and xp_result['leveled_up']:
-                    result_embed.add_field(
-                        name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                        value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                        inline=False
-                    )
-                    result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-                elif xp_result:
-                    result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            
-            for item in self.children:
-                item.disabled = True
-            
-            await interaction.response.edit_message(embed=result_embed, view=self)
-        
-        @discord.ui.button(label="Leave It", style=discord.ButtonStyle.gray)
-        async def leave_button(self, interaction: discord.Interaction, button: Button):
-            xp_reward_peaceful = 5
-            xp_result = db.add_xp(self.character_name, xp_reward_peaceful, 'scavenging')
-            
-            result_embed = discord.Embed(
-                title="<:DailyRitualIcon_objectives:1467234764795809842> ┃ Item Left Behind",
-                description=f"**{self.character_name}** decided to leave the **{self.item_name}** behind.\n\n{self.flee_message}",
-                color=discord.Color.from_rgb(0, 0, 0)
-            )
-            result_embed.add_field(name="Result", value="No item obtained", inline=True)
-            result_embed.add_field(name="XP Gained", value=f"+{xp_reward_peaceful} XP", inline=True)
-            
-            if xp_result and xp_result['leveled_up']:
-                result_embed.add_field(
-                    name="<:lvlup:1482362825119633478> LEVEL UP!", 
-                    value=f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**\n+{(xp_result['new_level']-1)//5 - (xp_result['old_level']-1)//5} roll bonus!", 
-                    inline=False
-                )
-                result_embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-            elif xp_result:
-                result_embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
-            
-            for item in self.children:
-                item.disabled = True
-            
-            await interaction.response.edit_message(embed=result_embed, view=self)
-    
-    await interaction.response.send_message(embed=embed, view=ScavengingView())
-
-# List Command
 @bot.tree.command(name="list", description="Show all your character profiles")
 async def list_profiles(interaction: discord.Interaction):
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    # Only fetch profiles belonging to the user who ran the command
-    cursor.execute(
-        "SELECT name, role, bloodpoints, auric_cells FROM profiles WHERE user_id = ? ORDER BY name",
-        (str(interaction.user.id),)
-    )
-    profiles = cursor.fetchall()
-    conn.close()
-
+    profiles = db.get_profiles_for_user(interaction.user.id)
+    title = f"{EMOJI['profile']} ┃ Your Characters"
     if not profiles:
-        embed = discord.Embed(
-            title="<:15824redneonstar:1467170916017639615> ┃ Your Characters",
-            description="You don't have any characters yet. Create one with `/create`!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
+        embed = discord.Embed(title=title, description="You don't have any characters yet. Create one with `/create`!",
+                              color=COLOR_DEFAULT)
         await interaction.response.send_message(embed=embed)
         return
 
-    # Group by role
-    killers   = [p for p in profiles if p[1] == 'Killer']
-    survivors = [p for p in profiles if p[1] == 'Survivor']
-
-    def build_lines(char_list, emoji):
-        return [
-            f"{emoji} **{p[0]}** — <:bp:1467159740797681716> {p[2]:,} / <:ac:1467159725870154021> {p[3]:,} "
-            for p in char_list
-        ]
-
-    killer_lines   = build_lines(killers,   "<:killer:1467160220009762837>")
-    survivor_lines = build_lines(survivors, "<:survivor:1467160220982841345>")
+    main_emoji, premium_emoji = CURRENCIES['main']['emoji'], CURRENCIES['premium']['emoji']
 
     def chunk_lines(lines, limit=1024):
-        """Split a list of lines into chunks that each fit within limit chars."""
-        chunks, current, current_len = [], [], 0
+        """Split lines into chunks that each fit into one embed field."""
+        chunks, current, length = [], [], 0
         for line in lines:
-            # +1 for the newline we'll join with
-            if current_len + len(line) + 1 > limit and current:
+            if current and length + len(line) + 1 > limit:
                 chunks.append("\n".join(current))
-                current, current_len = [], 0
+                current, length = [], 0
             current.append(line)
-            current_len += len(line) + 1
+            length += len(line) + 1
         if current:
             chunks.append("\n".join(current))
         return chunks
 
-    # Build all fields we need to add
+    # Group by role: configured roles first, then anything else
+    roles = list(config.ROLES) + sorted({p[1] for p in profiles} - set(config.ROLES))
     fields = []
-    for i, chunk in enumerate(chunk_lines(killer_lines)):
-        label = "Killers" if i == 0 else "Killers (cont.)"
-        fields.append((label, chunk))
-    for i, chunk in enumerate(chunk_lines(survivor_lines)):
-        label = "Survivors" if i == 0 else "Survivors (cont.)"
-        fields.append((label, chunk))
+    for role in roles:
+        lines = [f"{EMOJI.get(role, '•')} **{p[0]}** — {main_emoji} {p[2]:,} / {premium_emoji} {p[3]:,}"
+                 for p in profiles if p[1] == role]
+        for i, chunk in enumerate(chunk_lines(lines)):
+            fields.append((f"{role}s" if i == 0 else f"{role}s (cont.)", chunk))
 
-    # Discord allows max 25 fields per embed; split into pages if needed
-    pages = [fields[i:i+25] for i in range(0, max(len(fields), 1), 25)]
+    pages = [fields[i:i + 25] for i in range(0, max(len(fields), 1), 25)]  # max 25 fields per embed
 
-    def make_embed(page_fields, page_num, total_pages):
-        embed = discord.Embed(
-            title="<:15824redneonstar:1467170916017639615> ┃ Your Characters",
-            description=f"You have **{len(profiles)}** character(s).",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        for name, value in page_fields:
-            embed.add_field(name=name, value=value, inline=False)
+    def make_embed(page_num):
+        embed = discord.Embed(title=title, description=f"You have **{len(profiles)}** character(s).",
+                              color=COLOR_DEFAULT)
+        for field_name, value in pages[page_num]:
+            embed.add_field(name=field_name, value=value, inline=False)
         footer = "Use /profile [name] to view details."
-        if total_pages > 1:
-            footer += f"  •  Page {page_num}/{total_pages}"
+        if len(pages) > 1:
+            footer += f"  •  Page {page_num + 1}/{len(pages)}"
         embed.set_footer(text=footer)
         return embed
 
     if len(pages) == 1:
-        await interaction.response.send_message(embed=make_embed(pages[0], 1, 1))
+        await interaction.response.send_message(embed=make_embed(0))
+        return
+
+    class ListView(discord.ui.View):
+        def __init__(self):
+            super().__init__(timeout=120)
+            self.page = 0
+
+        @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
+        async def prev_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+            self.page = max(0, self.page - 1)
+            await inter.response.edit_message(embed=make_embed(self.page), view=self)
+
+        @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+        async def next_btn(self, inter: discord.Interaction, button: discord.ui.Button):
+            self.page = min(len(pages) - 1, self.page + 1)
+            await inter.response.edit_message(embed=make_embed(self.page), view=self)
+
+    await interaction.response.send_message(embed=make_embed(0), view=ListView())
+
+
+@bot.tree.command(name="claim", description="Claim an unowned character")
+@app_commands.describe(name="Character name to claim")
+async def claim_character(interaction: discord.Interaction, name: str):
+    success, message = db.claim_character(name, interaction.user.id)
+    embed = success_embed("Character claimed!", message) if success else error_embed(message)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="assignowner", description="[ADMIN] Manually assign character ownership")
+@app_commands.describe(character="Character name", user="User to assign ownership to")
+async def assign_owner(interaction: discord.Interaction, character: str, user: discord.User):
+    if not await require_admin(interaction):
+        return
+    success, message = db.assign_owner(character, user.id)
+    if success:
+        embed = success_embed("Owner assigned!", f"**{character}** is now owned by {user.mention}\n\n{message}")
     else:
-        # Multi-page view with Previous / Next buttons
-        class ListView(discord.ui.View):
-            def __init__(self):
-                super().__init__(timeout=120)
-                self.page = 0
+        embed = error_embed(message)
+    await interaction.response.send_message(embed=embed)
 
-            @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
-            async def prev_btn(self, inter: discord.Interaction, button: discord.ui.Button):
-                self.page = max(0, self.page - 1)
-                await inter.response.edit_message(embed=make_embed(pages[self.page], self.page + 1, len(pages)), view=self)
 
-            @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
-            async def next_btn(self, inter: discord.Interaction, button: discord.ui.Button):
-                self.page = min(len(pages) - 1, self.page + 1)
-                await inter.response.edit_message(embed=make_embed(pages[self.page], self.page + 1, len(pages)), view=self)
+# ==================== CURRENCY COMMANDS ====================
 
-        await interaction.response.send_message(embed=make_embed(pages[0], 1, len(pages)), view=ListView())
+MAIN_NAME = CURRENCIES['main']['name']
+PREMIUM_NAME = CURRENCIES['premium']['name']
 
-# Help Command
+
+@bot.tree.command(name="addcurrency", description=f"[ADMIN] Add {MAIN_NAME} or {PREMIUM_NAME} to a character")
+@app_commands.describe(name="Character name", currency="Currency type", amount="Amount to add")
+@app_commands.choices(currency=CURRENCY_CHOICES)
+async def add_currency(interaction: discord.Interaction, name: str, currency: app_commands.Choice[str], amount: int):
+    if not await require_admin(interaction):
+        return
+    success, message = db.add_currency(name, currency.value, amount)
+    if success:
+        embed = success_embed("Currency added!", f"Added {amount_text(currency.value, amount)} to **{name}**!")
+    else:
+        embed = error_embed(message)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="removecurrency", description=f"[ADMIN] Remove {MAIN_NAME} or {PREMIUM_NAME} from a character")
+@app_commands.describe(name="Character name", currency="Currency type", amount="Amount to remove")
+@app_commands.choices(currency=CURRENCY_CHOICES)
+async def remove_currency(interaction: discord.Interaction, name: str, currency: app_commands.Choice[str], amount: int):
+    if not await require_admin(interaction):
+        return
+    success, message = db.remove_currency(name, currency.value, amount)
+    if success:
+        embed = success_embed("Currency removed!", f"Removed {amount_text(currency.value, amount)} from **{name}**!")
+    else:
+        embed = error_embed(message)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="givecurrency", description="Give currency from your character to another character")
+@app_commands.describe(sender_name="Your character's name", currency="Currency type", amount="Amount to give",
+                       receiver_name="The receiver's character name")
+@app_commands.choices(currency=CURRENCY_CHOICES)
+async def give_currency(interaction: discord.Interaction, sender_name: str, currency: app_commands.Choice[str],
+                        amount: int, receiver_name: str):
+    if not await require_owner(interaction, sender_name):
+        return
+    success, message = db.transfer_currency(sender_name, receiver_name, currency.value, amount)
+    if success:
+        embed = success_embed("Currency Transferred!",
+                              f"**{sender_name}** gave {amount_text(currency.value, amount)} to **{receiver_name}**!")
+    else:
+        embed = error_embed(message)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="exchange", description=f"Exchange {MAIN_NAME} for {PREMIUM_NAME} or vice versa")
+@app_commands.describe(name="Character name", from_currency="Currency you want to spend", amount="Amount to spend")
+@app_commands.choices(from_currency=CURRENCY_CHOICES)
+async def exchange_currency(interaction: discord.Interaction, name: str, from_currency: app_commands.Choice[str],
+                            amount: int):
+    if not await require_owner(interaction, name):
+        return
+    success, message, received, to_currency = db.exchange_currency(name, from_currency.value, amount)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
+        return
+    embed = success_embed("Exchange Complete!", f"**{name}** exchanged currency!")
+    embed.add_field(name="Received", value=amount_text(to_currency, received), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+# ==================== MATCH COMMANDS ====================
+
+@bot.tree.command(name="match", description="Play a match and earn rewards")
+@app_commands.describe(name="Character name")
+async def match(interaction: discord.Interaction, name: str):
+    if not await require_owner(interaction, name):
+        return
+    result = db.complete_match(name)
+    if not result:
+        await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
+        return
+    embed = discord.Embed(title=f"{EMOJI['match']} ┃ {name}'s {result['role']} Match",
+                          description=result['message'], color=COLOR_ERROR)
+    embed.add_field(name="Result:", value=result['performance_text'], inline=True)
+    embed.add_field(name="Rewards",
+                    value=f"{amount_text('main', result['main'])}\n{amount_text('premium', result['premium'])}",
+                    inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="matchreward",
+                  description=f"Give match rewards ({MAIN_NAME} & {PREMIUM_NAME}) based on escapes or eliminations")
+@app_commands.describe(name="Character name", count="Number of escapes or eliminations (1–8)")
+@app_commands.choices(count=[app_commands.Choice(name=str(i), value=i) for i in range(1, 9)])
+async def match_reward(interaction: discord.Interaction, name: str, count: app_commands.Choice[int]):
+    if not await require_owner(interaction, name):
+        return
+    main_per, premium_per = config.MATCH_REWARD_PER_COUNT
+    main_reward, premium_reward = count.value * main_per, count.value * premium_per
+    success, message = db.add_rewards(name, main_reward, premium_reward)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
+        return
+    embed = success_embed("Match Rewards Granted!", f"**{name}** received their match rewards!")
+    embed.add_field(name="Rewards",
+                    value=f"{amount_text('main', main_reward)}\n{amount_text('premium', premium_reward)}",
+                    inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+# ==================== SHOP & INVENTORY COMMANDS ====================
+
+@bot.tree.command(name="shop", description="View available items for purchase")
+async def shop(interaction: discord.Interaction):
+    items = db.get_shop_items()
+    embed = discord.Embed(title="Shop", color=COLOR_DEFAULT)
+    if not items:
+        embed.description = "No items available."
+    else:
+        embed.description = "Purchase items with `/buy [name] [items]`"
+        lines = []
+        for item_name, price, description, currency in items:
+            currency = currency if currency in CURRENCIES else 'main'
+            line = f"**{item_name}** - {price:,} {CURRENCIES[currency]['name']}"
+            lines.append(f"{line}\n*{description}*" if description else line)
+        # Split into several fields so a long shop doesn't hit Discord's 1024-character limit
+        chunk, length, first = [], 0, True
+        for line in lines:
+            if chunk and length + len(line) + 1 > 1024:
+                embed.add_field(name="Available Items" if first else "​", value="\n".join(chunk), inline=False)
+                chunk, length, first = [], 0, False
+            chunk.append(line)
+            length += len(line) + 1
+        if chunk:
+            embed.add_field(name="Available Items" if first else "​", value="\n".join(chunk), inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="buy", description="Purchase items from the shop")
+@app_commands.describe(name="Character name",
+                       items="Items with optional quantities (e.g., 'Lantern:3, Bandage:2' or just 'Lantern, Bandage')")
+async def buy_item(interaction: discord.Interaction, name: str, items: str):
+    if not await require_owner(interaction, name):
+        return
+    item_quantities, error = parse_item_quantities(items)
+    if error:
+        await interaction.response.send_message(embed=error_embed(error))
+        return
+    success, message, total_price, currency, purchased = db.buy_items_with_quantity(name, item_quantities)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+    embed = success_embed("Purchase successful!",
+                          f"**{name}** purchased {format_items(purchased)} for {amount_text(currency, total_price)}!")
+    total_items = sum(purchased.values())
+    if total_items > 1:
+        embed.add_field(name="Total Items", value=f"{total_items} items", inline=True)
+        embed.add_field(name="Total Cost", value=f"{total_price:,} {CURRENCIES[currency]['name']}", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="additem", description="Add items to a character's inventory")
+@app_commands.describe(name="Character name",
+                       items="Items with optional quantities (e.g., 'Lantern:3, Bandage:2' or just 'Lantern')")
+async def add_item(interaction: discord.Interaction, name: str, items: str):
+    if not await require_owner(interaction, name):
+        return
+    item_quantities, error = parse_item_quantities(items)
+    if error:
+        await interaction.response.send_message(embed=error_embed(error))
+        return
+    item_quantities = {db.normalise(k): v for k, v in item_quantities.items()}
+    success, message, added = db.add_items_with_quantity(name, item_quantities)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+    embed = success_embed("Items added!", f"Added {format_items(added)} to **{name}**'s inventory!")
+    if sum(added.values()) > 1:
+        embed.add_field(name="Total Items Added", value=f"{sum(added.values())} items", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="removeitem", description="Remove items from a character's inventory")
+@app_commands.describe(name="Character name",
+                       items="Items with optional quantities (e.g., 'Lantern:3, Bandage:2' or just 'Lantern')")
+async def remove_item(interaction: discord.Interaction, name: str, items: str):
+    if not await require_owner(interaction, name):
+        return
+    item_quantities, error = parse_item_quantities(items)
+    if error:
+        await interaction.response.send_message(embed=error_embed(error))
+        return
+    success, message, removed = db.remove_items_with_quantity(name, item_quantities)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+    embed = success_embed("Items removed!", f"Removed {format_items(removed)} from **{name}**'s inventory!")
+    if sum(removed.values()) > 1:
+        embed.add_field(name="Total Items Removed", value=f"{sum(removed.values())} items", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="use", description="Use items from your character's inventory")
+@app_commands.describe(name="Character name",
+                       items="Items with optional quantities (e.g., 'Lantern:3, Bandage:2' or just 'Lantern, Bandage')")
+async def use_items(interaction: discord.Interaction, name: str, items: str):
+    if not await require_owner(interaction, name):
+        return
+    item_quantities, error = parse_item_quantities(items)
+    if error:
+        await interaction.response.send_message(embed=error_embed(error))
+        return
+    success, message, used = db.use_items_with_quantity(name, item_quantities)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+    embed = success_embed("Items used!", f"**{name}** used {format_items(used)}!")
+    if sum(used.values()) > 1:
+        embed.add_field(name="Total Items Used", value=f"{sum(used.values())} items", inline=True)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="giveitem", description="Give item(s) from your character to another character")
+@app_commands.describe(sender_name="Your character's name",
+                       items="Items with optional quantities (e.g., 'Lantern:3, Bandage' or just 'Lantern')",
+                       receiver_name="The receiver's character name")
+async def give_item(interaction: discord.Interaction, sender_name: str, items: str, receiver_name: str):
+    if not await require_owner(interaction, sender_name):
+        return
+    item_quantities, error = parse_item_quantities(items)
+    if error:
+        await interaction.response.send_message(embed=error_embed(error))
+        return
+    success, message, moved = db.transfer_items(sender_name, receiver_name, item_quantities)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+    embed = success_embed("Items Transferred!",
+                          f"**{sender_name}** gave {format_items(moved)} to **{receiver_name}**!")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="value", description="Check the sell value of items from your inventory")
+@app_commands.describe(name="Character name", items="Item names separated by commas (e.g., Rusty Key, Wild Berries)")
+async def value_items(interaction: discord.Interaction, name: str, items: str):
+    if not await require_owner(interaction, name):
+        return
+    item_list = [item.strip() for item in items.split(',') if item.strip()]
+    success, message, items_info, total_value = db.get_item_values(name, item_list)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+
+    main = CURRENCIES['main']
+    embed = discord.Embed(title=f"{main['emoji']} ┃ Item Values", description=f"**{name}**'s sellable items:",
+                          color=COLOR_DEFAULT)
+    for info in items_info[:23]:  # leave room for the total field (max 25 fields)
+        if info['sell_value'] == 0:
+            value_text = "❌ Not sellable"
+        else:
+            value_text = (f"{main['emoji']} {info['sell_value']:,} {main['name']} each\n"
+                          f"**Total:** {info['total']:,} {main['name']} ({info['quantity']}x)")
+        embed.add_field(name=f"• {info['name']}", value=value_text, inline=False)
+    embed.add_field(name="━━━━━━━━━━━━━━", value=f"**Total Value:** {amount_text('main', total_value)}", inline=False)
+    if "not found" in message.lower():
+        embed.set_footer(text=f"⚠️ {message}")
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="sell", description=f"Sell items from your inventory for {MAIN_NAME}")
+@app_commands.describe(name="Character name",
+                       items="Items to sell, e.g: Rusty Key:3, Wild Berries  (no number = sell 1)")
+async def sell_items(interaction: discord.Interaction, name: str, items: str):
+    if not await require_owner(interaction, name):
+        return
+    item_quantities, error = parse_item_quantities(items)
+    if error:
+        await interaction.response.send_message(embed=error_embed(error, "Invalid input!"), ephemeral=True)
+        return
+    success, message, items_sold, total_earned = db.sell_items(name, item_quantities)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message))
+        return
+
+    main_name = CURRENCIES['main']['name']
+    embed = success_embed("Items sold!", f"**{name}** earned {amount_text('main', total_earned)}!")
+    items_text = "\n".join(
+        f"• {i['name']} x{i['quantity']} → {i['sell_value']:,} {main_name} each = **{i['total']:,} {main_name}**"
+        for i in items_sold)
+    embed.add_field(name="Items Sold", value=items_text[:1024], inline=False)
+    embed.add_field(name="Total Earned", value=amount_text('main', total_earned), inline=False)
+    if any(w in message.lower() for w in ("not found", "no value", "not enough")):
+        embed.set_footer(text=f"⚠️ {message}")
+    await interaction.response.send_message(embed=embed)
+
+
+# ==================== MINIGAMES ====================
+# One shared implementation; every entry in config.MINIGAMES becomes a command.
+
+def _add_xp_info(embed, xp_result):
+    if not xp_result:
+        return
+    if xp_result['leveled_up']:
+        bonus_gain = db.level_bonus(xp_result['new_level']) - db.level_bonus(xp_result['old_level'])
+        value = f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**"
+        if bonus_gain:
+            value += f"\n+{bonus_gain} roll bonus!"
+        embed.add_field(name=f"{EMOJI['level_up']} LEVEL UP!", value=value, inline=False)
+        embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
+    else:
+        embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
+
+
+class MinigameView(discord.ui.View):
+    def __init__(self, game, character_name, item_name, result, user_id):
+        super().__init__(timeout=60)
+        self.user_id = user_id  # only the player who started it may click
+        self.game = game
+        self.cfg = MINIGAMES[game]
+        self.character_name = character_name
+        self.item_name = item_name
+        self.difficulty = result['difficulty']
+        self.flee_message = result['flee_message'] or self.cfg['default_flee'].format(item=item_name)
+        self.fail_message = result['fail_message'] or self.cfg['default_fail'].format(item=item_name)
+        self.attempt_button.label = self.cfg['attempt_button']
+        self.leave_button.label = self.cfg['leave_button']
+
+    async def interaction_check(self, interaction: discord.Interaction):
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message(
+            embed=error_embed(f"Only the player of **{self.character_name}** can decide here!", "Not your turn!"),
+            ephemeral=True)
+        return False
+
+    def _title(self, text):
+        return f"{self.cfg['emoji']} ┃ {text}"
+
+    async def _finish(self, interaction, embed):
+        self.stop()  # ignore further clicks
+        for item in self.children:
+            item.disabled = True
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Attempt", style=discord.ButtonStyle.danger)
+    async def attempt_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        bonus = db.get_level_bonus(self.character_name, self.game)
+        roll = random.randint(1, 20)
+        success = roll + bonus >= self.difficulty
+        xp_reward = config.MINIGAME_XP_BASE + self.difficulty * config.MINIGAME_XP_PER_DIFFICULTY
+        roll_text = f"**{self.character_name}** rolled **{roll}**" + (f" +{bonus}" if bonus > 0 else "")
+
+        if success:
+            db.add_minigame_item(self.character_name, self.item_name)
+            embed = discord.Embed(title=self._title(self.cfg['success_title']),
+                                  description=f"{roll_text}\n\n{self.cfg['success_text'].format(item=self.item_name)}",
+                                  color=COLOR_DEFAULT)
+            embed.add_field(name="Obtained", value=f"**{self.item_name}**", inline=True)
+        else:
+            xp_reward //= 4
+            embed = discord.Embed(title=self._title(self.cfg['fail_title']),
+                                  description=f"{roll_text}\n\n{self.fail_message}", color=COLOR_ERROR)
+            embed.add_field(name="Result", value="No item obtained", inline=True)
+
+        xp_result = db.add_xp(self.character_name, xp_reward, self.game)
+        embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
+        _add_xp_info(embed, xp_result)
+        await self._finish(interaction, embed)
+
+    @discord.ui.button(label="Leave It", style=discord.ButtonStyle.gray)
+    async def leave_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        xp_reward = config.MINIGAME_XP_LEAVE
+        xp_result = db.add_xp(self.character_name, xp_reward, self.game)
+        leave_text = self.cfg['leave_text'].format(name=self.character_name, item=self.item_name)
+        embed = discord.Embed(title=self._title(self.cfg['leave_title']),
+                              description=f"{leave_text}\n\n{self.flee_message}", color=COLOR_DEFAULT)
+        embed.add_field(name="Result", value="No item obtained", inline=True)
+        embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
+        _add_xp_info(embed, xp_result)
+        await self._finish(interaction, embed)
+
+
+async def run_minigame(interaction, name, game):
+    if not await require_owner(interaction, name):
+        return
+    cfg = MINIGAMES[game]
+    result = db.roll_minigame(name, game)
+    if result is None:
+        await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
+        return
+
+    embed = discord.Embed(title=f"{cfg['emoji']} ┃ {cfg['label']}", description=result['description'],
+                          color=COLOR_DEFAULT)
+    item_name = result['item']
+    if not item_name:
+        await interaction.response.send_message(embed=embed)
+        return
+
+    profile = db.get_profile(name)
+    level = profile[f"{game}_level"] if profile else 1
+    embed.add_field(name=cfg['found_field'], value=f"**{item_name}**", inline=True)
+    embed.add_field(name="Difficulty", value=f"**{result['difficulty']}**", inline=True)
+    embed.set_footer(text=f"{name} (Level {level})")
+    await interaction.response.send_message(embed=embed, view=MinigameView(game, name, item_name, result, interaction.user.id))
+
+
+def _register_minigame_command(game, cfg):
+    @bot.tree.command(name=game, description=cfg['command_description'])
+    @app_commands.describe(name="Character name")
+    async def _minigame_command(interaction: discord.Interaction, name: str):
+        await run_minigame(interaction, name, game)
+
+
+for _game, _cfg in MINIGAMES.items():
+    _register_minigame_command(_game, _cfg)
+
+
+# ==================== UTILITY COMMANDS ====================
+
+def _roll_dice(expr):
+    """'2d6+3' -> (rolls, modifier, total) or None if invalid / too large."""
+    match_ = re.match(r'(\d+)d(\d+)([+-]\d+)?', expr.lower())
+    if not match_:
+        return None
+    num_dice, num_sides = int(match_.group(1)), int(match_.group(2))
+    modifier = int(match_.group(3)) if match_.group(3) else 0
+    if num_dice < 1 or num_sides < 1 or num_dice > 100 or num_sides > 1000:
+        return "too_big"
+    rolls = [random.randint(1, num_sides) for _ in range(num_dice)]
+    return rolls, modifier, sum(rolls) + modifier
+
+
+@bot.tree.command(name="roll", description="Roll dice (e.g., 1d20, 2d6)")
+@app_commands.describe(dice="Dice notation (e.g., 1d20, 2d6+5)")
+async def roll_dice(interaction: discord.Interaction, dice: str):
+    result = _roll_dice(dice)
+    if result is None:
+        await interaction.response.send_message("Invalid dice format! Use format like: 1d20, 2d6, or 1d20+5")
+        return
+    if result == "too_big":
+        await interaction.response.send_message("Too many dice or sides! Keep it reasonable.")
+        return
+    rolls, modifier, total = result
+    embed = discord.Embed(title=f"{EMOJI['dice']} ┃ Roll", color=COLOR_DEFAULT)
+    if len(rolls) > 1 or modifier != 0:
+        modifier_str = f" {modifier:+d}" if modifier else ""
+        embed.add_field(name="Result:", value=f"**{total}**", inline=False)
+        embed.add_field(name="", value=f"-# Rolling {dice.lower()}\n-# Rolls: {', '.join(map(str, rolls))}{modifier_str}",
+                        inline=False)
+    else:
+        embed.add_field(name="Result:", value=f"**{rolls[0]}**", inline=False)
+        embed.add_field(name="", value=f"-# Rolling {dice.lower()}", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="choose", description="Pick a random option from a list")
+@app_commands.describe(options="Comma-separated list of options")
+async def choose(interaction: discord.Interaction, options: str):
+    choices = [choice.strip() for choice in options.split(',') if choice.strip()]
+    if len(choices) < 2:
+        await interaction.response.send_message("Please provide at least 2 options separated by commas!")
+        return
+    embed = discord.Embed(title=f"{EMOJI['choose']} ┃ Random Choice",
+                          description=f"I choose: **{random.choice(choices)}**", color=COLOR_DEFAULT)
+    embed.set_footer(text=f"Options: {', '.join(choices)}"[:2048])
+    await interaction.response.send_message(embed=embed)
+
+
+@bot.tree.command(name="location", description="Travel to a random location")
+@app_commands.describe(name="Character name")
+async def location(interaction: discord.Interaction, name: str):
+    if not await require_owner(interaction, name):
+        return
+    profile = db.get_profile(name)
+    if not profile:
+        await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
+        return
+    embed = discord.Embed(title=f"{EMOJI['location']} ┃ Location",
+                          description=f"**{profile['name']}** sets off and arrives at **{db.get_random_location()}**.",
+                          color=COLOR_DEFAULT)
+    await interaction.response.send_message(embed=embed)
+
+
 @bot.tree.command(name="help", description="Show all available commands")
 async def help_command(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="<:15824redneonstar:1467170916017639615> ┃ Bot Commands Help",
-        description="Here are all available commands for the bot:",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    
-    # Profile Management
-    embed.add_field(
-        name=".✦  Profile Management",
-        value=(
-            "`/create [name] [role]` - Create a new character profile\n"
-            "`/profile [name]` - View character profile and inventory\n"
-            "`/list` - Show all your character profiles\n"
-            "`/editname [name] [new_name]` - Change character name\n"
-            "`/editrole [name] [new_role]` - Change character role\n"
-            "`/deleteprofile [name]` - Delete a character profile"
-        ),
-        inline=False
-    )
-    
-    # Currency
-    embed.add_field(
-        name=".✦  Currency",
-        value=(
-            "`/addcurrency [name] [currency] [amount]` - Add Bloodpoints or Auric Cells\n"
-            "`/removecurrency [name] [currency] [amount]` - Remove currency"
-        ),
-        inline=False
-    )
-    
-    # Inventory & Shop
-    embed.add_field(
-        name=".✦  Inventory & Shop",
-        value=(
-            "`/buy [name] [item]` - Buy item from shop with Bloodpoints\n"
-            "`/additem [name] [item]` - Add item to inventory\n"
-            "`/removeitem [name] [item]` - Remove item from inventory"
-        ),
-        inline=False
-    )
-    
-    # Gameplay
-    embed.add_field(
-        name=".✦  Gameplay",
-        value=(
-            "`/trial [name]` - Complete a trial and earn rewards\n"
-            "`/hunting [name]` - Go hunting for resources\n"
-            "`/fishing [name]` - Go fishing for resources\n"
-            "`/scavenging [name]` - Go scavenging for resources\n"
-            "`/travel [name]` - Travel to a random realm"
-        ),
-        inline=False
-    )
-    
-    # Utility
-    embed.add_field(
-        name=".✦  Utility",
-        value=(
-            "`/roll [dice]` - Roll dice (e.g., 1d20, 2d6)\n"
-            "`/choose [options]` - Pick random option from comma-separated list"
-        ),
-        inline=False
-    )
-    
+    roles = " / ".join(config.ROLES)
+    embed = discord.Embed(title=f"{EMOJI['profile']} ┃ Bot Commands Help",
+                          description="Here are all available commands for the bot:", color=COLOR_DEFAULT)
+    embed.add_field(name=".✦  Profile Management", value=(
+        f"`/create [name] [role]` - Create a new character ({roles})\n"
+        "`/profile [name]` - View character profile and inventory\n"
+        "`/list` - Show all your character profiles\n"
+        "`/editname [name] [new_name]` - Change character name\n"
+        "`/editrole [name] [new_role]` - Change character role\n"
+        "`/deleteprofile [name]` - Delete a character profile\n"
+        "`/claim [name]` - Claim an unowned character"), inline=False)
+    embed.add_field(name=".✦  Currency", value=(
+        f"`/addcurrency` / `/removecurrency` - [Admin] Add or remove {MAIN_NAME} or {PREMIUM_NAME}\n"
+        "`/givecurrency` - Give currency to another character\n"
+        f"`/exchange` - Exchange {MAIN_NAME} and {PREMIUM_NAME}"), inline=False)
+    embed.add_field(name=".✦  Inventory & Shop", value=(
+        "`/shop` - View the shop\n"
+        "`/buy [name] [items]` - Buy items (e.g. `Lantern:2, Bandage`)\n"
+        "`/additem` / `/removeitem` - Add or remove items\n"
+        "`/use [name] [items]` - Use items\n"
+        "`/giveitem` - Give items to another character\n"
+        f"`/value` / `/sell` - Check value of / sell items for {MAIN_NAME}"), inline=False)
+    minigame_lines = "\n".join(f"`/{game} [name]` - {cfg['command_description']}" for game, cfg in MINIGAMES.items())
+    embed.add_field(name=".✦  Gameplay", value=(
+        "`/match [name]` - Play a match and earn rewards\n"
+        "`/matchreward [name] [count]` - Rewards for escapes / eliminations\n"
+        f"{minigame_lines}\n"
+        "`/location [name]` - Travel to a random location"), inline=False)
+    embed.add_field(name=".✦  Utility", value=(
+        "`/roll [dice]` - Roll dice (e.g., 1d20, 2d6+3)\n"
+        "`/choose [options]` - Pick a random option from a comma-separated list"), inline=False)
+    embed.add_field(name=".✦  Reservations", value=(
+        f"`/reserve [character]` - Request a roster character (in <#{config.RESERVE_CHANNEL_ID}>)\n"
+        "`/myreservations` - Your reservations, requests and characters\n"
+        "`/reservations` - List all active reservations"), inline=False)
     embed.set_footer(text="💡 Tip: Use /profile to see your inventory organized by categories!")
-    
     await interaction.response.send_message(embed=embed)
-    
-# Test Welcome Command
-@bot.tree.command(name="testwelcome", description="Test the welcome message system")
-async def test_welcome(interaction: discord.Interaction):
-    """Manually trigger a welcome message to test it"""
-    print(f"[TEST] Testing welcome message triggered by {interaction.user.name}")
-    await interaction.response.send_message("Testing welcome message...", ephemeral=True)
-    
-    # Trigger the welcome event with the command user
-    await on_member_join(interaction.user)
+
+
+# ==================== ADMIN COMMANDS ====================
+
+@bot.tree.command(name="restart", description="[ADMIN] Restart the bot process")
+async def restart_bot(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+    embed = discord.Embed(title="🔄 ┃ Restarting...",
+                          description="Restarting the bot now. It should be back in a few seconds.",
+                          color=COLOR_DEFAULT)
+    await interaction.response.send_message(embed=embed)
+    print(f"[RESTART] Triggered by {interaction.user} ({interaction.user.id})")
+    await bot.close()
+    os._exit(0)  # systemd (Restart=always) starts the bot again
+
+
+# ==================== RESERVATIONS ====================
+
+@bot.tree.command(name="reservations", description="List active reservations")
+async def list_reservations(interaction: discord.Interaction):
+    rows = db.get_active_reservations()
+    embed = discord.Embed(title="📅 Active Reservations", color=COLOR_DEFAULT)
+    if not rows:
+        embed.description = "There are no active reservations."
+    for row in rows[:25]:
+        res_id, channel_id, user_id, r_title, expires_at = row[0], row[2], row[4], row[5], row[12]
+        embed.add_field(name=f"#{res_id} ┃ {r_title or 'Reservation'}",
+                        value=f"<@{user_id}> in <#{channel_id}> ┃ expires <t:{expires_at}:R>", inline=False)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="cancelreservation", description="[ADMIN] Cancel an active reservation")
+@app_commands.describe(reservation_id="The reservation ID (see /reservations)")
+async def cancel_reservation(interaction: discord.Interaction, reservation_id: int):
+    if not await require_admin(interaction):
+        return
+    success, message = db.delete_reservation(reservation_id)
+    embed = success_embed("Reservation Cancelled", message) if success else error_embed(message)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+    if success:
+        schedule_roster_refresh()
+
+
+# ==================== ROSTER ====================
+
+_background_tasks = set()
+
+
+def is_staff(user):
+    if user.id in ADMIN_IDS:
+        return True
+    return any(role.id in config.STAFF_ROLE_IDS for role in getattr(user, 'roles', []))
+
+
+async def require_staff(interaction):
+    if is_staff(interaction.user):
+        return True
+    await interaction.response.send_message(embed=error_embed("Only staff can do this!", "Access Denied!"),
+                                            ephemeral=True)
+    return False
+
+
+def render_roster_part(part):
+    """Turn one part from roster_format.build_roster() into message.send()/edit() arguments."""
+    if part['style'] == 'embed':
+        embed = discord.Embed(title=part['title'] or None, description=part['text'],
+                              color=roster_format.parse_color(part['color']))
+        if part['footer']:
+            embed.set_footer(text=part['footer'])
+        if part['thumbnail']:
+            embed.set_thumbnail(url=part['thumbnail'])
+        if part['image']:
+            embed.set_image(url=part['image'])
+        return {'content': None, 'embeds': [embed]}
+    text = part['text'] + (f"\n\n{part['footer']}" if part['footer'] else "")
+    return {'content': text, 'embeds': []}
+
+
+async def refresh_roster():
+    """Update the roster messages in Discord. Returns an error text, or None on success."""
+    if not config.ROSTER_CHANNEL_ID:
+        return "No roster channel configured (ROSTER_CHANNEL_ID)."
+    async with bot.roster_lock:
+        channel = await resolve_channel(config.ROSTER_CHANNEL_ID)
+        if not channel:
+            return "Roster channel not found."
+        if isinstance(channel, discord.ForumChannel):
+            return "ROSTER_CHANNEL_ID is the forum itself. Use the ID of the post inside the forum."
+        if isinstance(channel, discord.Thread) and channel.archived:
+            # Forum posts archive themselves after inactivity; archived messages can't be edited
+            try:
+                await channel.edit(archived=False)
+            except discord.HTTPException as e:
+                return f"Couldn't reopen the archived roster post (give the bot 'Manage Threads'): {e}"
+        contents = [render_roster_part(part) for part in roster_format.build_roster(db)]
+        stored = db.get_roster_message_ids()
+        no_ping = discord.AllowedMentions.none()  # show mentions without pinging anyone
+
+        if len(stored) == len(contents):
+            try:
+                for message_id, content in zip(stored, contents):
+                    await channel.get_partial_message(int(message_id)).edit(**content, allowed_mentions=no_ping)
+                return None
+            except discord.NotFound:
+                pass  # a roster message was deleted: post everything again below
+
+        # Number of messages changed (or first post): repost all so the order stays Hunters -> Survivors
+        for message_id in stored:
+            try:
+                await channel.get_partial_message(int(message_id)).delete()
+            except discord.HTTPException:
+                pass
+        new_ids = []
+        for content in contents:
+            new_ids.append((await channel.send(**content, allowed_mentions=no_ping)).id)
+        db.set_roster_message_ids(new_ids)
+        return None
+
+
+def schedule_roster_refresh():
+    """Update the roster in the background so commands and buttons answer immediately."""
+    async def runner():
+        try:
+            error = await refresh_roster()
+            if error:
+                print(f"[ROSTER] {error}")
+        except Exception as e:
+            print(f"[ROSTER] Refresh failed: {e}")
+    task = asyncio.create_task(runner())
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+def roster_autocomplete(statuses, exclude_pending=False):
+    """Autocomplete for roster characters, filtered by status (and the optional role option)."""
+    async def autocomplete(interaction: discord.Interaction, current: str):
+        role = getattr(interaction.namespace, 'role', None)
+        characters = db.search_roster(current, statuses=statuses, role=role, exclude_pending=exclude_pending)
+        return [app_commands.Choice(name=c['display'][:100], value=str(c['id'])) for c in characters]
+    return autocomplete
+
+
+def linked_identity(roster_id):
+    """The linked identity (identity switch) of a roster character, or None."""
+    character = db.get_roster_character(roster_id) if roster_id else None
+    if character and character['linked_id']:
+        return db.get_roster_character(character['linked_id'])
+    return None
+
+
+async def close_staff_message(interaction, decision_text, color):
+    """Add the decision to a staff request message and remove its buttons."""
+    if interaction.message and interaction.message.embeds:
+        embed = interaction.message.embeds[0]
+        embed.color = color
+        embed.add_field(name="Decision", value=decision_text, inline=False)
+        await interaction.response.edit_message(embed=embed, view=None)
+    else:
+        await interaction.response.send_message(decision_text, ephemeral=True)
+
+
+async def handle_approve(interaction, reservation_id, days):
+    info = db.get_reservation_info(reservation_id)
+    if info and info['status'] == 'pending':
+        is_extension = False
+        success, message = db.approve_reservation(reservation_id, days, interaction.user.id)
+    elif info and info['status'] == 'active' and info['extension_pending']:
+        is_extension = True
+        success, message = db.approve_extension(reservation_id, days, interaction.user.id)
+    else:
+        success, message, is_extension = False, "This request was already handled.", False
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
+        return
+
+    info = db.get_reservation_info(reservation_id)
+    label = "Extension approved" if is_extension else "Approved"
+    await close_staff_message(interaction, f"✅ {label} by {interaction.user.mention} · {days} day(s)", COLOR_DEFAULT)
+
+    channel = await resolve_channel(int(info['channel_id']))
+    if channel:
+        expires = info['expires_at']
+        description = f"**{info['title']}** is reserved for <@{info['user_id']}>."
+        linked = linked_identity(info['roster_id'])
+        if linked:
+            description += f"\nThis includes the linked identity **{linked['display']}**."
+        embed = discord.Embed(title=f"📅 ┃ Reservation {'Extended' if is_extension else 'Confirmed'}",
+                              description=description, color=COLOR_DEFAULT)
+        embed.add_field(name="Expires", value=f"<t:{expires}:F> ┃ <t:{expires}:R>", inline=False)
+        embed.set_footer(text=f"Reservation #{reservation_id}")
+        sent = await channel.send(content=f"<@{info['user_id']}>", embed=embed)
+        if not is_extension:
+            db.set_reservation_message(reservation_id, sent.id)
+    schedule_roster_refresh()
+
+
+async def handle_deny(interaction, reservation_id, reason):
+    success, message, kind = db.deny_request(reservation_id, interaction.user.id)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
+        return
+    info = db.get_reservation_info(reservation_id)
+    is_extension = kind == 'extension'
+    reason_text = f"\n**Reason:** {reason}" if reason else ""
+    await close_staff_message(
+        interaction, f"❌ {'Extension denied' if is_extension else 'Denied'} by {interaction.user.mention}{reason_text}",
+        COLOR_ERROR)
+
+    channel = await resolve_channel(int(info['channel_id']))
+    if channel:
+        if is_extension:
+            text = (f"Your extension for **{info['title']}** was not approved. "
+                    f"The reservation still runs out <t:{info['expires_at']}:R>.")
+        else:
+            text = f"Your reservation request for **{info['title']}** was not approved."
+        embed = discord.Embed(title=f"{EMOJI['error']} ┃ {'Extension' if is_extension else 'Request'} Denied",
+                              description=text + reason_text, color=COLOR_ERROR)
+        await channel.send(content=f"<@{info['user_id']}>", embed=embed)
+
+
+async def handle_extend_click(interaction, reservation_id):
+    success, message = db.request_extension(reservation_id, interaction.user.id)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
+        return
+    info = db.get_reservation_info(reservation_id)
+    await interaction.response.edit_message(view=None)  # the Extend button can only be used once
+
+    staff_channel = await resolve_channel(config.STAFF_CHANNEL_ID)
+    if staff_channel:
+        embed = discord.Embed(title="🔁 ┃ Extension Request",
+                              description=f"<@{info['user_id']}> would like to extend **{info['title']}**.",
+                              color=COLOR_DEFAULT)
+        embed.add_field(name="Currently expires",
+                        value=f"<t:{info['expires_at']}:F> ┃ <t:{info['expires_at']}:R>", inline=False)
+        embed.set_footer(text=f"Reservation #{reservation_id}")
+        sent = await staff_channel.send(embed=embed, view=request_view(reservation_id))
+        db.set_request_message(reservation_id, sent.id)
+    await interaction.followup.send(embed=success_embed("Extension requested!", "Staff will get back to you."),
+                                    ephemeral=True)
+
+
+class ApproveLengthModal(discord.ui.Modal, title="Approve with a custom length"):
+    days = discord.ui.TextInput(label=f"Days (1–{config.MAX_RESERVATION_DAYS})",
+                                default=str(config.RESERVATION_DAYS), max_length=3)
+
+    def __init__(self, reservation_id):
+        super().__init__()
+        self.reservation_id = reservation_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            days = int(self.days.value)
+        except ValueError:
+            days = 0
+        if not 1 <= days <= config.MAX_RESERVATION_DAYS:
+            await interaction.response.send_message(
+                embed=error_embed(f"Please enter a number from 1 to {config.MAX_RESERVATION_DAYS}."), ephemeral=True)
+            return
+        await handle_approve(interaction, self.reservation_id, days)
+
+
+class DenyModal(discord.ui.Modal, title="Deny request"):
+    reason = discord.ui.TextInput(label="Reason (optional, the member sees it)", style=discord.TextStyle.paragraph,
+                                  required=False, max_length=500)
+
+    def __init__(self, reservation_id):
+        super().__init__()
+        self.reservation_id = reservation_id
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await handle_deny(interaction, self.reservation_id, self.reason.value.strip())
+
+
+RESERVATION_BUTTONS = {
+    'approve': (f"Approve ({config.RESERVATION_DAYS} days)", discord.ButtonStyle.success),
+    'custom': ("Approve (custom length)", discord.ButtonStyle.primary),
+    'deny': ("Deny", discord.ButtonStyle.danger),
+    'extend': ("Extend", discord.ButtonStyle.primary),
+}
+
+
+class ReservationButton(discord.ui.DynamicItem[discord.ui.Button],
+                        template=r'resv:(?P<action>approve|custom|deny|extend):(?P<id>[0-9]+)'):
+    """Buttons on request and reminder messages. The reservation ID is part of the button,
+    so they keep working after the bot restarts."""
+
+    def __init__(self, action, reservation_id):
+        label, style = RESERVATION_BUTTONS[action]
+        super().__init__(discord.ui.Button(label=label, style=style, custom_id=f"resv:{action}:{reservation_id}"))
+        self.action = action
+        self.reservation_id = reservation_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(match['action'], int(match['id']))
+
+    async def callback(self, interaction: discord.Interaction):
+        if self.action == 'extend':
+            await handle_extend_click(interaction, self.reservation_id)
+            return
+        if not await require_staff(interaction):
+            return
+        if self.action == 'approve':
+            await handle_approve(interaction, self.reservation_id, config.RESERVATION_DAYS)
+        elif self.action == 'custom':
+            await interaction.response.send_modal(ApproveLengthModal(self.reservation_id))
+        else:
+            await interaction.response.send_modal(DenyModal(self.reservation_id))
+
+
+def request_view(reservation_id):
+    view = discord.ui.View(timeout=None)
+    for action in ('approve', 'custom', 'deny'):
+        view.add_item(ReservationButton(action, reservation_id))
+    return view
+
+
+class ReleasePlayerButton(discord.ui.DynamicItem[discord.ui.Button], template=r'roster:release:(?P<user>[0-9]+)'):
+    """'Release all' button on the alert when a member leaves the server."""
+
+    def __init__(self, user_id):
+        super().__init__(discord.ui.Button(label="Release all their characters", style=discord.ButtonStyle.danger,
+                                           custom_id=f"roster:release:{user_id}"))
+        self.user_id = user_id
+
+    @classmethod
+    async def from_custom_id(cls, interaction, item, match):
+        return cls(int(match['user']))
+
+    async def callback(self, interaction: discord.Interaction):
+        if not await require_staff(interaction):
+            return
+        names = db.release_player(self.user_id)
+        released = ", ".join(names) if names else "nothing left to release"
+        await close_staff_message(interaction, f"Released by {interaction.user.mention}: {released}", COLOR_DEFAULT)
+        schedule_roster_refresh()
+
+
+@bot.tree.command(name="reserve", description="Request to reserve a character from the roster")
+@app_commands.describe(character="Start typing a name or title", role="Only suggest Hunters or Survivors",
+                       note="Anything staff should know (optional)")
+@app_commands.choices(role=ROLE_CHOICES)
+@app_commands.autocomplete(character=roster_autocomplete(('free',), exclude_pending=True))
+async def reserve(interaction: discord.Interaction, character: str,
+                  role: app_commands.Choice[str] = None, note: str = None):
+    if interaction.channel_id != config.RESERVE_CHANNEL_ID:
+        await interaction.response.send_message(
+            embed=error_embed(f"Please use this command in <#{config.RESERVE_CHANNEL_ID}>."), ephemeral=True)
+        return
+    found = db.find_roster_character(character)
+    if not found:
+        await interaction.response.send_message(
+            embed=error_embed(f"**{character}** isn't on the roster. Please pick one of the suggestions."),
+            ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    success, message, reservation_id = db.create_reservation_request(
+        interaction.guild_id, interaction.channel_id, interaction.user.id, interaction.user.display_name,
+        found['id'], note)
+    if not success:
+        await interaction.followup.send(embed=error_embed(message), ephemeral=True)
+        return
+
+    staff_channel = await resolve_channel(config.STAFF_CHANNEL_ID)
+    if not staff_channel:
+        db.cancel_request(reservation_id)
+        await interaction.followup.send(embed=error_embed("The staff channel wasn't found. Please tell an admin."),
+                                        ephemeral=True)
+        return
+
+    active = len(db.get_member_reservations(interaction.user.id)['active'])
+    embed = discord.Embed(title="📨 ┃ Reservation Request", color=COLOR_DEFAULT)
+    embed.add_field(name="Member", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=False)
+    embed.add_field(name="Character", value=f"**{found['display']}** ({found['role']})", inline=False)
+    linked = linked_identity(found['id'])
+    if linked:
+        embed.add_field(name="Linked identity (included)", value=f"**{linked['display']}** ({linked['role']})",
+                        inline=False)
+    if note:
+        embed.add_field(name="Note", value=note[:1024], inline=False)
+    embed.add_field(name="Active reservations",
+                    value=f"{active}/{config.MAX_RESERVATIONS_PER_MEMBER}", inline=False)
+    embed.set_footer(text=f"Request #{reservation_id}")
+    sent = await staff_channel.send(embed=embed, view=request_view(reservation_id))
+    db.set_request_message(reservation_id, sent.id)
+
+    included = f" (including **{linked['display']}**)" if linked else ""
+    await interaction.followup.send(
+        embed=success_embed("Request sent!", f"Your request for **{found['display']}**{included} was sent to staff. "
+                                             f"You'll be pinged here once it's decided."),
+        ephemeral=True)
+
+
+@bot.tree.command(name="myreservations", description="Show your reservations and characters")
+async def my_reservations(interaction: discord.Interaction):
+    data = db.get_member_reservations(interaction.user.id)
+    embed = discord.Embed(title="📅 ┃ Your Reservations", color=COLOR_DEFAULT)
+    embed.add_field(name="Active", inline=False, value="\n".join(
+        f"• **{r['title']}** – expires <t:{r['expires_at']}:F> (<t:{r['expires_at']}:R>)"
+        + (" · extension requested" if r['extension_pending'] else "")
+        for r in data['active']) or "None")
+    embed.add_field(name="Waiting for staff", inline=False,
+                    value="\n".join(f"• **{r['title']}**" for r in data['pending']) or "None")
+    embed.add_field(name="Your characters", inline=False,
+                    value="\n".join(f"• **{c['display']}**" for c in data['taken']) or "None")
+    embed.set_footer(text=f"You can have up to {config.MAX_RESERVATIONS_PER_MEMBER} reservations at a time.")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="approvecharacter",
+                  description="[STAFF] Submission accepted: mark a character as taken and end its reservation")
+@app_commands.describe(character="The reserved character", member="Only needed if the character wasn't reserved")
+@app_commands.autocomplete(character=roster_autocomplete(('reserved', 'free')))
+async def approve_character(interaction: discord.Interaction, character: str, member: discord.Member = None):
+    if not await require_staff(interaction):
+        return
+    found = db.find_roster_character(character)
+    if not found:
+        await interaction.response.send_message(embed=error_embed("Character not found on the roster."), ephemeral=True)
+        return
+    success, message = db.set_roster_taken(found['id'], member.id if member else None,
+                                           member.display_name if member else None)
+    if not success:
+        await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
+        return
+    player_id = member.id if member else found['player_id']
+    await interaction.response.send_message(embed=success_embed(
+        "Character approved!", f"**{found['display']}** is now taken by <@{player_id}>. "
+                               f"Their reservation has been closed."))
+    schedule_roster_refresh()
+
+
+@bot.tree.command(name="releasecharacter", description="[STAFF] Make a reserved or taken character free again")
+@app_commands.describe(character="The character to release")
+@app_commands.autocomplete(character=roster_autocomplete(('reserved', 'taken')))
+async def release_character(interaction: discord.Interaction, character: str):
+    if not await require_staff(interaction):
+        return
+    found = db.find_roster_character(character)
+    if not found:
+        await interaction.response.send_message(embed=error_embed("Character not found on the roster."), ephemeral=True)
+        return
+    success, message = db.release_roster_character(found['id'])
+    embed = success_embed("Character released!", message) if success else error_embed(message)
+    await interaction.response.send_message(embed=embed)
+    if success:
+        schedule_roster_refresh()
+
+
+# ==================== EVENTS ====================
 
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s)")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
-    rotate_status.start()
-    daily_vacuum.start()
-    check_reservations.start()
+
+
+@bot.tree.command(name="testwelcome", description="[ADMIN] Test the welcome message system")
+async def test_welcome(interaction: discord.Interaction):
+    if not await require_admin(interaction):
+        return
+    print(f"[TEST] Testing welcome message triggered by {interaction.user.name}")
+    await interaction.response.send_message("Testing welcome message...", ephemeral=True)
+    await on_member_join(interaction.user)
+
 
 @bot.event
 async def on_member_join(member):
-    """Send welcome message when a new member joins"""
+    """Send the welcome embed configured in the dashboard."""
     print(f"[WELCOME] Member joined: {member.name} (ID: {member.id})")
     try:
-        # Get welcome settings
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT enabled, embed_id, channel_id FROM welcome_settings WHERE id = 1")
-        settings = cursor.fetchone()
-        
-        print(f"[WELCOME] Settings: {settings}")
-        
-        if not settings:
-            print("[WELCOME] No settings found in database!")
-            conn.close()
+        welcome = db.get_welcome_embed()
+        if not welcome:
+            print("[WELCOME] Disabled or not configured")
             return
-            
-        if not settings[0]:  # Not enabled
-            print("[WELCOME] Welcome messages are disabled!")
-            conn.close()
-            return
-        
-        embed_id = settings[1]
-        channel_id = settings[2]
-        
-        print(f"[WELCOME] Embed ID: {embed_id}, Channel ID: {channel_id}")
-        
-        if not embed_id or not channel_id:
-            print("[WELCOME] Missing embed_id or channel_id!")
-            conn.close()
-            return
-        
-        # Get embed data
-        cursor.execute("SELECT title, description, color, footer_text, image_url, thumbnail_url FROM embeds WHERE id = ?", (embed_id,))
-        embed_data = cursor.fetchone()
-        conn.close()
-        
-        print(f"[WELCOME] Embed data: {embed_data}")
-        
-        if not embed_data:
-            print("[WELCOME] No embed found with that ID!")
-            return
-        
-        # Replace variables in embed
+        (title, description, color, footer, image_url, thumbnail_url), channel_id = welcome
+
+        replacements = {
+            '{user}': member.name,
+            '{mention}': member.mention,
+            '{member_count}': str(member.guild.member_count),
+            '{server}': member.guild.name,
+            '{user_tag}': str(member),
+            '{user_id}': str(member.id),
+        }
+
         def replace_vars(text):
             if not text:
                 return text
-            replacements = {
-                '{user}': member.name,
-                '{mention}': member.mention,
-                '{member_count}': str(member.guild.member_count),
-                '{server}': member.guild.name,
-                '{user_tag}': str(member),
-                '{user_id}': str(member.id)
-            }
             for key, value in replacements.items():
                 text = text.replace(key, value)
             return text
-        
-        # Create embed with replaced variables
-        title = replace_vars(embed_data[0])
-        description = replace_vars(embed_data[1])
-        footer = replace_vars(embed_data[3])
-        
-        print(f"[WELCOME] Original title: {embed_data[0]}")
-        print(f"[WELCOME] Replaced title: {title}")
-        print(f"[WELCOME] Original footer: {embed_data[3]}")
-        print(f"[WELCOME] Replaced footer: {footer}")
-        
-        embed = discord.Embed(
-            title=title,
-            description=description,
-            color=int(embed_data[2] or '000000', 16)
-        )
-        
+
+        embed = discord.Embed(title=replace_vars(title), description=replace_vars(description),
+                              color=int(color or '000000', 16))
         if footer:
-            embed.set_footer(text=footer)
-        if embed_data[4]:
-            embed.set_image(url=embed_data[4])
-        if embed_data[5]:
-            embed.set_thumbnail(url=embed_data[5])
-        
-        # Send to welcome channel
-        channel = bot.get_channel(int(channel_id))
-        print(f"[WELCOME] Channel object: {channel}")
-        
+            embed.set_footer(text=replace_vars(footer))
+        if image_url:
+            embed.set_image(url=image_url)
+        if thumbnail_url:
+            embed.set_thumbnail(url=thumbnail_url)
+
+        channel = await resolve_channel(int(channel_id))
         if channel:
             message = await channel.send(embed=embed)
             print(f"[WELCOME] ✅ Sent welcome message! Message ID: {message.id}")
@@ -1962,777 +1393,320 @@ async def on_member_join(member):
         import traceback
         traceback.print_exc()
 
-# Status rotation
-_status_cycle = itertools.cycle([
-    discord.Activity(type=discord.ActivityType.watching, name="/help | Watching the trials unfold"),
-    discord.Activity(type=discord.ActivityType.watching, name="/help | Watching survivors cower in the fog"),
-    discord.Activity(type=discord.ActivityType.watching, name="/help | Watching killers stalk their prey"),
-    discord.Activity(type=discord.ActivityType.playing,  name="/help | Playing with the survivors' hope"),
-    discord.Activity(type=discord.ActivityType.watching, name="/help | Watching new creatures take shape in the fog"),
-    discord.Activity(type=discord.ActivityType.playing,  name="/help | Playing an eternal game of hunt and prey"),
-])
 
-@tasks.loop(hours=3)
-async def rotate_status():
-    await bot.change_presence(
-        status=discord.Status.dnd,
-        activity=next(_status_cycle)
-    )
+@bot.event
+async def on_member_remove(member):
+    """Alert staff when someone with roster characters or open requests leaves."""
+    try:
+        characters = db.characters_of_player(member.id)
+        pending = db.get_member_reservations(member.id)['pending']
+        if not characters and not pending:
+            return
+        staff_channel = await resolve_channel(config.STAFF_CHANNEL_ID)
+        if not staff_channel:
+            return
+        lines = [f"• **{c['display']}** ({c['status']})" for c in characters]
+        lines += [f"• **{r['title']}** (request waiting for staff)" for r in pending]
+        embed = discord.Embed(title="👋 ┃ Member Left",
+                              description=f"**{member}** ({member.mention}) left the server. They had:\n"
+                                          + "\n".join(lines),
+                              color=COLOR_ERROR)
+        embed.set_footer(text="Nothing was changed. Use the button to free their characters.")
+        view = discord.ui.View(timeout=None)
+        view.add_item(ReleasePlayerButton(member.id))
+        await staff_channel.send(embed=embed, view=view)
+    except Exception as e:
+        print(f"[LEAVE] Error: {e}")
 
-@tasks.loop(minutes=1)
-async def check_reservations():
-    due = db.get_due_reservations()
-    for row in due:
-        res_id, channel_id, user_id, title = row[0], row[2], row[4], row[5]
-        try:
-            channel = bot.get_channel(int(channel_id))
-            if not channel:
-                for guild in bot.guilds:
-                    thread = guild.get_thread(int(channel_id))
-                    if thread:
-                        channel = thread
-                        break
 
-            if channel:
-                embed = discord.Embed(
-                    title="<a:error:1467157734817398946> ┃ Reservation Expired",
-                    description=f"Your reservation for **{title or ''}** has run out.",
-                    color=discord.Color.from_rgb(116, 7, 14)
-                )
-                await channel.send(content=f"<@{user_id}>", embed=embed)
-        except Exception as e:
-            print(f"Failed to send reservation expiry notice for #{res_id}: {e}")
-        finally:
-            db.mark_reservation_notified(res_id)
+async def _reaction_role_target(payload):
+    """(member, role) for a reaction on a reaction-role message, else None."""
+    role_id = db.get_reaction_role(payload.message_id, str(payload.emoji))
+    if not role_id:
+        return None
+    guild = bot.get_guild(payload.guild_id)
+    if not guild:
+        return None
+    member = guild.get_member(payload.user_id)
+    role = guild.get_role(role_id)
+    if not member or not role:
+        return None
+    return member, role
 
 
 @bot.event
 async def on_raw_reaction_add(payload):
-    """Handle reaction roles when user adds a reaction"""
-    # Ignore bot's own reactions
     if payload.user_id == bot.user.id:
         return
-    
     try:
-        # Format emoji for comparison
-        emoji_str = str(payload.emoji)
-        # For custom emojis, format as <:name:id> or <a:name:id>
-        if payload.emoji.id:
-            if payload.emoji.animated:
-                emoji_str = f"<a:{payload.emoji.name}:{payload.emoji.id}>"
-            else:
-                emoji_str = f"<:{payload.emoji.name}:{payload.emoji.id}>"
-        
-        # Check if this message has reaction roles
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?",
-                     (str(payload.message_id), emoji_str))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            return  # Not a reaction role message
-        
-        role_id = int(result[0])
-        
-        # Get guild and member
-        guild = bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        
-        member = guild.get_member(payload.user_id)
-        if not member:
-            return
-        
-        # Get role
-        role = guild.get_role(role_id)
-        if not role:
-            return
-        
-        # Add role
-        await member.add_roles(role)
-        
+        target = await _reaction_role_target(payload)
+        if target:
+            await target[0].add_roles(target[1])
     except Exception as e:
         print(f"[REACTION ROLE] Error: {e}")
+
 
 @bot.event
 async def on_raw_reaction_remove(payload):
-    """Handle reaction roles when user removes a reaction"""
     try:
-        # Format emoji for comparison
-        emoji_str = str(payload.emoji)
-        # For custom emojis, format as <:name:id> or <a:name:id>
-        if payload.emoji.id:
-            if payload.emoji.animated:
-                emoji_str = f"<a:{payload.emoji.name}:{payload.emoji.id}>"
-            else:
-                emoji_str = f"<:{payload.emoji.name}:{payload.emoji.id}>"
-        
-        # Check if this message has reaction roles
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?",
-                     (str(payload.message_id), emoji_str))
-        result = cursor.fetchone()
-        conn.close()
-        
-        if not result:
-            return  # Not a reaction role message
-        
-        role_id = int(result[0])
-        
-        # Get guild and member
-        guild = bot.get_guild(payload.guild_id)
-        if not guild:
-            return
-        
-        member = guild.get_member(payload.user_id)
-        if not member:
-            return
-        
-        # Get role
-        role = guild.get_role(role_id)
-        if not role:
-            return
-        
-        # Remove role
-        await member.remove_roles(role)
-        
+        target = await _reaction_role_target(payload)
+        if target:
+            await target[0].remove_roles(target[1])
     except Exception as e:
         print(f"[REACTION ROLE] Error: {e}")
 
-# ==================== FLASK API FOR EMBEDS ====================
+
+# ==================== BACKGROUND TASKS ====================
+
+_status_cycle = itertools.cycle([
+    discord.Activity(type=getattr(discord.ActivityType, kind), name=text)
+    for kind, text in config.STATUS_MESSAGES
+])
+
+
+@tasks.loop(hours=config.STATUS_ROTATION_HOURS)
+async def rotate_status():
+    await bot.change_presence(status=discord.Status.dnd, activity=next(_status_cycle))
+
+
+@rotate_status.before_loop
+async def _before_rotate_status():
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=1)
+async def check_reservations():
+    # 1) "Ends soon" reminder with an Extend button
+    for info in db.get_due_reminders():
+        message_id = None
+        try:
+            channel = await resolve_channel(int(info['channel_id']))
+            if channel:
+                embed = discord.Embed(
+                    title="⏳ ┃ Reservation Ending Soon",
+                    description=(f"Your reservation for **{info['title']}** runs out <t:{info['expires_at']}:R>.\n"
+                                 f"Need more time? Click **Extend** to ask staff."),
+                    color=COLOR_DEFAULT)
+                view = discord.ui.View(timeout=None)
+                view.add_item(ReservationButton('extend', info['id']))
+                message_id = (await channel.send(content=f"<@{info['user_id']}>", embed=embed, view=view)).id
+        except Exception as e:
+            print(f"Failed to send reservation reminder for #{info['id']}: {e}")
+        finally:
+            db.mark_reminded(info['id'], message_id)  # never remind twice, even if sending failed
+
+    # 2) Expired reservations: ping the member and free the character
+    roster_changed = False
+    for row in db.get_due_reservations():
+        info = db.expire_reservation(row[0])
+        if not info:
+            continue
+        is_roster = bool(info['roster_id'])
+        roster_changed = roster_changed or is_roster
+        try:
+            channel = await resolve_channel(int(info['channel_id']))
+            if not channel:
+                continue
+            if info['reminder_message_id']:  # the Extend button is no longer useful
+                try:
+                    await channel.get_partial_message(int(info['reminder_message_id'])).edit(view=None)
+                except discord.HTTPException:
+                    pass
+            text = f"Your reservation for **{info['title'] or ''}** has run out."
+            if is_roster:
+                text += " The character is free again."
+            embed = discord.Embed(title=f"{EMOJI['error']} ┃ Reservation Expired", description=text, color=COLOR_ERROR)
+            await channel.send(content=f"<@{info['user_id']}>", embed=embed)
+        except Exception as e:
+            print(f"Failed to send reservation expiry notice for #{info['id']}: {e}")
+    if roster_changed:
+        schedule_roster_refresh()
+
+
+@check_reservations.before_loop
+async def _before_check_reservations():
+    await bot.wait_until_ready()  # channel cache must be filled first
+
+
+@tasks.loop(hours=24)
+async def daily_checkpoint():
+    """Keep the WAL file small. Runs in a thread so the bot never blocks on it."""
+    try:
+        await asyncio.to_thread(db.checkpoint)
+        print("[DB] Daily WAL checkpoint complete")
+    except Exception as e:
+        print(f"[DB] checkpoint error: {e}")
+
+
+# ==================== INTERNAL API (used by the dashboard) ====================
+
+def run_on_bot(coro, timeout=10):
+    """Run a coroutine on the bot's event loop from a Flask thread and wait for the result."""
+    return asyncio.run_coroutine_threadsafe(coro, bot.loop).result(timeout=timeout)
+
+
+def build_embed(data):
+    embed = discord.Embed(title=data.get('title'), description=data.get('description'),
+                          color=int(data.get('color') or '000000', 16))
+    if data.get('footer_text'):
+        embed.set_footer(text=data['footer_text'])
+    if data.get('image_url'):
+        embed.set_image(url=data['image_url'])
+    if data.get('thumbnail_url'):
+        embed.set_thumbnail(url=data['thumbnail_url'])
+    return embed
+
+
+async def _add_reactions(message, reaction_roles):
+    for rr in reaction_roles:
+        try:
+            await message.add_reaction(rr['emoji'])
+        except Exception as e:
+            print(f"Failed to add reaction {rr['emoji']}: {e}")
+
+
 @api.route('/send_embed', methods=['POST'])
 def api_send_embed():
     try:
         data = request.json
         channel_id = int(data['channel_id'])
-        reaction_roles = data.get('reaction_roles', [])
-        
-        # Create embed
-        embed = discord.Embed(
-            title=data.get('title'),
-            description=data.get('description'),
-            color=int(data.get('color', '000000'), 16)
-        )
-        
-        if data.get('footer_text'):
-            embed.set_footer(text=data['footer_text'])
-        if data.get('image_url'):
-            embed.set_image(url=data['image_url'])
-        if data.get('thumbnail_url'):
-            embed.set_thumbnail(url=data['thumbnail_url'])
-        
-        # Send via bot using asyncio
+        embed = build_embed(data)
+
         async def send():
-            # Try to get regular channel first
-            channel = bot.get_channel(channel_id)
-            
-            # If not found, try to get thread (includes forum posts)
-            if not channel:
-                # Search all guilds for the thread
-                for guild in bot.guilds:
-                    thread = guild.get_thread(channel_id)
-                    if thread:
-                        channel = thread
-                        break
-            
+            channel = await resolve_channel(channel_id)
             if not channel:
                 return None
-            
             message = await channel.send(embed=embed)
-            
-            # Add reactions for reaction roles
-            for rr in reaction_roles:
-                try:
-                    await message.add_reaction(rr['emoji'])
-                except Exception as e:
-                    print(f"Failed to add reaction {rr['emoji']}: {e}")
-            
+            await _add_reactions(message, data.get('reaction_roles', []))
             return message.id
-        
-        # Get the bot's event loop
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(send(), bot.loop)
-        message_id = future.result(timeout=10)
-        
+
+        message_id = run_on_bot(send())
         if message_id:
             return jsonify({'status': 'success', 'message_id': str(message_id)}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Channel not found'}), 404
-            
+        return jsonify({'status': 'error', 'message': 'Channel not found'}), 404
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 @api.route('/update_embed', methods=['POST'])
 def api_update_embed():
     try:
         data = request.json
-        channel_id = int(data['channel_id'])
-        message_id = int(data['message_id'])
-        
-        # Create embed
-        embed = discord.Embed(
-            title=data.get('title'),
-            description=data.get('description'),
-            color=int(data.get('color', '000000'), 16)
-        )
-        
-        if data.get('footer_text'):
-            embed.set_footer(text=data['footer_text'])
-        if data.get('image_url'):
-            embed.set_image(url=data['image_url'])
-        if data.get('thumbnail_url'):
-            embed.set_thumbnail(url=data['thumbnail_url'])
-        
-        # Update via bot using asyncio
+        channel_id, message_id = int(data['channel_id']), int(data['message_id'])
+        embed = build_embed(data)
+
         async def update():
-            # Try to get regular channel first
-            channel = bot.get_channel(channel_id)
-            
-            # If not found, try to get thread (includes forum posts)
-            if not channel:
-                # Search all guilds for the thread
-                for guild in bot.guilds:
-                    thread = guild.get_thread(channel_id)
-                    if thread:
-                        channel = thread
-                        break
-            
+            channel = await resolve_channel(channel_id)
             if not channel:
                 return False
             message = await channel.fetch_message(message_id)
             await message.edit(embed=embed)
             return True
-        
-        # Get the bot's event loop
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(update(), bot.loop)
-        success = future.result(timeout=10)
-        
-        if success:
+
+        if run_on_bot(update()):
             return jsonify({'status': 'success'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Channel or message not found'}), 404
-            
+        return jsonify({'status': 'error', 'message': 'Channel or message not found'}), 404
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 @api.route('/update_reactions', methods=['POST'])
 def api_update_reactions():
-    """Clear existing reactions on a message and re-add based on updated reaction_roles list."""
+    """Clear the reactions on a message and re-add the current reaction-role emojis."""
     try:
         data = request.json
-        channel_id = int(data['channel_id'])
-        message_id = int(data['message_id'])
-        reaction_roles = data.get('reaction_roles', [])
+        channel_id, message_id = int(data['channel_id']), int(data['message_id'])
 
         async def update():
-            channel = bot.get_channel(channel_id)
-            if not channel:
-                for guild in bot.guilds:
-                    thread = guild.get_thread(channel_id)
-                    if thread:
-                        channel = thread
-                        break
+            channel = await resolve_channel(channel_id)
             if not channel:
                 return False
             message = await channel.fetch_message(message_id)
-            # Clear all existing reactions the bot added
             await message.clear_reactions()
-            # Re-add the new set
-            for rr in reaction_roles:
-                try:
-                    await message.add_reaction(rr['emoji'])
-                except Exception as e:
-                    print(f"Failed to add reaction {rr['emoji']}: {e}")
+            await _add_reactions(message, data.get('reaction_roles', []))
             return True
 
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(update(), bot.loop)
-        success = future.result(timeout=15)
-
-        if success:
+        if run_on_bot(update(), timeout=15):
             return jsonify({'status': 'success'}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Channel or message not found'}), 404
-
+        return jsonify({'status': 'error', 'message': 'Channel or message not found'}), 404
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-@api.route('/send_reservation', methods=['POST'])
-def api_send_reservation():
-    try:
-        data = request.json
-        channel_id = int(data['channel_id'])
-        user_id = int(data['user_id'])
-        reservation_id = data['reservation_id']
-        title = data.get('title') or "<:IconAddon_bloodiedWater:1468241349856722944> ┃ Reservation Active"
-        description = data.get('description') or f"Successfully reserved!"
-        color = data.get('color', '000000')
-        expires_at = int(data['expires_at'])
-        image_url = data.get('image_url')
-        thumbnail_url = data.get('thumbnail_url')
-
-        embed = discord.Embed(
-            description=description,
-            color=int(color, 16) if color else 0
-        )
-        embed.add_field(name="Expires", value=f"<t:{expires_at}:F> ┃ <t:{expires_at}:R>", inline=False)
-        if image_url:
-            embed.set_image(url=image_url)
-        if thumbnail_url:
-            embed.set_thumbnail(url=thumbnail_url)
-
-        async def send():
-            channel = bot.get_channel(channel_id)
-            if not channel:
-                for guild in bot.guilds:
-                    thread = guild.get_thread(channel_id)
-                    if thread:
-                        channel = thread
-                        break
-            if not channel:
-                return None
-            message = await channel.send(content=f"<@{user_id}>", embed=embed)
-            return message.id
-
-        import asyncio
-        future = asyncio.run_coroutine_threadsafe(send(), bot.loop)
-        message_id = future.result(timeout=10)
-
-        if message_id:
-            return jsonify({'status': 'success', 'message_id': str(message_id)}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Channel not found'}), 404
-
-    except Exception as e:
-        return jsonify({'status': 'error', 'message': str(e)}), 500
 
 @api.route('/upload_image', methods=['POST'])
 def api_upload_image():
-    """Upload image to Discord and return the CDN URL"""
+    """Upload an image to the UPLOAD_CHANNEL_ID channel and return its Discord CDN URL."""
     try:
-        if 'file' not in request.files:
+        file = request.files.get('file')
+        if not file or not file.filename:
             return jsonify({'status': 'error', 'message': 'No file provided'}), 400
-        
-        file = request.files['file']
-        if not file.filename:
-            return jsonify({'status': 'error', 'message': 'Empty filename'}), 400
-        
-        # Get upload channel ID from env or use a default
-        # You need to set UPLOAD_CHANNEL_ID in your .env file
         upload_channel_id = int(os.getenv('UPLOAD_CHANNEL_ID', '0'))
-        
         if not upload_channel_id:
-            return jsonify({'status': 'error', 'message': 'Upload channel not configured'}), 500
-        
-        # Upload to Discord
+            return jsonify({'status': 'error', 'message': 'Upload channel not configured (UPLOAD_CHANNEL_ID)'}), 500
+        file_data = file.read()
+
         async def upload():
-            channel = bot.get_channel(upload_channel_id)
+            channel = await resolve_channel(upload_channel_id)
             if not channel:
                 return None
-            
-            # Read file data
-            file_data = file.read()
-            discord_file = discord.File(io.BytesIO(file_data), filename=file.filename)
-            
-            # Send file to Discord channel
-            message = await channel.send(file=discord_file)
-            
-            # Return the attachment URL
-            if message.attachments:
-                return message.attachments[0].url
-            return None
-        
-        # Get the bot's event loop
-        import asyncio
-        import io
-        future = asyncio.run_coroutine_threadsafe(upload(), bot.loop)
-        image_url = future.result(timeout=10)
-        
+            message = await channel.send(file=discord.File(io.BytesIO(file_data), filename=file.filename))
+            return message.attachments[0].url if message.attachments else None
+
+        image_url = run_on_bot(upload())
         if image_url:
             return jsonify({'status': 'success', 'url': image_url}), 200
-        else:
-            return jsonify({'status': 'error', 'message': 'Failed to upload'}), 500
-            
+        return jsonify({'status': 'error', 'message': 'Failed to upload'}), 500
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500
 
-# New Ownership Commands
-@bot.tree.command(name="claim", description="Claim an unowned character")
-@app_commands.describe(name="Character name to claim")
-async def claim_character(interaction: discord.Interaction, name: str):
-    success, message = db.claim_character(name, interaction.user.id)
-    
-    if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Character claimed!",
-            description=message,
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="restart", description="[ADMIN] Restart the bot process")
-async def restart_bot(interaction: discord.Interaction):
-    if interaction.user.id not in ADMIN_IDS:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description="❌ Only admins can use this command!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    embed = discord.Embed(
-        title="🔄 ┃ Restarting...",
-        description="Restarting the bot now. It should be back in a few seconds.",
-        color=discord.Color.from_rgb(0, 0, 0)
-    )
-    await interaction.response.send_message(embed=embed)
-    print(f"[RESTART] Triggered by {interaction.user} ({interaction.user.id})")
-
-    await bot.close()
-    os._exit(0)
-
-@bot.tree.command(name="assignowner", description="[ADMIN] Manually assign character ownership")
-@app_commands.describe(
-    character="Character name",
-    user="User to assign ownership to"
-)
-async def assign_owner(interaction: discord.Interaction, character: str, user: discord.User):
-    # CHECK IF USER IS ADMIN
-    if interaction.user.id not in ADMIN_IDS:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description="❌ Only admins can use this command!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    success, message = db.assign_owner(character, user.id)
-    
-    if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Owner assigned!",
-            description=f"**{character}** is now owned by {user.mention}\n\n{message}",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="reservation", description="[ADMIN] Create a reservation timer that pings a user when it expires")
-@app_commands.describe(
-    user="The user this reservation is for",
-    hours="Hours until the reservation expires (max 336 / 14 days)",
-    title="Embed title (optional)",
-    description="Embed description (optional)",
-    color="Hex color, e.g. FF0000 (optional)",
-    image_url="Embed image URL (optional)",
-    thumbnail_url="Embed thumbnail URL (optional)"
-)
-async def create_reservation(interaction: discord.Interaction, user: discord.Member, hours: float,
-                              title: str = None, description: str = None, color: str = None,
-                              image_url: str = None, thumbnail_url: str = None):
-    if interaction.user.id not in ADMIN_IDS:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description="❌ Only admins can use this command!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    if hours <= 0 or hours > 336:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description="Reservation length must be between 0 and 336 hours (14 days).",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    color_value = color.lstrip('#') if color else '000000'
+@api.route('/member_names', methods=['POST'])
+def api_member_names():
+    """{user_id: current display name} for the dashboard's 'Played by' columns."""
     try:
-        color_int = int(color_value, 16)
-    except ValueError:
-        color_value = '000000'
-        color_int = 0
+        ids = [str(i) for i in (request.json or {}).get('ids', []) if str(i).isdigit()]
 
-    embed_title = title or "📅 Reservation Active"
-    embed_description = description or f"{user.mention} has an active reservation."
+        async def lookup():
+            guild = bot.get_guild(int(config.GUILD_ID)) if str(config.GUILD_ID).isdigit() else None
+            guilds = [guild] if guild else bot.guilds
+            names = {}
+            for user_id in ids:
+                for g in guilds:
+                    member = g.get_member(int(user_id))
+                    if member:
+                        names[user_id] = member.display_name
+                        break
+            return names
 
-    reservation_id, expires_at = db.create_reservation(
-        interaction.guild_id, interaction.channel_id, user.id,
-        embed_title, embed_description, color_value, None, image_url, thumbnail_url, hours
-    )
-
-    embed = discord.Embed(
-        title=embed_title,
-        description=embed_description,
-        color=discord.Color(color_int)
-    )
-    embed.add_field(name="Expires", value=f"<t:{expires_at}:F> ┃ <t:{expires_at}:R>", inline=False)
-    if image_url:
-        embed.set_image(url=image_url)
-    if thumbnail_url:
-        embed.set_thumbnail(url=thumbnail_url)
-    embed.set_footer(text=f"Reservation #{reservation_id}")
-
-    await interaction.response.send_message(content=user.mention, embed=embed)
-    sent_message = await interaction.original_response()
-    db.set_reservation_message(reservation_id, sent_message.id)
-
-@bot.tree.command(name="reservations", description="List active reservations")
-async def list_reservations(interaction: discord.Interaction):
-    rows = db.get_active_reservations()
-    if not rows:
-        embed = discord.Embed(
-            title="📅 Active Reservations",
-            description="There are no active reservations.",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    embed = discord.Embed(title="📅 Active Reservations", color=discord.Color.from_rgb(0, 0, 0))
-    for row in rows:
-        res_id, channel_id, user_id, r_title, expires_at = row[0], row[2], row[4], row[5], row[12]
-        embed.add_field(
-            name=f"#{res_id} ┃ {r_title or 'Reservation'}",
-            value=f"<@{user_id}> in <#{channel_id}> ┃ expires <t:{expires_at}:R>",
-            inline=False
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="cancelreservation", description="[ADMIN] Cancel an active reservation")
-@app_commands.describe(reservation_id="The reservation ID (see /reservations)")
-async def cancel_reservation(interaction: discord.Interaction, reservation_id: int):
-    if interaction.user.id not in ADMIN_IDS:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description="❌ Only admins can use this command!",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    success, message = db.delete_reservation(reservation_id)
-    if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Reservation Cancelled",
-            description=message,
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-@bot.tree.command(name="value", description="Check the sell value of items from your inventory")
-@app_commands.describe(
-    name="Character name",
-    items="Item names separated by commas (e.g., Fresh Meat, Animal Hide, Old Map)"
-)
-async def value_items(interaction: discord.Interaction, name: str, items: str):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-    
-    # Parse items - split by comma and strip whitespace
-    item_list = [item.strip() for item in items.split(',')]
-    
-    success, message, items_info, total_value = db.get_item_values(name, item_list)
-    
-    if success:
-        # Create value display
-        if len(items_info) == 0:
-            embed = discord.Embed(
-                title="<a:error:1467157734817398946> ┃ No Items!",
-                description="No items found to value!",
-                color=discord.Color.from_rgb(116, 7, 14)
-            )
-        else:
-            embed = discord.Embed(
-                title="<:bp:1467159740797681716> ┃ Item Values",
-                description=f"**{name}**'s sellable items:",
-                color=discord.Color.from_rgb(0, 0, 0)
-            )
-            
-            # Add each item as a field
-            for item_info in items_info:
-                item_name = item_info['name']
-                quantity = item_info['quantity']
-                sell_value = item_info['sell_value']
-                item_total = item_info['total']
-                
-                if sell_value == 0:
-                    value_text = "❌ Not sellable"
-                else:
-                    value_text = f"<:bp:1467159740797681716> {sell_value:,} BP each\n**Total:** {item_total:,} BP ({quantity}x)"
-                
-                embed.add_field(
-                    name=f"• {item_name}",
-                    value=value_text,
-                    inline=False
-                )
-            
-            # Add total value
-            embed.add_field(
-                name="━━━━━━━━━━━━━━",
-                value=f"**Total Value:** <:bp:1467159740797681716> {total_value:,} BP",
-                inline=False
-            )
-            
-            # Warning if any items not found
-            if "not found" in message.lower():
-                embed.set_footer(text=f"⚠️ {message}")
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-    
-    await interaction.response.send_message(embed=embed)
-
-@bot.tree.command(name="sell", description="Sell items from your inventory for Bloodpoints")
-@app_commands.describe(
-    name="Character name",
-    items="Items to sell, e.g: Fresh Meat:3, Old Coins, Animal Hide:2  (no number = sell 1)"
-)
-async def sell_items(interaction: discord.Interaction, name: str, items: str):
-    # Check ownership
-    is_owner, msg = db.check_ownership(name, interaction.user.id)
-    if not is_owner:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Access Denied!",
-            description=msg,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    # Parse "Item Name:quantity, Other Item, Another:5" into {name: qty}
-    item_quantities = {}
-    parse_errors = []
-    for entry in items.split(','):
-        entry = entry.strip()
-        if not entry:
-            continue
-        if ':' in entry:
-            parts = entry.rsplit(':', 1)          # split on last colon only
-            item_name = parts[0].strip()
-            try:
-                qty = int(parts[1].strip())
-                if qty < 1:
-                    raise ValueError
-            except ValueError:
-                parse_errors.append(f"`{entry}` — quantity must be a whole number ≥ 1")
-                continue
-        else:
-            item_name = entry
-            qty = 1
-        item_quantities[item_name] = item_quantities.get(item_name, 0) + qty
-
-    if parse_errors:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Invalid input!",
-            description="Couldn't parse these entries:\n" + "\n".join(parse_errors)
-                        + "\n\nFormat: `Item Name:quantity` — e.g. `Fresh Meat:3, Old Coins`",
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        return
-
-    success, message, items_sold, total_earned = db.sell_items(name, item_quantities)
-
-    if success:
-        embed = discord.Embed(
-            title="<a:check:1467157700831088773> ┃ Items sold!",
-            description=f"**{name}** earned **{total_earned:,}** <:bp:1467159740797681716> Bloodpoints!",
-            color=discord.Color.from_rgb(0, 0, 0)
-        )
-
-        items_text = "\n".join([
-            f"• {item['name']} x{item['quantity']} → {item['sell_value']:,} BP each = **{item['total']:,} BP**"
-            for item in items_sold
-        ])
-        embed.add_field(name="Items Sold", value=items_text, inline=False)
-        embed.add_field(
-            name="Total Earned",
-            value=f"<:bp:1467159740797681716> {total_earned:,} BP",
-            inline=False
-        )
-
-        if any(w in message.lower() for w in ("not found", "no value", "not enough")):
-            embed.set_footer(text=f"⚠️ {message}")
-    else:
-        embed = discord.Embed(
-            title="<a:error:1467157734817398946> ┃ Error!",
-            description=message,
-            color=discord.Color.from_rgb(116, 7, 14)
-        )
-
-    await interaction.response.send_message(embed=embed)
-
-@tasks.loop(hours=24)
-async def daily_vacuum():
-    """Keep the WAL file from growing.
-
-    A full VACUUM takes an EXCLUSIVE lock and rewrites the whole database,
-    which on a Raspberry Pi can exceed the 15s busy_timeout and cause
-    'database is locked' errors for the bot AND the dashboard. A WAL
-    checkpoint achieves the routine maintenance (truncating the WAL file)
-    without blocking other writers.
-    """
-    try:
-        conn = db.get_connection()
-        try:
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        finally:
-            conn.close()
-        print("[DB] Daily WAL checkpoint complete")
+        return jsonify(run_on_bot(lookup())), 200
     except Exception as e:
-        print(f"[DB] checkpoint error: {e}")
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api.route('/refresh_roster', methods=['POST'])
+def api_refresh_roster():
+    """Called by the dashboard after every roster change."""
+    try:
+        error = run_on_bot(refresh_roster(), timeout=60)
+        if error:
+            return jsonify({'status': 'error', 'message': error}), 400
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
 
 def run_api():
-    api.run(host='0.0.0.0', port=5002, debug=False)
+    # Bound to 127.0.0.1: only the dashboard on this machine can reach it
+    api.run(host=config.BOT_API_HOST, port=config.BOT_API_PORT, debug=False)
 
-# Run the bot
-load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
-TOKEN = os.getenv('DISCORD_TOKEN')
 
-if not TOKEN:
-    print("ERROR: Discord Token not found! Check .env file")
-else:
-    # Start Flask API in separate thread
-    api_thread = threading.Thread(target=run_api, daemon=True)
-    api_thread.start()
-    print("🌐 API server started on port 5002")
-    
-    # Start Discord bot
-    bot.run(TOKEN)
+# ==================== START ====================
+
+if __name__ == "__main__":
+    TOKEN = os.getenv('DISCORD_TOKEN')
+    if not TOKEN:
+        print("ERROR: Discord Token not found! Check .env file")
+    else:
+        threading.Thread(target=run_api, daemon=True).start()
+        print(f"🌐 API server started on {config.BOT_API_HOST}:{config.BOT_API_PORT}")
+        bot.run(TOKEN)

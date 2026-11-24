@@ -1,64 +1,84 @@
-from flask import Flask, render_template, request, redirect, url_for, flash, jsonify, session
-from flask_httpauth import HTTPBasicAuth
-from werkzeug.security import generate_password_hash, check_password_hash
-from functools import wraps
-from database import Database
+import datetime
+import json
 import os
 import secrets
+import sqlite3
 import subprocess
 import threading
-from dotenv import load_dotenv
-load_dotenv()
+from functools import wraps
+
+import requests
+from flask import Flask, render_template, request, redirect, url_for, flash, session, abort
+from werkzeug.security import generate_password_hash, check_password_hash
+
+import config
+import roster_format
+from database import Database
 
 app = Flask(__name__)
-app.secret_key = secrets.token_hex(32)
+# Set DASHBOARD_SECRET in .env to keep people logged in across restarts
+app.secret_key = os.getenv("DASHBOARD_SECRET") or secrets.token_hex(32)
 
-# ==================== SECURITY OPTIONS ====================
-auth = HTTPBasicAuth()
+db = Database()
 
-users = {
-    "admin": generate_password_hash("sNbt1404."),
-    "mod": generate_password_hash("hkp35e."),
-}
+# ==================== LOGIN ====================
 
-@auth.verify_password
-def verify_password(username, password):
-    if username in users and check_password_hash(users.get(username), password):
-        return username
-    return None
+def _load_users():
+    """Read logins from .env: DASHBOARD_USERS=name:password,name2:password2
+
+    Passwords are never stored in the code (the repository is on GitHub).
+    """
+    result = {}
+    for entry in os.getenv("DASHBOARD_USERS", "").split(","):
+        username, sep, password = entry.strip().partition(":")
+        if sep and username.strip() and password:
+            result[username.strip()] = generate_password_hash(password)
+    return result
+
+
+users = _load_users()
+if not users:
+    print("⚠️  No dashboard logins configured: set DASHBOARD_USERS in .env. Nobody can log in until then.")
 
 LOGIN_ENABLED = True
+
 
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
-        if not LOGIN_ENABLED:
-            return f(*args, **kwargs)
-        if not session.get('logged_in'):
+        if LOGIN_ENABLED and not session.get('logged_in'):
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
 
-# ==================== LOGIN ROUTES ====================
+
+@app.context_processor
+def inject_config():
+    """Make the server configuration available in every template."""
+    return {
+        'bot_name': config.BOT_NAME,
+        'currencies': config.CURRENCIES,
+        'minigames': config.MINIGAMES,
+        'roles': config.ROLES,
+        'categories': config.ITEM_CATEGORIES,
+    }
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if not LOGIN_ENABLED:
         return redirect(url_for('index'))
-    
     if request.method == 'POST':
         username = request.form.get('username')
         password = request.form.get('password')
-        
-        if username in users and check_password_hash(users.get(username), password):
+        if username in users and check_password_hash(users[username], password or ''):
             session['logged_in'] = True
             session['username'] = username
             flash('Successfully logged in!', 'success')
             return redirect(url_for('index'))
-        else:
-            flash('Invalid username or password!', 'danger')
-    
+        flash('Invalid username or password!', 'danger')
     return render_template('login.html')
+
 
 @app.route('/logout')
 def logout():
@@ -66,617 +86,533 @@ def logout():
     flash('Successfully logged out!', 'info')
     return redirect(url_for('login'))
 
-# ==================== DATABASE ====================
-db = Database()
 
-# ==================== DASHBOARD ROUTES ====================
+# ==================== HELPERS ====================
+
+def query(sql, params=()):
+    with db._conn() as conn:
+        return conn.execute(sql, params).fetchall()
+
+
+def execute(sql, params=()):
+    with db._conn() as conn:
+        conn.execute(sql, params)
+        conn.commit()
+
+
+def form_int(key, default):
+    try:
+        return int(request.form.get(key) or default)
+    except ValueError:
+        return default
+
+
+def rename_in_inventories(table, item_id, new_name, update_sql, update_params):
+    """Run an item UPDATE and carry a name change over to everyone's inventory.
+
+    Without this, characters who already own the item would keep it under the
+    old name, which then has no category or sell value.
+    """
+    old = query(f"SELECT item_name FROM {table} WHERE id = ?", (item_id,))
+    old_name = old[0][0] if old else None
+    execute(update_sql, update_params)
+    if old_name and new_name and old_name.strip() != new_name.strip():
+        renamed = db.rename_inventory_item(old_name, new_name)
+        if renamed:
+            flash(f'Renamed {renamed} owned "{old_name}" in character inventories to "{new_name}".', 'info')
+
+
+def bot_api(path, timeout=15, **kwargs):
+    """POST to the bot's internal API."""
+    return requests.post(f"{config.BOT_API_URL}/{path}", timeout=timeout, **kwargs)
+
+
+def refresh_player_names(user_ids):
+    """Ask the bot for players' current Discord names and store them.
+
+    If the bot isn't running, the last known names are simply kept.
+    """
+    ids = sorted({str(i) for i in user_ids if i and str(i).isdigit()})
+    if not ids:
+        return
+    try:
+        response = bot_api('member_names', timeout=8, json={'ids': ids})
+        if response.status_code == 200:
+            db.update_player_names(response.json())
+    except Exception:
+        pass
+
+
+# ==================== HOME & UPDATES ====================
 
 @app.route('/')
 @login_required
 def index():
     return render_template('index.html')
 
-# ==================== UPDATE / DEPLOY ROUTE ====================
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-BOT_SERVICE = "dbdbot"
-DASHBOARD_SERVICE = "dbddashboard"
+DASHBOARD_FILES = ("dashboard_secure.py", "database.py", "config.py", "templates/")
+
 
 def _restart_services(restart_dashboard):
-    subprocess.run(["sudo", "systemctl", "restart", BOT_SERVICE])
+    subprocess.run(["sudo", "systemctl", "restart", config.BOT_SERVICE])
     if restart_dashboard:
-        subprocess.run(["sudo", "systemctl", "restart", DASHBOARD_SERVICE])
+        subprocess.run(["sudo", "systemctl", "restart", config.DASHBOARD_SERVICE])
+
 
 @app.route('/admin/update', methods=['POST'])
 @login_required
 def admin_update():
     try:
-        result = subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=REPO_DIR,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+        result = subprocess.run(["git", "pull", "--ff-only"], cwd=REPO_DIR,
+                                capture_output=True, text=True, timeout=30)
         output = (result.stdout + result.stderr).strip()
-
         if result.returncode != 0:
             flash(f"git pull failed: {output}", "danger")
-            return redirect(url_for('index'))
-
-        if "Already up to date" in output:
+        elif "Already up to date" in output:
             flash("Already up to date — nothing to restart.", "info")
-            return redirect(url_for('index'))
-
-        dashboard_changed = "dashboard_secure.py" in output
-        flash(f"Pulled latest changes, restarting service(s)...\n{output}", "success")
-        threading.Timer(1.5, _restart_services, args=(dashboard_changed,)).start()
-        return redirect(url_for('index'))
+        else:
+            # The dashboard also uses database.py, config.py and the templates
+            dashboard_changed = any(name in output for name in DASHBOARD_FILES)
+            flash(f"Pulled latest changes, restarting service(s)...\n{output}", "success")
+            threading.Timer(1.5, _restart_services, args=(dashboard_changed,)).start()
     except subprocess.TimeoutExpired:
         flash("git pull timed out after 30 seconds.", "danger")
-        return redirect(url_for('index'))
     except Exception as e:
-        flash(f"Error: {str(e)}", "danger")
-        return redirect(url_for('index'))
+        flash(f"Error: {e}", "danger")
+    return redirect(url_for('index'))
 
-# ==================== REALMS ROUTES ====================
 
-@app.route('/realms')
+# ==================== LOCATIONS ====================
+
+@app.route('/locations')
 @login_required
-def realms():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM realms ORDER BY name")
-    realms_list = cursor.fetchall()
-    conn.close()
-    return render_template('realms.html', realms=realms_list)
+def locations():
+    return render_template('locations.html', locations=query("SELECT id, name FROM locations ORDER BY name"))
 
-@app.route('/realms/add', methods=['POST'])
+
+@app.route('/locations/add', methods=['POST'])
 @login_required
-def add_realm():
-    realm_name = request.form.get('name')
-    if realm_name:
+def add_location():
+    name = (request.form.get('name') or '').strip()
+    if name:
         try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO realms (name) VALUES (?)", (realm_name,))
-            conn.commit()
-            conn.close()
-            flash(f'Realm "{realm_name}" added successfully!', 'success')
+            execute("INSERT INTO locations (name) VALUES (?)", (name,))
+            flash(f'Location "{name}" added!', 'success')
         except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('realms'))
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('locations'))
 
-@app.route('/realms/delete/<int:realm_id>', methods=['POST'])
+
+@app.route('/locations/edit/<int:location_id>', methods=['POST'])
 @login_required
-def delete_realm(realm_id):
+def edit_location(location_id):
+    name = (request.form.get('name') or '').strip()
+    if name:
+        try:
+            execute("UPDATE locations SET name = ? WHERE id = ?", (name, location_id))
+            flash('Location updated!', 'success')
+        except Exception as e:
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('locations'))
+
+
+@app.route('/locations/delete/<int:location_id>', methods=['POST'])
+@login_required
+def delete_location(location_id):
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM realms WHERE id = ?", (realm_id,))
-        conn.commit()
-        conn.close()
-        flash('Realm deleted successfully!', 'success')
+        execute("DELETE FROM locations WHERE id = ?", (location_id,))
+        flash('Location deleted!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('realms'))
+        flash(f'Error: {e}', 'danger')
+    return redirect(url_for('locations'))
 
-@app.route('/realms/edit/<int:realm_id>', methods=['POST'])
-@login_required
-def edit_realm(realm_id):
-    new_name = request.form.get('name')
-    if new_name:
-        try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE realms SET name = ? WHERE id = ?", (new_name, realm_id))
-            conn.commit()
-            conn.close()
-            flash('Realm updated successfully!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('realms'))
 
-# ==================== SHOP ROUTES ====================
+# ==================== SHOP ====================
+
+def _shop_form():
+    currency = request.form.get('currency_type', 'main')
+    if currency not in config.CURRENCIES:
+        currency = 'main'
+    return (db.normalise(request.form.get('name')),
+            form_int('price', 0),
+            request.form.get('description') or None,
+            db.normalise_category(request.form.get('category')),
+            currency)
+
 
 @app.route('/shop')
 @login_required
 def shop():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM shop_items ORDER BY price")
-    items = cursor.fetchall()
-    conn.close()
+    items = query("SELECT id, item_name, price, description, category, currency_type FROM shop_items ORDER BY price")
     return render_template('shop.html', items=items)
+
 
 @app.route('/shop/add', methods=['POST'])
 @login_required
 def add_shop_item():
-    item_name = request.form.get('name')
-    price = request.form.get('price')
-    description = request.form.get('description')
-    category = request.form.get('category', 'Miscellaneous')
-    currency_type = request.form.get('currency_type', 'bloodpoints')
-    
-    if item_name and price:
+    if request.form.get('name') and request.form.get('price'):
         try:
-            item_name = db.normalise(item_name)
-            category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO shop_items (item_name, price, description, category, currency_type) VALUES (?, ?, ?, ?, ?)",
-                         (item_name, int(price), description, category, currency_type))
-            conn.commit()
-            conn.close()
-            flash(f'Item "{item_name}" added to shop!', 'success')
+            values = _shop_form()
+            execute("INSERT INTO shop_items (item_name, price, description, category, currency_type) "
+                    "VALUES (?, ?, ?, ?, ?)", values)
+            flash(f'Item "{values[0]}" added to the shop!', 'success')
         except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
+            flash(f'Error: {e}', 'danger')
     return redirect(url_for('shop'))
+
+
+@app.route('/shop/edit/<int:item_id>', methods=['POST'])
+@login_required
+def edit_shop_item(item_id):
+    if request.form.get('name') and request.form.get('price'):
+        try:
+            values = _shop_form()
+            rename_in_inventories(
+                "shop_items", item_id, values[0],
+                "UPDATE shop_items SET item_name = ?, price = ?, description = ?, category = ?, currency_type = ? "
+                "WHERE id = ?", values + (item_id,))
+            flash('Shop item updated!', 'success')
+        except Exception as e:
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('shop'))
+
 
 @app.route('/shop/delete/<int:item_id>', methods=['POST'])
 @login_required
 def delete_shop_item(item_id):
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
-        conn.commit()
-        conn.close()
-        flash('Shop item deleted successfully!', 'success')
+        execute("DELETE FROM shop_items WHERE id = ?", (item_id,))
+        flash('Shop item deleted!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('shop'))
 
-@app.route('/shop/edit/<int:item_id>', methods=['POST'])
-@login_required
-def edit_shop_item(item_id):
-    item_name = request.form.get('name')
-    price = request.form.get('price')
-    description = request.form.get('description')
-    category = request.form.get('category', 'Miscellaneous')
-    currency_type = request.form.get('currency_type', 'bloodpoints')
-    
-    if item_name and price:
-        try:
-            item_name = db.normalise(item_name)
-            category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE shop_items SET item_name = ?, price = ?, description = ?, category = ?, currency_type = ? WHERE id = ?",
-                         (item_name, int(price), description, category, currency_type, item_id))
-            conn.commit()
-            conn.close()
-            flash('Shop item updated successfully!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('shop'))
 
-# ==================== TRIALS ROUTES ====================
+# ==================== MATCH MESSAGES ====================
 
-@app.route('/trials')
-@login_required
-def trials():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM trial_messages ORDER BY performance_level, role, id")
-    messages = cursor.fetchall()
-    conn.close()
-    return render_template('trials.html', messages=messages)
-
-@app.route('/trials/add', methods=['POST'])
-@login_required
-def add_trial_message():
+def _match_form():
     role = request.form.get('role')
-    performance_level = request.form.get('performance_level')
-    message = request.form.get('message')
-    
-    if role and performance_level is not None and message:
-        try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO trial_messages (role, performance_level, message) VALUES (?, ?, ?)", 
-                         (role, int(performance_level), message))
-            conn.commit()
-            conn.close()
-            flash(f'Trial message for {role} (Level {performance_level}) added!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('trials'))
+    level = request.form.get('performance_level')
+    message = (request.form.get('message') or '').strip()
+    if role not in config.ROLES or level not in {'0', '1', '2', '3', '4'} or not message:
+        return None
+    return role, int(level), message
 
-@app.route('/trials/delete/<int:message_id>', methods=['POST'])
+
+@app.route('/matches')
 @login_required
-def delete_trial_message(message_id):
+def matches():
+    messages = query("SELECT id, role, performance_level, message FROM match_messages "
+                     "ORDER BY performance_level, role, id")
+    return render_template('matches.html', messages=messages, result_text=config.MATCH_RESULT_TEXT)
+
+
+@app.route('/matches/add', methods=['POST'])
+@login_required
+def add_match_message():
+    values = _match_form()
+    if values:
+        try:
+            execute("INSERT INTO match_messages (role, performance_level, message) VALUES (?, ?, ?)", values)
+            flash(f'{values[0]} message for result {values[1]} added!', 'success')
+        except Exception as e:
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('matches'))
+
+
+@app.route('/matches/edit/<int:message_id>', methods=['POST'])
+@login_required
+def edit_match_message(message_id):
+    values = _match_form()
+    if values:
+        try:
+            execute("UPDATE match_messages SET role = ?, performance_level = ?, message = ? WHERE id = ?",
+                    values + (message_id,))
+            flash('Match message updated!', 'success')
+        except Exception as e:
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('matches'))
+
+
+@app.route('/matches/delete/<int:message_id>', methods=['POST'])
+@login_required
+def delete_match_message(message_id):
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM trial_messages WHERE id = ?", (message_id,))
-        conn.commit()
-        conn.close()
-        flash('Trial message deleted successfully!', 'success')
+        execute("DELETE FROM match_messages WHERE id = ?", (message_id,))
+        flash('Match message deleted!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('trials'))
+        flash(f'Error: {e}', 'danger')
+    return redirect(url_for('matches'))
 
-@app.route('/trials/edit/<int:message_id>', methods=['POST'])
+
+# ==================== MINIGAMES (one set of routes for every minigame in config) ====================
+
+LOOT_COLUMNS = ("id, item_name, message, description, category, sell_value, "
+                "weight, difficulty, flee_message, fail_message")
+
+
+def _loot_table(game):
+    if game not in config.MINIGAMES:
+        abort(404)
+    return db.loot_table(game)
+
+
+def _loot_form():
+    item_name = (request.form.get('item_name') or '').strip()
+    item_name = db.normalise(item_name) if item_name else None
+    category = db.normalise_category(request.form.get('category')) if item_name else None
+    return (item_name,
+            (request.form.get('message') or '').strip(),
+            request.form.get('description') or None,
+            category,
+            form_int('sell_value', 0),
+            form_int('weight', 10),
+            form_int('difficulty', 10),
+            request.form.get('flee_message') or None,
+            request.form.get('fail_message') or None)
+
+
+@app.route('/minigame/<game>')
 @login_required
-def edit_trial_message(message_id):
-    role = request.form.get('role')
-    performance_level = request.form.get('performance_level')
-    message = request.form.get('message')
-    
-    if role and performance_level is not None and message:
+def minigame(game):
+    items = query(f"SELECT {LOOT_COLUMNS} FROM {_loot_table(game)} ORDER BY item_name IS NULL, item_name")
+    return render_template('minigame.html', game=game, cfg=config.MINIGAMES[game], items=items,
+                           xp_base=config.MINIGAME_XP_BASE, xp_per=config.MINIGAME_XP_PER_DIFFICULTY,
+                           xp_leave=config.MINIGAME_XP_LEAVE)
+
+
+@app.route('/minigame/<game>/add', methods=['POST'])
+@login_required
+def add_minigame_item(game):
+    table = _loot_table(game)
+    values = _loot_form()
+    if values[1]:
         try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE trial_messages SET role = ?, performance_level = ?, message = ? WHERE id = ?",
-                         (role, int(performance_level), message, message_id))
-            conn.commit()
-            conn.close()
-            flash('Trial message updated successfully!', 'success')
+            execute(f"INSERT INTO {table} (item_name, message, description, category, sell_value, weight, "
+                    f"difficulty, flee_message, fail_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", values)
+            flash('Outcome added!', 'success')
         except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('trials'))
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('minigame', game=game))
 
-# ==================== HUNTING ROUTES ====================
 
-@app.route('/hunting')
+@app.route('/minigame/<game>/edit/<int:item_id>', methods=['POST'])
 @login_required
-def hunting():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM hunting_items")
-    items = cursor.fetchall()
-    conn.close()
-    return render_template('hunting.html', items=items)
-
-@app.route('/hunting/add', methods=['POST'])
-@login_required
-def add_hunting_item():
-    item_name = request.form.get('item_name')
-    message = request.form.get('message')
-    category = request.form.get('category', 'Miscellaneous')
-    description = request.form.get('description')
-    sell_value = request.form.get('sell_value', 0)
-    weight = request.form.get('weight', 10)
-    difficulty = request.form.get('difficulty', 10)
-    flee_message = request.form.get('flee_message', '')
-    fail_message = request.form.get('fail_message', '')
-    
-    if message:
+def edit_minigame_item(game, item_id):
+    table = _loot_table(game)
+    values = _loot_form()
+    if values[1]:
         try:
-            if item_name:
-                item_name = db.normalise(item_name)
-                category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO hunting_items (item_name, message, category, description, sell_value, weight, difficulty, flee_message, fail_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (item_name if item_name else None, message, category if item_name else None, description, sell_value, weight, difficulty, flee_message, fail_message))
-            conn.commit()
-            conn.close()
-            flash('Hunting item added!', 'success')
+            rename_in_inventories(
+                table, item_id, values[0],
+                f"UPDATE {table} SET item_name = ?, message = ?, description = ?, category = ?, sell_value = ?, "
+                f"weight = ?, difficulty = ?, flee_message = ?, fail_message = ? WHERE id = ?",
+                values + (item_id,))
+            flash('Outcome updated!', 'success')
         except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('hunting'))
+            flash(f'Error: {e}', 'danger')
+    return redirect(url_for('minigame', game=game))
 
-@app.route('/hunting/delete/<int:item_id>', methods=['POST'])
+
+@app.route('/minigame/<game>/delete/<int:item_id>', methods=['POST'])
 @login_required
-def delete_hunting_item(item_id):
+def delete_minigame_item(game, item_id):
+    table = _loot_table(game)
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM hunting_items WHERE id = ?", (item_id,))
-        conn.commit()
-        conn.close()
-        flash('Hunting item deleted successfully!', 'success')
+        execute(f"DELETE FROM {table} WHERE id = ?", (item_id,))
+        flash('Outcome deleted!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('hunting'))
+        flash(f'Error: {e}', 'danger')
+    return redirect(url_for('minigame', game=game))
 
-@app.route('/hunting/edit/<int:item_id>', methods=['POST'])
+
+# ==================== PROFILES ====================
+
+@app.route('/profiles')
 @login_required
-def edit_hunting_item(item_id):
-    item_name = request.form.get('item_name')
-    message = request.form.get('message')
-    category = request.form.get('category', 'Miscellaneous')
-    description = request.form.get('description')
-    sell_value = request.form.get('sell_value', 0)
-    weight = request.form.get('weight', 10)
-    difficulty = request.form.get('difficulty', 10)
-    flee_message = request.form.get('flee_message', '')
-    fail_message = request.form.get('fail_message', '')
-    
-    if message:
-        try:
-            if item_name:
-                item_name = db.normalise(item_name)
-                category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE hunting_items SET item_name = ?, message = ?, category = ?, description = ?, sell_value = ?, weight = ?, difficulty = ?, flee_message = ?, fail_message = ? WHERE id = ?",
-                         (item_name if item_name else None, message, category if item_name else None, description, sell_value, weight, difficulty, flee_message, fail_message, item_id))
-            conn.commit()
-            conn.close()
-            flash('Hunting item updated successfully!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('hunting'))
+def profiles():
+    with db._conn() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("SELECT * FROM profiles ORDER BY name COLLATE NOCASE").fetchall()
+    return render_template('profiles.html', profiles=[dict(r) for r in rows])
 
-# ==================== FISHING ROUTES ====================
 
-@app.route('/fishing')
+@app.route('/profiles/delete/<int:profile_id>', methods=['POST'])
 @login_required
-def fishing():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM fishing_items")
-    items = cursor.fetchall()
-    conn.close()
-    return render_template('fishing.html', items=items)
+def delete_profile_dashboard(profile_id):
+    rows = query("SELECT name FROM profiles WHERE id = ?", (profile_id,))
+    if not rows:
+        flash('Profile not found!', 'danger')
+    else:
+        success, message = db.delete_profile(rows[0][0])
+        flash(f'Profile "{rows[0][0]}" and their inventory deleted!' if success else message,
+              'success' if success else 'danger')
+    return redirect(url_for('profiles'))
 
-@app.route('/fishing/add', methods=['POST'])
-@login_required
-def add_fishing_item():
-    item_name = request.form.get('item_name')
-    message = request.form.get('message')
-    category = request.form.get('category', 'Miscellaneous')
-    description = request.form.get('description')
-    sell_value = request.form.get('sell_value', 0)
-    weight = request.form.get('weight', 10)
-    difficulty = request.form.get('difficulty', 10)
-    flee_message = request.form.get('flee_message', '')
-    fail_message = request.form.get('fail_message', '')
-    
-    if message:
-        try:
-            if item_name:
-                item_name = db.normalise(item_name)
-                category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO fishing_items (item_name, message, category, description, sell_value, weight, difficulty, flee_message, fail_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (item_name if item_name else None, message, category if item_name else None, description, sell_value, weight, difficulty, flee_message, fail_message))
-            conn.commit()
-            conn.close()
-            flash('Fishing item added!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('fishing'))
 
-@app.route('/fishing/delete/<int:item_id>', methods=['POST'])
-@login_required
-def delete_fishing_item(item_id):
+# ==================== ROSTER ====================
+
+def refresh_roster_in_discord():
+    """Ask the bot to update the roster messages. Problems only produce a warning."""
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM fishing_items WHERE id = ?", (item_id,))
-        conn.commit()
-        conn.close()
-        flash('Fishing item deleted successfully!', 'success')
+        response = bot_api('refresh_roster', timeout=60)
+        if response.status_code != 200:
+            flash(f"Saved, but the roster in Discord wasn't updated: {response.json().get('message')}", 'warning')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('fishing'))
+        flash(f"Saved, but the roster in Discord wasn't updated (is the bot running?): {e}", 'warning')
 
-@app.route('/fishing/edit/<int:item_id>', methods=['POST'])
-@login_required
-def edit_fishing_item(item_id):
-    item_name = request.form.get('item_name')
-    message = request.form.get('message')
-    category = request.form.get('category', 'Miscellaneous')
-    description = request.form.get('description')
-    sell_value = request.form.get('sell_value', 0)
-    weight = request.form.get('weight', 10)
-    difficulty = request.form.get('difficulty', 10)
-    flee_message = request.form.get('flee_message', '')
-    fail_message = request.form.get('fail_message', '')
-    
-    if message:
-        try:
-            if item_name:
-                item_name = db.normalise(item_name)
-                category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE fishing_items SET item_name = ?, message = ?, category = ?, description = ?, sell_value = ?, weight = ?, difficulty = ?, flee_message = ?, fail_message = ? WHERE id = ?",
-                         (item_name if item_name else None, message, category if item_name else None, description, sell_value, weight, difficulty, flee_message, fail_message, item_id))
-            conn.commit()
-            conn.close()
-            flash('Fishing item updated successfully!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('fishing'))
 
-# ==================== SCAVENGING ROUTES ====================
-
-@app.route('/scavenging')
-@login_required
-def scavenging():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM scavenging_items")
-    items = cursor.fetchall()
-    conn.close()
-    return render_template('scavenging.html', items=items)
-
-@app.route('/scavenging/add', methods=['POST'])
-@login_required
-def add_scavenging_item():
-    item_name = request.form.get('item_name')
-    message = request.form.get('message')
-    category = request.form.get('category', 'Miscellaneous')
-    description = request.form.get('description')
-    sell_value = request.form.get('sell_value', 0)
-    weight = request.form.get('weight', 10)
-    difficulty = request.form.get('difficulty', 10)
-    flee_message = request.form.get('flee_message', '')
-    fail_message = request.form.get('fail_message', '')
-    
-    if message:
-        try:
-            if item_name:
-                item_name = db.normalise(item_name)
-                category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("INSERT INTO scavenging_items (item_name, message, category, description, sell_value, weight, difficulty, flee_message, fail_message) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                         (item_name if item_name else None, message, category if item_name else None, description, sell_value, weight, difficulty, flee_message, fail_message))
-            conn.commit()
-            conn.close()
-            flash('Scavenging item added!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('scavenging'))
-
-@app.route('/scavenging/delete/<int:item_id>', methods=['POST'])
-@login_required
-def delete_scavenging_item(item_id):
-    try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM scavenging_items WHERE id = ?", (item_id,))
-        conn.commit()
-        conn.close()
-        flash('Scavenging item deleted successfully!', 'success')
-    except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('scavenging'))
-
-@app.route('/scavenging/edit/<int:item_id>', methods=['POST'])
-@login_required
-def edit_scavenging_item(item_id):
-    item_name = request.form.get('item_name')
-    message = request.form.get('message')
-    category = request.form.get('category', 'Miscellaneous')
-    description = request.form.get('description')
-    sell_value = request.form.get('sell_value', 0)
-    weight = request.form.get('weight', 10)
-    difficulty = request.form.get('difficulty', 10)
-    flee_message = request.form.get('flee_message', '')
-    fail_message = request.form.get('fail_message', '')
-    
-    if message:
-        try:
-            if item_name:
-                item_name = db.normalise(item_name)
-                category = db.normalise_category(category)
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE scavenging_items SET item_name = ?, message = ?, category = ?, description = ?, sell_value = ?, weight = ?, difficulty = ?, flee_message = ?, fail_message = ? WHERE id = ?",
-                         (item_name if item_name else None, message, category if item_name else None, description, sell_value, weight, difficulty, flee_message, fail_message, item_id))
-            conn.commit()
-            conn.close()
-            flash('Scavenging item updated successfully!', 'success')
-        except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('scavenging'))
-
-# ==================== PROFILES ROUTES ====================
-
-# ==================== RESERVATIONS ROUTES ====================
-
-@app.route('/reservations')
-@login_required
-def reservations():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM reservations WHERE active = 1 ORDER BY expires_at ASC")
-    reservations_list = cursor.fetchall()
-    conn.close()
-    return render_template('reservations.html', reservations=reservations_list)
-
-@app.route('/reservations/create', methods=['POST'])
-@login_required
-def create_reservation_dashboard():
-    guild_id = '1308318260944568340'
-    channel_id = request.form.get('channel_id')
-    user_id = request.form.get('user_id')
-    hours = request.form.get('hours')
-    title = request.form.get('title') or "📅 Reservation Active"
-    description = request.form.get('description') or None
-    color = request.form.get('color', '#000000').lstrip('#')
-    image_url = request.form.get('image_url') or None
-    thumbnail_url = request.form.get('thumbnail_url') or None
-
-    if not (channel_id and user_id and hours):
-        flash('Channel ID, User ID and duration are required!', 'danger')
-        return redirect(url_for('reservations'))
-
-    try:
-        hours = float(hours)
-        if hours <= 0 or hours > 336:
-            flash('Duration must be between 0 and 336 hours (14 days)!', 'danger')
-            return redirect(url_for('reservations'))
-    except ValueError:
-        flash('Duration must be a number!', 'danger')
-        return redirect(url_for('reservations'))
-
-    reservation_id, expires_at = db.create_reservation(
-        guild_id, channel_id, user_id, title, description, color,
-        None, image_url, thumbnail_url, hours
-    )
-
-    try:
-        import requests
-        bot_url = "http://localhost:5002/send_reservation"
-        payload = {
-            'channel_id': channel_id,
-            'user_id': user_id,
-            'reservation_id': reservation_id,
-            'title': title,
-            'description': description,
-            'color': color,
-            'expires_at': expires_at,
-            'image_url': image_url,
-            'thumbnail_url': thumbnail_url
-        }
-        response = requests.post(bot_url, json=payload, timeout=15)
-        if response.status_code == 200:
-            result = response.json()
-            message_id = result.get('message_id')
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("UPDATE reservations SET message_id = ? WHERE id = ?", (message_id, reservation_id))
-            conn.commit()
-            conn.close()
-            flash('Reservation created and posted!', 'success')
-        else:
-            flash(f'Reservation saved, but failed to post embed: {response.text}', 'danger')
-    except Exception as e:
-        flash(f'Reservation saved, but failed to post embed: {str(e)}', 'danger')
-
-    return redirect(url_for('reservations'))
-
-@app.route('/reservations/delete/<int:reservation_id>', methods=['POST'])
-@login_required
-def delete_reservation_dashboard(reservation_id):
-    success, message = db.delete_reservation(reservation_id)
+def _roster_result(success, message):
     flash(message, 'success' if success else 'danger')
-    return redirect(url_for('reservations'))
+    if success:
+        refresh_roster_in_discord()
+    return redirect(url_for('roster'))
 
-# ==================== ACTIVITY CHECK ROUTES ====================
+
+@app.route('/roster')
+@login_required
+def roster():
+    refresh_player_names(c['player_id'] for c in db.get_roster())
+    characters = db.get_roster()
+    counts = {status: sum(1 for c in characters if c['status'] == status) for status in ('free', 'reserved', 'taken')}
+    end_dates = {roster_id: datetime.datetime.fromtimestamp(ts).strftime('%d %b %Y, %H:%M')
+                 for roster_id, ts in db.get_reservation_end_dates().items()}
+    # Preview shows "@Name" where Discord shows the real mention
+    preview = roster_format.build_roster(db, mention=lambda c: "@" + (c['player_name'] or c['player_id']))
+    names = {c['id']: c['display'] for c in characters}
+    return render_template('roster.html', characters=characters, counts=counts, end_dates=end_dates, names=names,
+                           roster_channel=config.ROSTER_CHANNEL_ID, layout=roster_format.get_layout(db),
+                           preview=preview)
+
+
+@app.route('/roster/layout', methods=['POST'])
+@login_required
+def roster_layout():
+    keys = ['line_format', 'reserved_suffix', 'empty_text']
+    for role in config.ROLES:
+        keys += [f"{role}_{k}" for k in ('title', 'color', 'intro', 'footer', 'thumbnail', 'image')]
+    values = {key: request.form.get(key, '') for key in keys}
+    values['style'] = 'message' if request.form.get('style') == 'message' else 'embed'
+    values['alternate_indent'] = '1' if request.form.get('alternate_indent') else '0'
+    values['blank_lines'] = '1' if request.form.get('blank_lines') else '0'
+    if '{character}' not in values['line_format'] and '{name}' not in values['line_format']:
+        flash('The line format needs {character} or {name}, otherwise no names would be shown!', 'danger')
+        return redirect(url_for('roster'))
+    db.set_settings(roster_format.SETTINGS_PREFIX, values)
+    flash('Roster layout saved!', 'success')
+    refresh_roster_in_discord()
+    return redirect(url_for('roster'))
+
+
+@app.route('/roster/add', methods=['POST'])
+@login_required
+def add_roster_character():
+    return _roster_result(*db.add_roster_character(request.form.get('name'), request.form.get('title'),
+                                                   request.form.get('role')))
+
+
+@app.route('/roster/import', methods=['POST'])
+@login_required
+def import_roster():
+    role = request.form.get('role')
+    if role not in config.ROLES:
+        flash('Please choose Hunter or Survivor!', 'danger')
+        return redirect(url_for('roster'))
+    added, skipped = db.import_roster(request.form.get('lines'), role)
+    flash(f'Imported {added} {role} character(s).', 'success' if added else 'info')
+    for message in skipped[:20]:
+        flash(f'Skipped: {message}', 'warning')
+    if added:
+        refresh_roster_in_discord()
+    return redirect(url_for('roster'))
+
+
+@app.route('/roster/edit/<int:character_id>', methods=['POST'])
+@login_required
+def edit_roster_character(character_id):
+    success, message = db.update_roster_character(character_id, request.form.get('name'),
+                                                  request.form.get('title'), request.form.get('role'))
+    if not success:
+        return _roster_result(success, message)
+    linked = (request.form.get('linked_id') or '').strip()
+    link_ok, link_message = db.set_roster_link(character_id, int(linked) if linked.isdigit() else None)
+    if link_message:
+        flash(link_message, 'success' if link_ok else 'danger')
+    return _roster_result(True, message)
+
+
+@app.route('/roster/taken/<int:character_id>', methods=['POST'])
+@login_required
+def roster_mark_taken(character_id):
+    player_id = (request.form.get('player_id') or '').strip()
+    if player_id and not player_id.isdigit():
+        flash('The Discord user ID must be a number!', 'danger')
+        return redirect(url_for('roster'))
+    return _roster_result(*db.set_roster_taken(character_id, player_id or None,
+                                               (request.form.get('player_name') or '').strip() or None))
+
+
+@app.route('/roster/release/<int:character_id>', methods=['POST'])
+@login_required
+def roster_release(character_id):
+    return _roster_result(*db.release_roster_character(character_id))
+
+
+@app.route('/roster/delete/<int:character_id>', methods=['POST'])
+@login_required
+def roster_delete(character_id):
+    return _roster_result(*db.delete_roster_character(character_id))
+
+
+@app.route('/roster/release-player', methods=['POST'])
+@login_required
+def roster_release_player():
+    player_id = (request.form.get('player_id') or '').strip()
+    if not player_id.isdigit():
+        flash('Please enter a Discord user ID!', 'danger')
+        return redirect(url_for('roster'))
+    names = db.release_player(player_id)
+    if not names:
+        flash('That user has no characters on the roster.', 'info')
+        return redirect(url_for('roster'))
+    return _roster_result(True, f"Released: {', '.join(names)}")
+
+
+@app.route('/roster/refresh', methods=['POST'])
+@login_required
+def roster_refresh():
+    refresh_roster_in_discord()
+    flash('Roster refresh sent to Discord.', 'info')
+    return redirect(url_for('roster'))
+
+
+# ==================== ACTIVITY CHECK ====================
 
 @app.route('/activity-check')
 @login_required
 def activity_check():
-    import datetime
     current_month = datetime.datetime.now().strftime('%Y-%m')
     month = request.args.get('month', current_month)
-
-    characters = db.get_all_activity_characters()
-    statuses = db.get_activity_statuses_for_month(month)
     all_months = db.get_all_checked_months()
     if current_month not in all_months:
         all_months = [current_month] + all_months
-    inactive_list = db.get_inactive_characters_for_month(month)
-
+    db.sync_activity_with_roster()  # taken roster characters in, released ones out
+    refresh_player_names(c['discord_user_id'] for c in db.get_all_activity_characters())
+    characters = db.get_all_activity_characters()
+    counts = {'roster': sum(1 for c in characters if not c['is_oc']),
+              'oc': sum(1 for c in characters if c['is_oc'])}
     return render_template(
         'activity_check.html',
+        counts=counts,
         characters=characters,
-        statuses=statuses,
+        statuses=db.get_activity_statuses_for_month(month),
         all_months=all_months,
         selected_month=month,
         current_month=current_month,
-        inactive_list=inactive_list
-    )
+        inactive_list=db.get_inactive_characters_for_month(month))
+
 
 @app.route('/activity-check/add-character', methods=['POST'])
 @login_required
@@ -687,8 +623,7 @@ def add_activity_character():
     discord_user_id = request.form.get('discord_user_id')
     month = request.form.get('month')
 
-    added = 0
-    errors = []
+    added, errors = 0, []
     for i, character_name in enumerate(character_names):
         character_name = character_name.strip()
         if not character_name:
@@ -706,8 +641,8 @@ def add_activity_character():
         flash(f'Added {added} character(s)!' + (f' ({len(errors)} failed)' if errors else ''), 'success')
     for err in errors:
         flash(err, 'danger')
-
     return redirect(url_for('activity_check', month=month))
+
 
 @app.route('/activity-check/remove-character/<int:character_id>', methods=['POST'])
 @login_required
@@ -717,26 +652,21 @@ def remove_activity_character(character_id):
     flash(message, 'success' if success else 'danger')
     return redirect(url_for('activity_check', month=month))
 
+
 @app.route('/activity-check/save-month', methods=['POST'])
 @login_required
 def save_activity_month():
-    import json
-
     month = request.form.get('month')
-    statuses_json = request.form.get('statuses_json', '{}')
-
     try:
-        statuses = json.loads(statuses_json)
+        statuses = json.loads(request.form.get('statuses_json', '{}'))
     except (ValueError, TypeError):
         flash('Could not read the changes — nothing was saved.', 'danger')
         return redirect(url_for('activity_check', month=month))
-
     if not month:
         flash('Missing month — nothing was saved.', 'danger')
         return redirect(url_for('activity_check', month=month))
 
-    saved = 0
-    errors = []
+    saved, errors = 0, []
     for character_id, status in statuses.items():
         if status not in ('active', 'inactive', 'hiatus'):
             continue
@@ -746,556 +676,307 @@ def save_activity_month():
         else:
             errors.append(message)
 
-    if saved:
-        flash(f'Saved {saved} status update(s) for {month}!', 'success')
-    else:
-        flash('No changes to save.', 'info')
+    flash(f'Saved {saved} status update(s) for {month}!' if saved else 'No changes to save.',
+          'success' if saved else 'info')
     for err in errors:
         flash(err, 'danger')
-
     return redirect(url_for('activity_check', month=month))
 
-@app.route('/profiles')
-@login_required
-def profiles():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM profiles ORDER BY name")
-    profiles_list = cursor.fetchall()
-    conn.close()
-    return render_template('profiles.html', profiles=profiles_list)
 
-@app.route('/profiles/delete/<int:profile_id>', methods=['POST'])
-@login_required
-def delete_profile_dashboard(profile_id):
+# ==================== EMBEDS & WELCOME MESSAGE ====================
+
+EMBED_COLUMNS = "id, name, title, description, color, footer_text, image_url, thumbnail_url, channel_id, message_id"
+
+
+def _get_embed(embed_id):
+    rows = query(f"SELECT {EMBED_COLUMNS} FROM embeds WHERE id = ?", (embed_id,))
+    return rows[0] if rows else None
+
+
+def _embed_payload(embed):
+    return {'title': embed[2], 'description': embed[3], 'color': embed[4], 'footer_text': embed[5],
+            'image_url': embed[6], 'thumbnail_url': embed[7]}
+
+
+def _upload_image(field, label):
+    """Upload a file from the form via the bot. Returns the URL or None."""
+    file = request.files.get(field)
+    if not file or not file.filename:
+        return None
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        # Get name first for the flash message
-        cursor.execute("SELECT name FROM profiles WHERE id = ?", (profile_id,))
-        result = cursor.fetchone()
-        if not result:
-            flash('Profile not found!', 'danger')
-            conn.close()
-            return redirect(url_for('profiles'))
-        profile_name = result[0]
-        # Delete profile and their inventory
-        cursor.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
-        cursor.execute("DELETE FROM inventory WHERE character_name = ?", (profile_name,))
-        conn.commit()
-        conn.close()
-        flash(f'Profile "{profile_name}" and their inventory deleted successfully!', 'success')
+        response = bot_api('upload_image', timeout=10,
+                           files={'file': (file.filename, file.stream, file.mimetype)})
+        if response.status_code == 200:
+            flash(f'{label} uploaded successfully!', 'success')
+            return response.json().get('url')
+        flash(f'Failed to upload {label.lower()}: {response.text}', 'danger')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    return redirect(url_for('profiles'))
+        flash(f'Error uploading {label.lower()}: {e}', 'danger')
+    return None
 
-# ==================== EMBEDS ROUTES (Separated from Reaction Roles) ====================
 
 @app.route('/embeds')
 @login_required
 def embeds():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM embeds ORDER BY id DESC")
-    embeds_list = cursor.fetchall()
-    
-    # Get welcome message settings
-    cursor.execute("SELECT * FROM welcome_settings WHERE id = 1")
-    welcome_settings = cursor.fetchone()
-    
-    conn.close()
-    return render_template('embeds.html', embeds=embeds_list, welcome_settings=welcome_settings)
+    embeds_list = query(f"SELECT {EMBED_COLUMNS} FROM embeds ORDER BY id DESC")
+    welcome = query("SELECT id, enabled, embed_id, channel_id FROM welcome_settings WHERE id = 1")
+    return render_template('embeds.html', embeds=embeds_list, welcome_settings=welcome[0] if welcome else None)
+
 
 @app.route('/embeds/welcome/settings', methods=['POST'])
 @login_required
 def update_welcome_settings():
     enabled = request.form.get('enabled') == '1'
-    embed_id = request.form.get('embed_id')
+    embed_id = request.form.get('embed_id') or None
     channel_id = request.form.get('channel_id')
-    
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        
-        cursor.execute("""INSERT OR REPLACE INTO welcome_settings (id, enabled, embed_id, channel_id)
-                         VALUES (1, ?, ?, ?)""", (enabled, embed_id if embed_id else None, channel_id))
-        conn.commit()
-        conn.close()
+        execute("INSERT OR REPLACE INTO welcome_settings (id, enabled, embed_id, channel_id) VALUES (1, ?, ?, ?)",
+                (enabled, embed_id, channel_id))
         flash('Welcome settings updated!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('embeds'))
+
 
 @app.route('/embeds/create', methods=['POST'])
 @login_required
 def create_embed():
     name = request.form.get('name')
-    title = request.form.get('title')
-    description = request.form.get('description')
-    color = request.form.get('color', '#000000').lstrip('#')
-    footer_text = request.form.get('footer_text')
-    image_url = request.form.get('image_url')
-    thumbnail_url = request.form.get('thumbnail_url')
-    
-    # Handle file uploads
-    if 'image_file' in request.files:
-        image_file = request.files['image_file']
-        if image_file and image_file.filename:
-            try:
-                import requests
-                bot_url = "http://localhost:5002/upload_image"
-                files = {'file': (image_file.filename, image_file.stream, image_file.mimetype)}
-                response = requests.post(bot_url, files=files, timeout=10)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    image_url = result.get('url')
-                    flash('Image uploaded successfully!', 'success')
-                else:
-                    flash(f'Failed to upload image: {response.text}', 'danger')
-            except Exception as e:
-                flash(f'Error uploading image: {str(e)}', 'danger')
-    
-    if 'thumbnail_file' in request.files:
-        thumbnail_file = request.files['thumbnail_file']
-        if thumbnail_file and thumbnail_file.filename:
-            try:
-                import requests
-                bot_url = "http://localhost:5002/upload_image"
-                files = {'file': (thumbnail_file.filename, thumbnail_file.stream, thumbnail_file.mimetype)}
-                response = requests.post(bot_url, files=files, timeout=10)
-                
-                if response.status_code == 200:
-                    result = response.json()
-                    thumbnail_url = result.get('url')
-                    flash('Thumbnail uploaded successfully!', 'success')
-                else:
-                    flash(f'Failed to upload thumbnail: {response.text}', 'danger')
-            except Exception as e:
-                flash(f'Error uploading thumbnail: {str(e)}', 'danger')
-    
+    image_url = _upload_image('image_file', 'Image') or request.form.get('image_url')
+    thumbnail_url = _upload_image('thumbnail_file', 'Thumbnail') or request.form.get('thumbnail_url')
     if name:
         try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""INSERT INTO embeds 
-                            (name, title, description, color, footer_text, image_url, thumbnail_url) 
-                            VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                         (name, title, description, color, footer_text, image_url, thumbnail_url))
-            conn.commit()
-            conn.close()
+            execute("INSERT INTO embeds (name, title, description, color, footer_text, image_url, thumbnail_url) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (name, request.form.get('title'), request.form.get('description'),
+                     request.form.get('color', '#000000').lstrip('#'), request.form.get('footer_text'),
+                     image_url, thumbnail_url))
             flash(f'Embed "{name}" created!', 'success')
         except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
+            flash(f'Error: {e}', 'danger')
     return redirect(url_for('embeds'))
+
 
 @app.route('/embeds/edit/<int:embed_id>', methods=['POST'])
 @login_required
 def edit_embed(embed_id):
     name = request.form.get('name')
-    title = request.form.get('title')
-    description = request.form.get('description')
-    color = request.form.get('color', '#000000').lstrip('#')
-    footer_text = request.form.get('footer_text')
-    image_url = request.form.get('image_url')
-    thumbnail_url = request.form.get('thumbnail_url')
-    
     if name:
         try:
-            conn = db.get_connection()
-            cursor = conn.cursor()
-            cursor.execute("""UPDATE embeds SET 
-                            name = ?, title = ?, description = ?, color = ?, 
-                            footer_text = ?, image_url = ?, thumbnail_url = ?
-                            WHERE id = ?""",
-                         (name, title, description, color, footer_text, image_url, thumbnail_url, embed_id))
-            conn.commit()
-            conn.close()
+            execute("UPDATE embeds SET name = ?, title = ?, description = ?, color = ?, footer_text = ?, "
+                    "image_url = ?, thumbnail_url = ? WHERE id = ?",
+                    (name, request.form.get('title'), request.form.get('description'),
+                     request.form.get('color', '#000000').lstrip('#'), request.form.get('footer_text'),
+                     request.form.get('image_url'), request.form.get('thumbnail_url'), embed_id))
             flash('Embed updated!', 'success')
         except Exception as e:
-            flash(f'Error: {str(e)}', 'danger')
+            flash(f'Error: {e}', 'danger')
     return redirect(url_for('embeds'))
+
 
 @app.route('/embeds/delete/<int:embed_id>', methods=['POST'])
 @login_required
 def delete_embed(embed_id):
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM embeds WHERE id = ?", (embed_id,))
-        conn.commit()
-        conn.close()
+        execute("DELETE FROM embeds WHERE id = ?", (embed_id,))
         flash('Embed deleted!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('embeds'))
+
 
 @app.route('/embeds/send/<int:embed_id>', methods=['POST'])
 @login_required
 def send_embed(embed_id):
     channel_id = request.form.get('channel_id')
-    
     if not channel_id:
         flash('Channel ID is required!', 'danger')
         return redirect(url_for('embeds'))
-    
+    embed = _get_embed(embed_id)
+    if not embed:
+        flash('Embed not found!', 'danger')
+        return redirect(url_for('embeds'))
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM embeds WHERE id = ?", (embed_id,))
-        embed_data = cursor.fetchone()
-        
-        if not embed_data:
-            flash('Embed not found!', 'danger')
-            return redirect(url_for('embeds'))
-        
-        import requests
-        bot_url = "http://localhost:5002/send_embed"
-        
-        payload = {
-            'channel_id': channel_id,
-            'embed_id': embed_id,
-            'title': embed_data[2],
-            'description': embed_data[3],
-            'color': embed_data[4],
-            'footer_text': embed_data[5],
-            'image_url': embed_data[6],
-            'thumbnail_url': embed_data[7],
-            'reaction_roles': []  # No reaction roles from embeds page
-        }
-        
-        response = requests.post(bot_url, json=payload, timeout=15)
-        
+        response = bot_api('send_embed', json={'channel_id': channel_id, 'reaction_roles': [],
+                                               **_embed_payload(embed)})
         if response.status_code == 200:
-            result = response.json()
-            message_id = result.get('message_id')
-            
-            cursor.execute("UPDATE embeds SET channel_id = ?, message_id = ? WHERE id = ?",
-                         (channel_id, message_id, embed_id))
-            conn.commit()
+            execute("UPDATE embeds SET channel_id = ?, message_id = ? WHERE id = ?",
+                    (channel_id, response.json().get('message_id'), embed_id))
             flash('Embed sent to channel!', 'success')
         else:
             flash(f'Failed to send embed: {response.text}', 'danger')
-        
-        conn.close()
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('embeds'))
+
 
 @app.route('/embeds/update/<int:embed_id>', methods=['POST'])
 @login_required
 def update_embed_message(embed_id):
+    embed = _get_embed(embed_id)
+    if not embed or not embed[9]:
+        flash('Embed not sent yet or message ID not found!', 'danger')
+        return redirect(url_for('embeds'))
     try:
-        # Get embed data
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM embeds WHERE id = ?", (embed_id,))
-        embed_data = cursor.fetchone()
-        
-        if not embed_data or not embed_data[9]:  # Check if message_id exists
-            flash('Embed not sent yet or message ID not found!', 'danger')
-            return redirect(url_for('embeds'))
-        
-        # Send update request to bot API
-        import requests
-        bot_url = "http://localhost:5002/update_embed"
-        
-        payload = {
-            'channel_id': embed_data[8],
-            'message_id': embed_data[9],
-            'title': embed_data[2],
-            'description': embed_data[3],
-            'color': embed_data[4],
-            'footer_text': embed_data[5],
-            'image_url': embed_data[6],
-            'thumbnail_url': embed_data[7]
-        }
-        
-        response = requests.post(bot_url, json=payload, timeout=5)
-        
+        response = bot_api('update_embed', json={'channel_id': embed[8], 'message_id': embed[9],
+                                                 **_embed_payload(embed)})
         if response.status_code == 200:
             flash('Embed updated in channel!', 'success')
         else:
             flash(f'Failed to update embed: {response.text}', 'danger')
-        
-        conn.close()
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('embeds'))
 
-# ==================== REACTION ROLES ROUTES (Separate from Embeds) ====================
+
+# ==================== REACTION ROLES ====================
+
+def _sync_reactions(message_id):
+    """Re-sync the emoji reactions on a Discord message with the saved mappings."""
+    embed_rows = query("SELECT channel_id FROM embeds WHERE message_id = ?", (message_id,))
+    if not embed_rows or not embed_rows[0][0]:
+        flash('Mappings saved, but no channel is linked to this message, so Discord was not updated.', 'warning')
+        return
+    roles = [{'emoji': r[0], 'role_id': r[1]}
+             for r in query("SELECT emoji, role_id FROM reaction_roles WHERE message_id = ?", (message_id,))]
+    try:
+        response = bot_api('update_reactions', json={'channel_id': embed_rows[0][0], 'message_id': message_id,
+                                                     'reaction_roles': roles})
+        if response.status_code != 200:
+            flash(f'Mappings saved but failed to sync reactions in Discord: {response.text}', 'warning')
+    except Exception as e:
+        flash(f'Mappings saved but failed to sync reactions in Discord: {e}', 'warning')
+
 
 @app.route('/reaction-roles')
 @login_required
 def reaction_roles():
-    conn = db.get_connection()
-    cursor = conn.cursor()
-    
-    # Get all embeds for selection
-    cursor.execute("SELECT * FROM embeds ORDER BY id DESC")
-    embeds_list = cursor.fetchall()
-    
-    # Get all reaction role messages with their details
-    cursor.execute("""
-        SELECT DISTINCT rr.message_id, e.name as embed_name
-        FROM reaction_roles rr
-        LEFT JOIN embeds e ON e.message_id = rr.message_id
-        GROUP BY rr.message_id
-    """)
-    messages = cursor.fetchall()
-    
-    # Build reaction messages list with roles
-    reaction_messages = []
-    for msg in messages:
-        message_id = msg[0]
-        embed_name = msg[1] or 'Unknown Embed'
-        
-        # Get all roles for this message
-        cursor.execute("SELECT emoji, role_id FROM reaction_roles WHERE message_id = ?", (message_id,))
-        roles = [{'emoji': r[0], 'role_id': r[1]} for r in cursor.fetchall()]
-        
-        reaction_messages.append({
-            'message_id': message_id,
-            'embed_name': embed_name,
-            'roles': roles
-        })
-    
-    conn.close()
+    embeds_list = query(f"SELECT {EMBED_COLUMNS} FROM embeds ORDER BY id DESC")
+    messages = query("""
+        SELECT rr.message_id, MAX(e.name)
+        FROM reaction_roles rr LEFT JOIN embeds e ON e.message_id = rr.message_id
+        GROUP BY rr.message_id""")
+    reaction_messages = [{
+        'message_id': message_id,
+        'embed_name': embed_name or 'Unknown Embed',
+        'roles': [{'emoji': r[0], 'role_id': r[1]}
+                  for r in query("SELECT emoji, role_id FROM reaction_roles WHERE message_id = ?", (message_id,))],
+    } for message_id, embed_name in messages]
     return render_template('reaction_roles.html', embeds=embeds_list, reaction_messages=reaction_messages)
+
 
 @app.route('/reaction-roles/create', methods=['POST'])
 @login_required
 def create_reaction_role():
     embed_id = request.form.get('embed_id')
     channel_id = request.form.get('channel_id')
-    emojis = request.form.getlist('emoji[]')
-    role_ids = request.form.getlist('role_id[]')
-    
     if not embed_id or not channel_id:
         flash('Embed and Channel ID are required!', 'danger')
         return redirect(url_for('reaction_roles'))
-    
+    embed = _get_embed(embed_id)
+    if not embed:
+        flash('Embed not found!', 'danger')
+        return redirect(url_for('reaction_roles'))
+
+    roles = [{'emoji': e.strip(), 'role_id': r.strip()}
+             for e, r in zip(request.form.getlist('emoji[]'), request.form.getlist('role_id[]'))
+             if e.strip() and r.strip()]
+    if not roles:
+        flash('At least one reaction role mapping is required!', 'danger')
+        return redirect(url_for('reaction_roles'))
+
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM embeds WHERE id = ?", (embed_id,))
-        embed_data = cursor.fetchone()
-        
-        if not embed_data:
-            flash('Embed not found!', 'danger')
-            return redirect(url_for('reaction_roles'))
-        
-        # Build reaction roles list
-        reaction_roles = []
-        for emoji, role_id in zip(emojis, role_ids):
-            if emoji and role_id:
-                reaction_roles.append({'emoji': emoji, 'role_id': role_id})
-        
-        if not reaction_roles:
-            flash('At least one reaction role mapping is required!', 'danger')
-            return redirect(url_for('reaction_roles'))
-        
-        # Send to bot
-        import requests
-        bot_url = "http://localhost:5002/send_embed"
-        
-        payload = {
-            'channel_id': channel_id,
-            'embed_id': embed_id,
-            'title': embed_data[2],
-            'description': embed_data[3],
-            'color': embed_data[4],
-            'footer_text': embed_data[5],
-            'image_url': embed_data[6],
-            'thumbnail_url': embed_data[7],
-            'reaction_roles': reaction_roles
-        }
-        
-        response = requests.post(bot_url, json=payload, timeout=5)
-        
-        if response.status_code == 200:
-            result = response.json()
-            message_id = result.get('message_id')
-            
-            # Update embed with channel and message ID
-            cursor.execute("UPDATE embeds SET channel_id = ?, message_id = ? WHERE id = ?",
-                         (channel_id, message_id, embed_id))
-            
-            # Save reaction roles to database
-            for rr in reaction_roles:
-                cursor.execute("INSERT OR REPLACE INTO reaction_roles (message_id, emoji, role_id) VALUES (?, ?, ?)",
-                             (message_id, rr['emoji'], rr['role_id']))
-            
-            conn.commit()
-            flash(f'Reaction role message created with {len(reaction_roles)} role(s)!', 'success')
-        else:
+        response = bot_api('send_embed', json={'channel_id': channel_id, 'reaction_roles': roles,
+                                               **_embed_payload(embed)})
+        if response.status_code != 200:
             flash(f'Failed to send reaction role message: {response.text}', 'danger')
-        
-        conn.close()
-    except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-    
-    return redirect(url_for('reaction_roles'))
-
-@app.route('/reaction-roles/edit-embed/<message_id>', methods=['POST'])
-@login_required
-def edit_reaction_role_embed(message_id):
-    """Edit the embed content for an existing reaction role message and update it live in Discord."""
-    title = request.form.get('title')
-    description = request.form.get('description')
-    color = request.form.get('color', '#000000').lstrip('#')
-    footer_text = request.form.get('footer_text')
-    image_url = request.form.get('image_url')
-    thumbnail_url = request.form.get('thumbnail_url')
-
-    try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-
-        # Find the embed linked to this message_id
-        cursor.execute("SELECT id, channel_id FROM embeds WHERE message_id = ?", (message_id,))
-        embed_row = cursor.fetchone()
-
-        if not embed_row:
-            flash('No embed found linked to this reaction role message!', 'danger')
-            conn.close()
             return redirect(url_for('reaction_roles'))
-
-        embed_id = embed_row[0]
-        channel_id = embed_row[1]
-
-        # Update the embed in the database
-        cursor.execute("""UPDATE embeds SET
-                        title = ?, description = ?, color = ?,
-                        footer_text = ?, image_url = ?, thumbnail_url = ?
-                        WHERE id = ?""",
-                     (title, description, color, footer_text, image_url, thumbnail_url, embed_id))
-        conn.commit()
-        conn.close()
-
-        # Push the update live to Discord via bot API
-        import requests as req
-        bot_url = "http://localhost:5002/update_embed"
-        payload = {
-            'channel_id': channel_id,
-            'message_id': message_id,
-            'title': title,
-            'description': description,
-            'color': color,
-            'footer_text': footer_text,
-            'image_url': image_url,
-            'thumbnail_url': thumbnail_url
-        }
-        response = req.post(bot_url, json=payload, timeout=10)
-
-        if response.status_code == 200:
-            flash('Reaction role embed updated successfully in Discord!', 'success')
-        else:
-            flash(f'Embed saved to database but failed to update in Discord: {response.text}', 'warning')
-
+        message_id = response.json().get('message_id')
+        with db._conn() as conn:
+            conn.execute("UPDATE embeds SET channel_id = ?, message_id = ? WHERE id = ?",
+                         (channel_id, message_id, embed_id))
+            conn.executemany("INSERT OR REPLACE INTO reaction_roles (message_id, emoji, role_id) VALUES (?, ?, ?)",
+                             [(message_id, rr['emoji'], rr['role_id']) for rr in roles])
+            conn.commit()
+        flash(f'Reaction role message created with {len(roles)} role(s)!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('reaction_roles'))
 
-@app.route('/reaction-roles/update-roles/<message_id>', methods=['POST'])
+
+@app.route('/reaction-roles/link-existing', methods=['POST'])
 @login_required
-def update_reaction_role_mappings(message_id):
-    """Update the emoji→role mappings for an existing reaction role message."""
-    emojis = request.form.getlist('emoji[]')
-    role_ids = request.form.getlist('role_id[]')
-
+def link_existing_reaction_message():
+    """Link a message that already exists in Discord to an embed (nothing is sent)."""
+    embed_id = request.form.get('embed_id')
+    message_id = (request.form.get('message_id') or '').strip()
+    channel_id = (request.form.get('channel_id') or '').strip()
+    if not (embed_id and message_id and channel_id):
+        flash('Embed, message ID and channel ID are required!', 'danger')
+        return redirect(url_for('reaction_roles'))
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-
-        # Find the embed linked to this message_id for channel info
-        cursor.execute("SELECT channel_id FROM embeds WHERE message_id = ?", (message_id,))
-        embed_row = cursor.fetchone()
-
-        if not embed_row:
-            flash('No embed found linked to this reaction role message!', 'danger')
-            conn.close()
-            return redirect(url_for('reaction_roles'))
-
-        channel_id = embed_row[0]
-
-        # Delete old role mappings
-        cursor.execute("DELETE FROM reaction_roles WHERE message_id = ?", (message_id,))
-
-        # Insert new mappings
-        new_roles = []
-        for emoji, role_id in zip(emojis, role_ids):
-            if emoji and role_id:
-                cursor.execute("INSERT INTO reaction_roles (message_id, emoji, role_id) VALUES (?, ?, ?)",
-                             (message_id, emoji, role_id))
-                new_roles.append({'emoji': emoji, 'role_id': role_id})
-
-        conn.commit()
-        conn.close()
-
-        # Update reactions on the Discord message via bot API
-        import requests as req
-        bot_url = "http://localhost:5002/update_reactions"
-        payload = {
-            'channel_id': channel_id,
-            'message_id': message_id,
-            'reaction_roles': new_roles
-        }
-        response = req.post(bot_url, json=payload, timeout=10)
-
-        if response.status_code == 200:
-            flash(f'Reaction role mappings updated with {len(new_roles)} role(s)!', 'success')
-        else:
-            # Mappings saved in DB even if Discord sync fails
-            flash(f'Mappings saved but failed to sync reactions in Discord: {response.text}', 'warning')
-
+        execute("UPDATE embeds SET channel_id = ?, message_id = ? WHERE id = ?", (channel_id, message_id, embed_id))
+        flash('Message linked! Add roles to it below.', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
-
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('reaction_roles'))
+
+
+@app.route('/reaction-roles/add-role/<message_id>', methods=['POST'])
+@login_required
+def add_reaction_role(message_id):
+    emoji = (request.form.get('emoji') or '').strip()
+    role_id = (request.form.get('role_id') or '').strip()
+    if not emoji or not role_id:
+        flash('Emoji and role ID are required!', 'danger')
+        return redirect(url_for('reaction_roles'))
+    try:
+        execute("INSERT OR REPLACE INTO reaction_roles (message_id, emoji, role_id) VALUES (?, ?, ?)",
+                (message_id, emoji, role_id))
+        _sync_reactions(message_id)
+        flash(f'Added {emoji} → {role_id}!', 'success')
+    except Exception as e:
+        flash(f'Error: {e}', 'danger')
+    return redirect(url_for('reaction_roles'))
+
+
+@app.route('/reaction-roles/remove-role/<message_id>', methods=['POST'])
+@login_required
+def remove_reaction_role(message_id):
+    emoji = request.form.get('emoji')
+    try:
+        execute("DELETE FROM reaction_roles WHERE message_id = ? AND emoji = ?", (message_id, emoji))
+        _sync_reactions(message_id)
+        flash(f'Removed {emoji}!', 'success')
+    except Exception as e:
+        flash(f'Error: {e}', 'danger')
+    return redirect(url_for('reaction_roles'))
+
 
 @app.route('/reaction-roles/delete/<message_id>', methods=['POST'])
 @login_required
 def delete_reaction_role(message_id):
     try:
-        conn = db.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("DELETE FROM reaction_roles WHERE message_id = ?", (message_id,))
-        conn.commit()
-        conn.close()
+        execute("DELETE FROM reaction_roles WHERE message_id = ?", (message_id,))
         flash('Reaction roles deleted from message!', 'success')
     except Exception as e:
-        flash(f'Error: {str(e)}', 'danger')
+        flash(f'Error: {e}', 'danger')
     return redirect(url_for('reaction_roles'))
 
-# ==================== IP WHITELIST (Optional) ====================
+
+# ==================== IP WHITELIST (optional) ====================
+
 ENABLE_IP_WHITELIST = False
 ALLOWED_IPS = ['127.0.0.1', '192.168.1.100']
 
+
 @app.before_request
 def limit_remote_addr():
-    if ENABLE_IP_WHITELIST:
-        client_ip = request.remote_addr
-        if client_ip not in ALLOWED_IPS:
-            return "Access Denied", 403
+    if ENABLE_IP_WHITELIST and request.remote_addr not in ALLOWED_IPS:
+        return "Access Denied", 403
+
 
 if __name__ == '__main__':
-    if not os.path.exists('templates'):
-        os.makedirs('templates')
-    
-    print("="*50)
-    print("🔒 SECURITY NOTES:")
-    print("="*50)
-    print(f"Login enabled: {LOGIN_ENABLED}")
-    print(f"Default user: admin")
-    print(f"⚠️  CHANGE PASSWORD in line 18!")
-    print("="*50)
-    
-    # debug=False in production: debug mode starts the auto-reloader, which
-    # runs a SECOND copy of this process — a second writer to the SQLite file
-    # that can cause 'database is locked' errors.
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    print(f"Dashboard for {config.BOT_NAME} on port {config.DASHBOARD_PORT} (login enabled: {LOGIN_ENABLED})")
+    # debug=False: the debug reloader starts a second process = a second SQLite writer
+    app.run(debug=False, host='0.0.0.0', port=config.DASHBOARD_PORT)

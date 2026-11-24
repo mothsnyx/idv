@@ -2,15 +2,48 @@ import sqlite3
 import random
 import threading
 import functools
+import time
+from contextlib import contextmanager
+
+import config
+from config import ADMIN_IDS  # re-exported for main.py
+
+# ==================== PLACEHOLDER SEED DATA ====================
+# Only inserted into EMPTY tables on first start, so every command works out
+# of the box. Replace these entries in the dashboard.
+
+SEED_SHOP_ITEMS = [
+    # (item_name, price, description, category, currency_type)
+    ("Sample Item", 1000, "Placeholder - replace in the dashboard", "Miscellaneous", "main"),
+    ("Sample Premium Item", 5, "Placeholder - replace in the dashboard", "Cosmetics", "premium"),
+]
+
+SEED_LOCATIONS = ["Arms Factory", "Lakeside Village"]
+
+# (item_name, message, category, sell_value, weight, difficulty); item_name None = nothing found
+SEED_LOOT = {
+    "scavenging": [
+        ("Sample Scrap", "[Placeholder] You spot something useful among the debris.", "Miscellaneous", 100, 10, 10),
+        (None, "[Placeholder] You searched everywhere but found nothing of use.", None, 0, 10, 10),
+    ],
+    "foraging": [
+        ("Sample Herb", "[Placeholder] You spot a plant worth gathering.", "Consumables", 100, 10, 10),
+        (None, "[Placeholder] You searched the undergrowth but found nothing worth taking.", None, 0, 10, 10),
+    ],
+}
+
+
+def _seed_match_messages():
+    """One placeholder message per role and result level."""
+    return [(role, level, f"[Placeholder] {role} result {level}/4 - edit this message in the dashboard.")
+            for role in config.ROLES for level in range(5)]
 
 
 def _serialize_writes(func):
-    """Decorator: run a write method while holding the instance write lock.
+    """Run a write method while holding the instance write lock.
 
-    Every method that modifies the database goes through this so that two
-    writes can never reach SQLite at the same time (which causes the
-    'database is locked' error). The lock is an RLock, so it is safe even if
-    a decorated method calls another decorated method on the same instance.
+    Prevents two writes from the same process reaching SQLite at the same time
+    ('database is locked'). RLock, so decorated methods may call each other.
     """
     @functools.wraps(func)
     def wrapper(self, *args, **kwargs):
@@ -18,1787 +51,1599 @@ def _serialize_writes(func):
             return func(self, *args, **kwargs)
     return wrapper
 
-# ADMIN USER IDS - These users can edit ANY character
-# Replace with YOUR Discord user ID
-ADMIN_IDS = [
-    790588177240555561,  # Replace this with your actual Discord ID
-    210551397278679050, #Joker
-    724281461053849641, #Zem
-    200759921912840193, #Rhythm
-    # Add more admin IDs here if needed
-]
 
 class Database:
-    def __init__(self, db_name="game_database.db"):
-        self.db_name = db_name
-        self._write_lock = threading.RLock()  # Serialise all write transactions (reentrant)
+    def __init__(self, db_name=None):
+        self.db_name = db_name or config.DB_FILE
+        self._write_lock = threading.RLock()
         self.init_database()
         self.populate_initial_data()
-    
+
+    # ==================== CONNECTION HELPERS ====================
+
     def get_connection(self):
         conn = sqlite3.connect(self.db_name, timeout=15)
-        conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA foreign_keys=ON")
-        conn.create_function("LOWER", 1, lambda x: x.lower() if x else None)
+        # Python lower() so case-insensitive matching also works for non-ASCII names
+        conn.create_function("LOWER", 1, lambda x: x.lower() if x else None, deterministic=True)
         return conn
 
-    def normalise(self, text):
-        """Normalise user-typed text to Title Case before inserting."""
-        return text.strip().title() if text else text
+    @contextmanager
+    def _conn(self):
+        """Connection that is always closed. Uncommitted changes are discarded."""
+        conn = self.get_connection()
+        try:
+            yield conn
+        finally:
+            conn.close()
 
-    # Canonical category buckets used by get_inventory(). Any category value
-    # saved to the DB is folded onto one of these (case/whitespace-insensitive)
-    # so admin typos like "consumables" or "Consumables " don't silently land
-    # items in Miscellaneous.
-    KNOWN_CATEGORIES = ['Consumables', 'Tools', 'Collectibles', 'Miscellaneous',
-                        'Cosmetics', 'Pets', 'Shelter', 'NSFW']
+    @staticmethod
+    def _profile_name(cursor, name):
+        """Return the exact stored name of a profile (case-insensitive lookup), or None.
+
+        Always write the stored name into other tables: the inventory foreign key
+        is case-sensitive, so 'norton' would fail where 'Norton' is stored.
+        """
+        cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+        row = cursor.fetchone()
+        return row[0] if row else None
+
+    @staticmethod
+    def _currency_column(key):
+        if key not in config.CURRENCY_COLUMNS:
+            raise ValueError(f"Unknown currency: {key}")
+        return config.CURRENCY_COLUMNS[key]
+
+    @staticmethod
+    def currency_name(key):
+        return config.CURRENCIES[key]["name"]
+
+    @staticmethod
+    def loot_table(game):
+        if game not in config.MINIGAMES:
+            raise ValueError(f"Unknown minigame: {game}")
+        return f"{game}_items"
+
+    def _item_tables(self):
+        """Tables that define items, in priority order for display name/category."""
+        return ["shop_items"] + [self.loot_table(g) for g in config.MINIGAMES]
+
+    # ==================== TEXT NORMALISATION ====================
+
+    def normalise(self, text):
+        """Capitalise the first letter of each word and keep the rest as typed.
+
+        'rusty key' -> 'Rusty Key', "engineer's kit" -> "Engineer's Kit",
+        'McAllister' stays 'McAllister' (str.title() would make it 'Mcallister').
+        """
+        if not text:
+            return text
+        return " ".join(word[:1].upper() + word[1:] for word in text.split())
 
     def normalise_category(self, category):
-        """Normalise a user-typed category to one of KNOWN_CATEGORIES.
-
-        Strips whitespace and matches case-insensitively against the known
-        categories. Falls back to Title Case (preserving unrecognised custom
-        categories) rather than silently dropping them into Miscellaneous.
-        """
+        """Fold a category onto config.ITEM_CATEGORIES (case/whitespace-insensitive)."""
         if not category:
             return 'Miscellaneous'
         cleaned = category.strip()
-        for known in self.KNOWN_CATEGORIES:
+        for known in config.ITEM_CATEGORIES:
             if cleaned.lower() == known.lower():
                 return known
         return cleaned.title()
-    
+
+    # ==================== SCHEMA ====================
+
+    @staticmethod
+    def _ensure_columns(cursor, table, columns):
+        """Add any missing columns (lets new minigames be added via config)."""
+        cursor.execute(f"PRAGMA table_info({table})")
+        existing = {row[1] for row in cursor.fetchall()}
+        for col, decl in columns.items():
+            if col not in existing:
+                cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+                print(f"✓ Added {col} column to {table} table")
+
     def init_database(self):
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
+            cursor.execute("PRAGMA journal_mode=WAL")  # persistent, only needs setting once
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS profiles (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL,
-                role TEXT NOT NULL,
-                bloodpoints INTEGER DEFAULT 0,
-                auric_cells INTEGER DEFAULT 0
-            )
-            ''')
-
-            cursor.execute("PRAGMA table_info(profiles)")
-            columns = [column[1] for column in cursor.fetchall()]
-            if 'user_id' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN user_id TEXT")
-                print("✓ Added user_id column to profiles table for character ownership")
-            if 'hunting_level' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN hunting_level INTEGER DEFAULT 1")
-                print("✓ Added hunting_level column to profiles table")
-            if 'hunting_xp' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN hunting_xp INTEGER DEFAULT 0")
-                print("✓ Added hunting_xp column to profiles table")
-            if 'fishing_level' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN fishing_level INTEGER DEFAULT 1")
-                print("✓ Added fishing_level column to profiles table")
-            if 'fishing_xp' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN fishing_xp INTEGER DEFAULT 0")
-                print("✓ Added fishing_xp column to profiles table")
-            if 'scavenging_level' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN scavenging_level INTEGER DEFAULT 1")
-                print("✓ Added scavenging_level column to profiles table")
-            if 'scavenging_xp' not in columns:
-                cursor.execute("ALTER TABLE profiles ADD COLUMN scavenging_xp INTEGER DEFAULT 0")
-                print("✓ Added scavenging_xp column to profiles table")
+                CREATE TABLE IF NOT EXISTS profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    role TEXT NOT NULL,
+                    currency_main INTEGER DEFAULT 0,
+                    currency_premium INTEGER DEFAULT 0,
+                    user_id TEXT
+                )''')
+            level_columns = {}
+            for game in config.MINIGAMES:
+                level_columns[f"{game}_level"] = "INTEGER DEFAULT 1"
+                level_columns[f"{game}_xp"] = "INTEGER DEFAULT 0"
+            self._ensure_columns(cursor, "profiles", level_columns)
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS inventory (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                character_name TEXT NOT NULL,
-                item_name TEXT NOT NULL,
-                FOREIGN KEY (character_name) REFERENCES profiles(name) ON DELETE CASCADE
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS inventory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_name TEXT NOT NULL,
+                    item_name TEXT NOT NULL,
+                    FOREIGN KEY (character_name) REFERENCES profiles(name) ON DELETE CASCADE
+                )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS shop_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_name TEXT UNIQUE NOT NULL,
-                price INTEGER NOT NULL,
-                description TEXT
-            )
-            ''')
-
-            cursor.execute("PRAGMA table_info(shop_items)")
-            shop_columns = [column[1] for column in cursor.fetchall()]
-            if 'category' not in shop_columns:
-                cursor.execute("ALTER TABLE shop_items ADD COLUMN category TEXT DEFAULT 'Miscellaneous'")
-                print("✓ Added category column to shop_items table")
-            if 'currency_type' not in shop_columns:
-                cursor.execute("ALTER TABLE shop_items ADD COLUMN currency_type TEXT DEFAULT 'bloodpoints'")
-                print("✓ Added currency_type column to shop_items table")
+                CREATE TABLE IF NOT EXISTS shop_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_name TEXT UNIQUE NOT NULL,
+                    price INTEGER NOT NULL,
+                    description TEXT,
+                    category TEXT DEFAULT 'Miscellaneous',
+                    currency_type TEXT DEFAULT 'main'
+                )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS trial_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                role TEXT NOT NULL,
-                performance_level INTEGER NOT NULL,
-                message TEXT NOT NULL
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS match_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    role TEXT NOT NULL,
+                    performance_level INTEGER NOT NULL,
+                    message TEXT NOT NULL
+                )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS realms (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT UNIQUE NOT NULL
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS locations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL
+                )''')
+
+            for game in config.MINIGAMES:
+                cursor.execute(f'''
+                    CREATE TABLE IF NOT EXISTS {self.loot_table(game)} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        item_name TEXT,
+                        message TEXT NOT NULL,
+                        description TEXT,
+                        category TEXT DEFAULT 'Miscellaneous',
+                        sell_value INTEGER DEFAULT 0,
+                        weight INTEGER DEFAULT 10,
+                        difficulty INTEGER DEFAULT 10,
+                        flee_message TEXT,
+                        fail_message TEXT
+                    )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS hunting_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_name TEXT,
-                message TEXT NOT NULL
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS reservations (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    guild_id TEXT NOT NULL,
+                    channel_id TEXT NOT NULL,
+                    message_id TEXT,
+                    user_id TEXT NOT NULL,
+                    title TEXT,
+                    description TEXT,
+                    color TEXT DEFAULT '000000',
+                    footer_text TEXT,
+                    image_url TEXT,
+                    thumbnail_url TEXT,
+                    created_at INTEGER NOT NULL,
+                    expires_at INTEGER NOT NULL,
+                    notified INTEGER DEFAULT 0,
+                    active INTEGER DEFAULT 1,
+                    status TEXT DEFAULT 'active',      -- pending / active / denied / expired / completed / cancelled
+                    roster_id INTEGER,                 -- set for roster character reservations
+                    request_message_id TEXT,           -- request message in the staff channel
+                    reminder_message_id TEXT,          -- "ends soon" message with the Extend button
+                    reminded INTEGER DEFAULT 0,
+                    extension_pending INTEGER DEFAULT 0,
+                    note TEXT,
+                    player_name TEXT,
+                    decided_by TEXT
+                )''')
+
+            # Character roster: who plays which character
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS roster (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,              -- same name allowed with a different title
+                    title TEXT,                      -- (e.g. Norton Campbell: Prospector / Fool's Gold)
+                    role TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'free',   -- free / reserved / taken
+                    player_id TEXT,
+                    player_name TEXT
+                )''')
+            # Identity switches: two linked entries always share status and player
+            self._ensure_columns(cursor, "roster", {"linked_id": "INTEGER"})
+
+            # Simple key/value settings edited on the dashboard (e.g. the roster layout)
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )''')
+
+            # The roster messages the bot keeps updated in Discord, in posting order
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS roster_messages (
+                    position INTEGER PRIMARY KEY,
+                    message_id TEXT NOT NULL
+                )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS fishing_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_name TEXT,
-                message TEXT NOT NULL
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS activity_characters (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_name TEXT NOT NULL,
+                    role TEXT,
+                    discord_username TEXT,
+                    discord_user_id TEXT,
+                    added_at INTEGER NOT NULL,
+                    removed INTEGER DEFAULT 0
+                )''')
+            # Entries with a roster_id come from the roster automatically; the others are OCs
+            self._ensure_columns(cursor, "activity_characters", {"roster_id": "INTEGER"})
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS scavenging_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                item_name TEXT,
-                message TEXT NOT NULL
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS activity_checks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    character_id INTEGER NOT NULL,
+                    month TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    checked_at INTEGER NOT NULL,
+                    FOREIGN KEY (character_id) REFERENCES activity_characters(id) ON DELETE CASCADE,
+                    UNIQUE(character_id, month)
+                )''')
 
-            for table, col_list in [
-                ("hunting_items", ["category", "description", "sell_value", "weight", "difficulty", "flee_message", "fail_message"]),
-                ("fishing_items", ["category", "description", "sell_value", "weight", "difficulty", "flee_message", "fail_message"]),
-                ("scavenging_items", ["category", "description", "sell_value", "weight", "difficulty", "flee_message", "fail_message"]),
-            ]:
-                cursor.execute(f"PRAGMA table_info({table})")
-                existing = [c[1] for c in cursor.fetchall()]
-                defaults = {
-                    "category": "TEXT DEFAULT 'Miscellaneous'",
-                    "description": "TEXT",
-                    "sell_value": "INTEGER DEFAULT 0",
-                    "weight": "INTEGER DEFAULT 10",
-                    "difficulty": "INTEGER DEFAULT 10",
-                    "flee_message": "TEXT",
-                    "fail_message": "TEXT",
-                }
-                for col in col_list:
-                    if col not in existing:
-                        cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defaults[col]}")
-                        print(f"✓ Added {col} column to {table} table")
+            # Embeds, welcome message and reaction roles (managed via the dashboard).
+            # The old code never created these, so a fresh install crashed without them.
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS embeds (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    title TEXT,
+                    description TEXT,
+                    color TEXT DEFAULT '000000',
+                    footer_text TEXT,
+                    image_url TEXT,
+                    thumbnail_url TEXT,
+                    channel_id TEXT,
+                    message_id TEXT
+                )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS reservations (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                message_id TEXT,
-                user_id TEXT NOT NULL,
-                title TEXT,
-                description TEXT,
-                color TEXT DEFAULT '000000',
-                footer_text TEXT,
-                image_url TEXT,
-                thumbnail_url TEXT,
-                created_at INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                notified INTEGER DEFAULT 0,
-                active INTEGER DEFAULT 1
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS welcome_settings (
+                    id INTEGER PRIMARY KEY,
+                    enabled INTEGER DEFAULT 0,
+                    embed_id INTEGER,
+                    channel_id TEXT
+                )''')
 
             cursor.execute('''
-            CREATE TABLE IF NOT EXISTS activity_characters (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                character_name TEXT NOT NULL,
-                role TEXT,
-                discord_username TEXT,
-                discord_user_id TEXT,
-                added_at INTEGER NOT NULL,
-                removed INTEGER DEFAULT 0
-            )
-            ''')
-
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS activity_checks (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                character_id INTEGER NOT NULL,
-                month TEXT NOT NULL,
-                status TEXT NOT NULL,
-                checked_at INTEGER NOT NULL,
-                FOREIGN KEY (character_id) REFERENCES activity_characters(id) ON DELETE CASCADE,
-                UNIQUE(character_id, month)
-            )
-            ''')
+                CREATE TABLE IF NOT EXISTS reaction_roles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    message_id TEXT NOT NULL,
+                    emoji TEXT NOT NULL,
+                    role_id TEXT NOT NULL,
+                    UNIQUE(message_id, emoji)
+                )''')
 
             conn.commit()
-        finally:
-            conn.close()
+
     def populate_initial_data(self):
-        conn = self.get_connection()
-        try:
+        """Fill empty tables with the placeholder content above."""
+        with self._conn() as conn:
             cursor = conn.cursor()
 
-            cursor.execute("SELECT COUNT(*) FROM shop_items")
-            if cursor.fetchone()[0] == 0:
-                shop_items = [
-                    ("Medkit", 3000, "Heal yourself or others"),
-                    ("Toolbox", 4000, "Repair generators faster"),
-                    ("Flashlight", 2500, "Blind the killer"),
-                    ("Map", 3500, "Track objectives"),
-                    ("Key", 5000, "Open the hatch"),
-                    ("First Aid Kit", 2000, "Basic healing item"),
-                    ("Engineer's Toolbox", 6000, "Advanced repair tool"),
-                    ("Sport Flashlight", 4500, "High-quality flashlight")
-                ]
-                cursor.executemany("INSERT INTO shop_items (item_name, price, description) VALUES (?, ?, ?)", shop_items)
+            def is_empty(table):
+                cursor.execute(f"SELECT COUNT(*) FROM {table}")
+                return cursor.fetchone()[0] == 0
 
-            cursor.execute("SELECT COUNT(*) FROM trial_messages")
-            if cursor.fetchone()[0] == 0:
-                trial_messages = [
-                    ("Killer", 0, "A complete failure. All survivors escaped. The Entity is furious with your incompetence."),
-                    ("Killer", 0, "Humiliating defeat. Not a single survivor fell to your blade. Shame fills the fog."),
-                    ("Killer", 0, "The survivors toyed with you. All four escaped unscathed. You have disappointed The Entity."),
-                    ("Killer", 1, "The survivors proved elusive. You managed one sacrifice, but three escaped into the fog."),
-                    ("Killer", 1, "Your hunt was challenging. Only one survivor fell to your blade tonight."),
-                    ("Killer", 1, "The Entity whispers its disappointment. Most survivors escaped your grasp."),
-                    ("Killer", 2, "A decent hunt. Two survivors sacrificed, but two escaped through the gates."),
-                    ("Killer", 2, "You stalked through the fog with moderate success. Half the survivors fell."),
-                    ("Killer", 2, "The trial ended in balance. Two hooks, two escapes."),
-                    ("Killer", 3, "An impressive display of power! Three survivors sacrificed, only one escaped."),
-                    ("Killer", 3, "Your brutal efficiency earned a strong victory. Three fell to The Entity."),
-                    ("Killer", 3, "You dominated the trial. Three survivors on hooks, one narrowly escaped."),
-                    ("Killer", 4, "FLAWLESS VICTORY! All survivors sacrificed. The Entity is greatly pleased."),
-                    ("Killer", 4, "The trial ended with all survivors on hooks. A perfect sacrifice to The Entity."),
-                    ("Killer", 4, "Total domination! No one survived. The fog consumes all."),
-                    ("Survivor", 0, "Total annihilation. All four survivors were sacrificed. The killer was unstoppable."),
-                    ("Survivor", 0, "A massacre. No one escaped. The Entity claims all four souls tonight."),
-                    ("Survivor", 0, "Complete defeat. The killer showed no mercy. All survivors fell to the hooks."),
-                    ("Survivor", 1, "You barely made it out alive. Three teammates fell, but you escaped alone."),
-                    ("Survivor", 1, "A desperate escape. The killer claimed your teammates, but you found the hatch."),
-                    ("Survivor", 1, "Survival came at a cost. Only you made it through the gates."),
-                    ("Survivor", 2, "A difficult trial. You and one teammate escaped, but two were sacrificed."),
-                    ("Survivor", 2, "Half the team made it out. A bittersweet escape through the fog."),
-                    ("Survivor", 2, "Two escaped, two sacrificed. The killer fought well tonight."),
-                    ("Survivor", 3, "Excellent teamwork! Three survivors escaped, though one fell to the killer."),
-                    ("Survivor", 3, "You unhooked your teammates and healed the wounded. Three made it out!"),
-                    ("Survivor", 3, "An impressive trial. Three survivors through the gates, one sacrificed."),
-                    ("Survivor", 4, "PERFECT ESCAPE! All four survivors made it out. The killer stands defeated!"),
-                    ("Survivor", 4, "Working together, you managed to repair all generators and escape with your team."),
-                    ("Survivor", 4, "You looped the killer for five generators. All four survivors escaped to safety!")
-                ]
-                cursor.executemany("INSERT INTO trial_messages (role, performance_level, message) VALUES (?, ?, ?)", trial_messages)
-
-            cursor.execute("SELECT COUNT(*) FROM realms")
-            if cursor.fetchone()[0] == 0:
-                realms = [
-                    ("MacMillan Estate",), ("Autohaven Wreckers",), ("Coldwind Farm",),
-                    ("Crotus Prenn Asylum",), ("Haddonfield",), ("Backwater Swamp",),
-                    ("Léry's Memorial Institute",), ("Red Forest",), ("Springwood",),
-                    ("Gideon Meat Plant",), ("Yamaoka Estate",), ("Ormond",),
-                    ("Hawkins National Laboratory",), ("Grave of Glenvale",), ("Silent Hill",),
-                    ("Raccoon City",), ("Forsaken Boneyard",)
-                ]
-                cursor.executemany("INSERT INTO realms (name) VALUES (?)", realms)
-
-            cursor.execute("SELECT COUNT(*) FROM hunting_items")
-            if cursor.fetchone()[0] == 0:
-                hunting_items = [
-                    ("Fresh Meat", "You tracked and hunted a wild animal. Fresh meat acquired!"),
-                    ("Animal Hide", "You successfully hunted down prey and collected its hide."),
-                    ("Bone Fragment", "Your hunt was successful. You collected bone fragments."),
-                    (None, "Your hunt was unsuccessful. The prey escaped into the fog."),
-                    (None, "You searched the woods but found nothing. Better luck next time.")
-                ]
-                cursor.executemany("INSERT INTO hunting_items (item_name, message) VALUES (?, ?)", hunting_items)
-
-            cursor.execute("SELECT COUNT(*) FROM fishing_items")
-            if cursor.fetchone()[0] == 0:
-                fishing_items = [
-                    ("Fresh Fish", "You caught a fresh fish from the murky waters!"),
-                    ("Old Boot", "You reeled in... an old boot. At least it's something."),
-                    ("Strange Relic", "Something ancient surfaced. A strange relic from the depths."),
-                    (None, "The fish weren't biting today. You caught nothing."),
-                    (None, "Your line got tangled. No catch this time.")
-                ]
-                cursor.executemany("INSERT INTO fishing_items (item_name, message) VALUES (?, ?)", fishing_items)
-
-            cursor.execute("SELECT COUNT(*) FROM scavenging_items")
-            if cursor.fetchone()[0] == 0:
-                scavenging_items = [
-                    ("Scrap Metal", "You found some useful scrap metal among the debris."),
-                    ("Old Coins", "You discovered a stash of old coins hidden away."),
-                    ("Medical Supplies", "You scavenged some medical supplies from an abandoned building."),
-                    ("Mysterious Map", "You found a mysterious map with strange markings."),
-                    (None, "Your search turned up empty. Nothing of value here."),
-                    (None, "You combed through the area but found nothing useful.")
-                ]
-                cursor.executemany("INSERT INTO scavenging_items (item_name, message) VALUES (?, ?)", scavenging_items)
-
+            if is_empty("shop_items"):
+                cursor.executemany(
+                    "INSERT INTO shop_items (item_name, price, description, category, currency_type) VALUES (?, ?, ?, ?, ?)",
+                    SEED_SHOP_ITEMS)
+            if is_empty("match_messages"):
+                cursor.executemany(
+                    "INSERT INTO match_messages (role, performance_level, message) VALUES (?, ?, ?)",
+                    _seed_match_messages())
+            if is_empty("locations"):
+                cursor.executemany("INSERT INTO locations (name) VALUES (?)", [(n,) for n in SEED_LOCATIONS])
+            for game, rows in SEED_LOOT.items():
+                if game in config.MINIGAMES and is_empty(self.loot_table(game)):
+                    cursor.executemany(
+                        f"INSERT INTO {self.loot_table(game)} (item_name, message, category, sell_value, weight, difficulty) "
+                        f"VALUES (?, ?, ?, ?, ?, ?)", rows)
             conn.commit()
-        finally:
-            conn.close()
-    # Profile Methods
+
+    # ==================== PROFILES ====================
+
     @_serialize_writes
     def create_profile(self, name, role, user_id):
-        conn = self.get_connection()
-        try:
+        name = name.strip()
+        with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            existing = cursor.fetchone()
+            existing = self._profile_name(cursor, name)
             if existing:
-                return False, f"Profile {existing[0]} already exists!"
-            cursor.execute("INSERT INTO profiles (name, role, user_id) VALUES (?, ?, ?)", 
-                     (name, role, str(user_id)))
-            conn.commit()
-            return True, f"Profile created for {name}"
-        except sqlite3.IntegrityError:
-            return False, f"Profile {name} already exists!"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+                return False, f"Profile {existing} already exists!"
+            try:
+                cursor.execute("INSERT INTO profiles (name, role, user_id) VALUES (?, ?, ?)",
+                               (name, role, str(user_id)))
+                conn.commit()
+                return True, f"Profile created for {name}"
+            except sqlite3.IntegrityError:
+                return False, f"Profile {name} already exists!"
+            except Exception as e:
+                return False, f"Error: {e}"
+
     def check_ownership(self, name, user_id):
-        """Check if user owns the character. Returns (is_owner, message)"""
+        """Returns (is_owner, message). Admins and unowned (legacy) characters pass."""
         try:
             if int(user_id) in ADMIN_IDS:
                 return True, "Admin access"
-
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
-                cursor.execute("SELECT user_id FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                result = cursor.fetchone()
-            finally:
-                conn.close()
-
+            with self._conn() as conn:
+                result = conn.execute("SELECT user_id FROM profiles WHERE LOWER(name) = LOWER(?)", (name,)).fetchone()
             if not result:
                 return False, f"Character **{name}** not found!"
-
             owner_id = result[0]
-
             if owner_id is None:
                 return True, "Legacy character (no owner)"
-
             if str(owner_id) == str(user_id):
                 return True, "You own this character"
-
             return False, f"❌ You don't own **{name}**! Only the creator can edit this character."
-
         except Exception as e:
-            return False, f"Error: {str(e)}"
-    
+            return False, f"Error: {e}"
+
     @_serialize_writes
     def claim_character(self, name, user_id):
-        """Claim an unowned (legacy) character"""
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
-            
-            cursor.execute("SELECT user_id FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+            cursor.execute("SELECT name, user_id FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
             result = cursor.fetchone()
-            
             if not result:
                 return False, f"Character **{name}** not found!"
-            
-            owner_id = result[0]
-            
-            if owner_id is not None:
-                return False, f"**{name}** is already owned by someone!"
-            
-            # Claim it
-            cursor.execute("UPDATE profiles SET user_id = ? WHERE LOWER(name) = LOWER(?)", (str(user_id), name))
+            if result[1] is not None:
+                return False, f"**{result[0]}** is already owned by someone!"
+            cursor.execute("UPDATE profiles SET user_id = ? WHERE name = ?", (str(user_id), result[0]))
             conn.commit()
-            return True, f"✅ You now own **{name}**!"
-            
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+            return True, f"✅ You now own **{result[0]}**!"
+
     @_serialize_writes
     def assign_owner(self, character_name, new_owner_id):
-        """Manually assign ownership of a character (admin only)"""
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
-            
-            cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (character_name,))
-            if not cursor.fetchone():
+            stored = self._profile_name(cursor, character_name)
+            if not stored:
                 return False, f"Character **{character_name}** not found!"
-            
-            cursor.execute("UPDATE profiles SET user_id = ? WHERE LOWER(name) = LOWER(?)", 
-                          (str(new_owner_id), character_name))
+            cursor.execute("UPDATE profiles SET user_id = ? WHERE name = ?", (str(new_owner_id), stored))
             conn.commit()
-            return True, f"✅ Assigned **{character_name}** to user ID {new_owner_id}"
-            
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+            return True, f"✅ Assigned **{stored}** to user ID {new_owner_id}"
+
     @_serialize_writes
     def edit_profile_name(self, old_name, new_name):
-        conn = self.get_connection()
-        try:
+        new_name = new_name.strip()  # kept exactly as typed, like /create
+        if not new_name:
+            return False, "The new name can't be empty!"
+        with self._conn() as conn:
             cursor = conn.cursor()
-
-            new_name = self.normalise(new_name)
-
-            cursor.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (old_name,))
-            if not cursor.fetchone():
+            stored = self._profile_name(cursor, old_name)
+            if not stored:
                 return False, f"Profile {old_name} not found!"
-
-            # Check explicitly for a duplicate before touching anything.
-            cursor.execute(
-                "SELECT 1 FROM profiles WHERE LOWER(name) = LOWER(?) AND LOWER(name) != LOWER(?)",
-                (new_name, old_name)
-            )
+            cursor.execute("SELECT 1 FROM profiles WHERE LOWER(name) = LOWER(?) AND name != ?", (new_name, stored))
             if cursor.fetchone():
                 return False, f"Profile {new_name} already exists!"
+            try:
+                # FK enforcement off while inventory still points at the old name.
+                # Only works outside a transaction, which is the case here (only SELECTs so far).
+                cursor.execute("PRAGMA foreign_keys=OFF")
+                cursor.execute("UPDATE profiles SET name = ? WHERE name = ?", (new_name, stored))
+                cursor.execute("UPDATE inventory SET character_name = ? WHERE character_name = ?", (new_name, stored))
+                conn.commit()
+                cursor.execute("PRAGMA foreign_keys=ON")
+                return True, f"Profile renamed to {new_name}"
+            except Exception as e:
+                return False, f"Error: {e}"
 
-            # Disable FK enforcement for the duration of the rename so SQLite
-            # doesn't raise an IntegrityError because inventory rows still
-            # reference the old name while we haven't updated them yet.
-            cursor.execute("PRAGMA foreign_keys=OFF")
-            cursor.execute("UPDATE profiles SET name = ? WHERE LOWER(name) = LOWER(?)", (new_name, old_name))
-            cursor.execute("UPDATE inventory SET character_name = ? WHERE LOWER(character_name) = LOWER(?)", (new_name, old_name))
-            cursor.execute("PRAGMA foreign_keys=ON")
-            conn.commit()
-            return True, f"Profile renamed to {new_name}"
-        except sqlite3.IntegrityError as e:
-            return False, f"Error: {str(e)}"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
     @_serialize_writes
     def edit_profile_role(self, name, new_role):
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            if not cursor.fetchone():
+            stored = self._profile_name(cursor, name)
+            if not stored:
                 return False, f"Profile {name} not found!"
-            
-            cursor.execute("UPDATE profiles SET role = ? WHERE LOWER(name) = LOWER(?)", (new_role, name))
+            cursor.execute("UPDATE profiles SET role = ? WHERE name = ?", (new_role, stored))
             conn.commit()
             return True, f"Role updated to {new_role}"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+
     @_serialize_writes
     def delete_profile(self, name):
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            if not cursor.fetchone():
+            stored = self._profile_name(cursor, name)
+            if not stored:
                 return False, f"Profile {name} not found!"
-            
-            cursor.execute("DELETE FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            cursor.execute("DELETE FROM inventory WHERE LOWER(character_name) = LOWER(?)", (name,))
+            cursor.execute("DELETE FROM inventory WHERE character_name = ?", (stored,))
+            cursor.execute("DELETE FROM profiles WHERE name = ?", (stored,))
             conn.commit()
-            return True, f"Profile {name} deleted"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+            return True, f"Profile {stored} deleted"
+
     def get_profile(self, name):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            result = cursor.fetchone()
-            if result:
-                return {
-                    'id': result[0],
-                    'name': result[1],
-                    'role': result[2],
-                    'bloodpoints': result[3],
-                    'auric_cells': result[4],
-                    'user_id': result[5] if len(result) > 5 else None,
-                    'hunting_level': result[6] if len(result) > 6 else 1,
-                    'hunting_xp': result[7] if len(result) > 7 else 0,
-                    'fishing_level': result[8] if len(result) > 8 else 1,
-                    'fishing_xp': result[9] if len(result) > 9 else 0,
-                    'scavenging_level': result[10] if len(result) > 10 else 1,
-                    'scavenging_xp': result[11] if len(result) > 11 else 0,
-                }
+        """Profile as a dict, with extra 'main' / 'premium' keys for the currencies."""
+        with self._conn() as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (name,)).fetchone()
+        if not row:
             return None
-        finally:
-            conn.close()
-    
-    # Currency Methods
+        profile = dict(row)
+        for key, column in config.CURRENCY_COLUMNS.items():
+            profile[key] = profile.get(column) or 0
+        for game in config.MINIGAMES:
+            profile[f"{game}_level"] = profile.get(f"{game}_level") or 1
+            profile[f"{game}_xp"] = profile.get(f"{game}_xp") or 0
+        return profile
+
+    def get_profiles_for_user(self, user_id):
+        """[(name, role, main, premium)] for one Discord user, sorted by name."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT name, role, currency_main, currency_premium FROM profiles "
+                "WHERE user_id = ? ORDER BY name COLLATE NOCASE", (str(user_id),)).fetchall()
+
+    # ==================== CURRENCY ====================
+
     @_serialize_writes
-    def add_currency(self, name, currency_type, amount):
-        conn = self.get_connection()
-        try:
+    def add_currency(self, name, currency, amount):
+        column = self._currency_column(currency)
+        if amount <= 0:
+            return False, "Amount must be greater than 0!"
+        with self._conn() as conn:
             cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            if not cursor.fetchone():
+            stored = self._profile_name(cursor, name)
+            if not stored:
                 return False, f"Profile {name} not found!"
-            
-            cursor.execute(f"UPDATE profiles SET {currency_type} = {currency_type} + ? WHERE LOWER(name) = LOWER(?)", (amount, name))
+            cursor.execute(f"UPDATE profiles SET {column} = {column} + ? WHERE name = ?", (amount, stored))
             conn.commit()
-            return True, f"Added {amount} {currency_type}"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+            return True, f"Added {amount:,} {self.currency_name(currency)}"
+
     @_serialize_writes
-    def remove_currency(self, name, currency_type, amount):
-        conn = self.get_connection()
-        try:
+    def remove_currency(self, name, currency, amount):
+        column = self._currency_column(currency)
+        if amount <= 0:
+            return False, "Amount must be greater than 0!"
+        with self._conn() as conn:
             cursor = conn.cursor()
-            
-            cursor.execute(f"SELECT {currency_type} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+            cursor.execute(f"SELECT name, {column} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
             result = cursor.fetchone()
-            
             if not result:
                 return False, f"Profile {name} not found!"
-            
-            current_amount = result[0]
-            if current_amount < amount:
-                return False, f"Insufficient {currency_type}! Current: {current_amount}"
-            
-            cursor.execute(f"UPDATE profiles SET {currency_type} = {currency_type} - ? WHERE LOWER(name) = LOWER(?)", (amount, name))
+            stored, balance = result
+            if balance < amount:
+                return False, f"Insufficient {self.currency_name(currency)}! Current: {balance:,}"
+            cursor.execute(f"UPDATE profiles SET {column} = {column} - ? WHERE name = ?", (amount, stored))
             conn.commit()
-            return True, f"Removed {amount} {currency_type}"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
+            return True, f"Removed {amount:,} {self.currency_name(currency)}"
 
-    # Bloodpoints <-> Auric Cells exchange rates.
-    # Deliberately asymmetric: converting BP into AC is expensive so grinding
-    # BP purely for AC is never as efficient as earning AC directly (e.g. via
-    # trial rewards). Converting AC back into BP is cheaper since AC is the
-    # scarcer currency and dumping it isn't exploitable.
-    BP_TO_AC_RATE = 20000  # 20,000 BP -> 1 AC
-    AC_TO_BP_RATE = 5000   # 1 AC -> 5,000 BP
+    @_serialize_writes
+    def add_rewards(self, name, main_amount, premium_amount):
+        """Add both currencies in one transaction."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            stored = self._profile_name(cursor, name)
+            if not stored:
+                return False, f"Profile {name} not found!"
+            cursor.execute(
+                "UPDATE profiles SET currency_main = currency_main + ?, currency_premium = currency_premium + ? "
+                "WHERE name = ?", (main_amount, premium_amount, stored))
+            conn.commit()
+            return True, "Rewards added"
+
+    @_serialize_writes
+    def transfer_currency(self, sender, receiver, currency, amount):
+        """Move currency between two characters in one transaction."""
+        column = self._currency_column(currency)
+        if amount <= 0:
+            return False, "Amount must be greater than 0!"
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT name, {column} FROM profiles WHERE LOWER(name) = LOWER(?)", (sender,))
+            sender_row = cursor.fetchone()
+            if not sender_row:
+                return False, f"Profile {sender} not found!"
+            receiver_stored = self._profile_name(cursor, receiver)
+            if not receiver_stored:
+                return False, f"Receiver character **{receiver}** not found!"
+            sender_stored, balance = sender_row
+            if balance < amount:
+                return False, f"Insufficient {self.currency_name(currency)}! Current: {balance:,}"
+            cursor.execute(f"UPDATE profiles SET {column} = {column} - ? WHERE name = ?", (amount, sender_stored))
+            cursor.execute(f"UPDATE profiles SET {column} = {column} + ? WHERE name = ?", (amount, receiver_stored))
+            conn.commit()
+            return True, "Transferred"
 
     @_serialize_writes
     def exchange_currency(self, name, from_currency, amount):
-        """Exchange between bloodpoints and auric_cells for a character.
-
-        `amount` is how much of `from_currency` the player wants to spend.
-        Returns (success, message, received_amount, to_currency).
-        """
-        if from_currency not in ('bloodpoints', 'auric_cells'):
+        """Exchange main <-> premium. Returns (success, message, received, to_currency)."""
+        if from_currency not in config.CURRENCY_COLUMNS:
             return False, "Invalid currency type!", 0, None
         if amount <= 0:
             return False, "Amount must be greater than 0!", 0, None
 
-        to_currency = 'auric_cells' if from_currency == 'bloodpoints' else 'bloodpoints'
-        rate = self.BP_TO_AC_RATE if from_currency == 'bloodpoints' else self.AC_TO_BP_RATE
-
-        if from_currency == 'bloodpoints':
+        to_currency = 'premium' if from_currency == 'main' else 'main'
+        if from_currency == 'main':
+            rate = config.MAIN_TO_PREMIUM_RATE
             received = amount // rate
             cost = received * rate
         else:
+            rate = config.PREMIUM_TO_MAIN_RATE
             received = amount * rate
             cost = amount
 
+        from_name, to_name = self.currency_name(from_currency), self.currency_name(to_currency)
         if received <= 0:
-            return False, f"You need at least {rate:,} {from_currency.replace('_', ' ')} to exchange for 1 {to_currency.replace('_', ' ')}!", 0, None
+            return False, f"You need at least {rate:,} {from_name} to exchange for 1 {to_name}!", 0, None
 
-        conn = self.get_connection()
-        try:
+        from_col, to_col = self._currency_column(from_currency), self._currency_column(to_currency)
+        with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute(f"SELECT {from_currency} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+            cursor.execute(f"SELECT name, {from_col} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
             result = cursor.fetchone()
-
             if not result:
                 return False, f"Profile {name} not found!", 0, None
-
-            current_amount = result[0]
-            if current_amount < cost:
-                return False, f"Insufficient {from_currency.replace('_', ' ')}! You need {cost:,}, you have {current_amount:,}.", 0, None
-
-            cursor.execute(f"UPDATE profiles SET {from_currency} = {from_currency} - ? WHERE LOWER(name) = LOWER(?)", (cost, name))
-            cursor.execute(f"UPDATE profiles SET {to_currency} = {to_currency} + ? WHERE LOWER(name) = LOWER(?)", (received, name))
-            conn.commit()
-            return True, f"Exchanged {cost:,} {from_currency.replace('_', ' ')} for {received:,} {to_currency.replace('_', ' ')}", received, to_currency
-        except Exception as e:
-            return False, f"Error: {str(e)}", 0, None
-        finally:
-            conn.close()
-    
-    # Inventory Methods
-    @_serialize_writes
-    def add_item(self, name, item_name):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            if not cursor.fetchone():
-                return False, f"Profile {name} not found!"
-            
-            item_name = self.normalise(item_name)
-            cursor.execute("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)", (name, item_name))
-            conn.commit()
-            return True, f"Added {item_name} to inventory"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
-    @_serialize_writes
-    def remove_item(self, name, item_name):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT * FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (name, item_name))
-            if not cursor.fetchone():
-                return False, f"{item_name} not found in {name}'s inventory!"
-            
+            stored, balance = result
+            if balance < cost:
+                return False, f"Insufficient {from_name}! You need {cost:,}, you have {balance:,}.", 0, None
             cursor.execute(
-                "DELETE FROM inventory WHERE id IN ("
-                "SELECT id FROM inventory WHERE LOWER(character_name) = LOWER(?) "
-                "AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT 1)",
-                (name, item_name),
-            )
+                f"UPDATE profiles SET {from_col} = {from_col} - ?, {to_col} = {to_col} + ? WHERE name = ?",
+                (cost, received, stored))
             conn.commit()
-            return True, f"Removed {item_name} from inventory"
-        except Exception as e:
-            return False, f"Error: {str(e)}"
-        finally:
-            conn.close()
-    
+            return True, f"Exchanged {cost:,} {from_name} for {received:,} {to_name}", received, to_currency
+
+    # ==================== INVENTORY ====================
+
+    def _item_catalog(self, cursor):
+        """{normalised key: (display name, category)} from all item definition tables."""
+        catalog = {}
+        for table in self._item_tables():
+            cursor.execute(f"SELECT item_name, category FROM {table} WHERE item_name IS NOT NULL")
+            for item_name, category in cursor.fetchall():
+                key = item_name.strip().lower()
+                if key and key not in catalog:
+                    catalog[key] = (item_name.strip(), category)
+        return catalog
+
+    def _sell_value(self, cursor, item_name):
+        """Sell value from the first loot table that gives the item a value (0 = not sellable)."""
+        for game in config.MINIGAMES:
+            cursor.execute(
+                f"SELECT sell_value FROM {self.loot_table(game)} "
+                f"WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?)) AND sell_value > 0 LIMIT 1", (item_name,))
+            result = cursor.fetchone()
+            if result:
+                return result[0]
+        return 0
+
+    @staticmethod
+    def _count_item(cursor, character, item_name):
+        cursor.execute(
+            "SELECT COUNT(*) FROM inventory WHERE character_name = ? AND LOWER(TRIM(item_name)) = LOWER(TRIM(?))",
+            (character, item_name))
+        return cursor.fetchone()[0]
+
+    @staticmethod
+    def _delete_items(cursor, character, item_name, quantity):
+        cursor.execute(
+            "DELETE FROM inventory WHERE id IN (SELECT id FROM inventory WHERE character_name = ? "
+            "AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT ?)", (character, item_name, quantity))
+
+    @staticmethod
+    def _insert_items(cursor, character, item_name, quantity):
+        cursor.executemany("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)",
+                           [(character, item_name)] * quantity)
+
     def get_inventory(self, name):
-        conn = self.get_connection()
-        try:
+        """{category: [{'item_name', 'quantity'}]} for every category in config.ITEM_CATEGORIES."""
+        with self._conn() as conn:
             cursor = conn.cursor()
-
-            # First, get inventory counts (accurate count from inventory table only).
-            # Group by a whitespace/case-normalised key so that legacy rows with
-            # stray whitespace or inconsistent casing (e.g. from an old edit that
-            # bypassed normalise()) still get counted together as one item instead
-            # of splintering into separate entries.
+            # Group case/whitespace-insensitively so spelling variants count as one item
             cursor.execute("""
-                SELECT LOWER(TRIM(item_name)) as item_key, COUNT(*) as quantity
-                FROM inventory
-                WHERE LOWER(character_name) = LOWER(?)
-                GROUP BY item_key
-            """, (name,))
-            inventory_counts = {row[0]: row[1] for row in cursor.fetchall()}
+                SELECT LOWER(TRIM(item_name)) AS item_key, MIN(TRIM(item_name)), COUNT(*)
+                FROM inventory WHERE LOWER(character_name) = LOWER(?)
+                GROUP BY item_key""", (name,))
+            rows = cursor.fetchall()
+            catalog = self._item_catalog(cursor)
 
-            # Then get a clean display name + category for each item (using DISTINCT
-            # to avoid duplicates from multiple scenarios). Matching against the
-            # definition tables is done case/whitespace-insensitively, and the
-            # canonical (properly normalised) item_name from whichever definition
-            # table matches is preferred as the display name, so a stray space in
-            # the inventory row doesn't leak into what's shown to the user.
-            cursor.execute("""
-                SELECT DISTINCT
-                       LOWER(TRIM(i.item_name)) as item_key,
-                       COALESCE(
-                           (SELECT item_name FROM shop_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           (SELECT item_name FROM hunting_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           (SELECT item_name FROM fishing_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           (SELECT item_name FROM scavenging_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           TRIM(i.item_name)
-                       ) as display_name,
-                       COALESCE(
-                           (SELECT category FROM shop_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           (SELECT category FROM hunting_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           (SELECT category FROM fishing_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           (SELECT category FROM scavenging_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(i.item_name)) LIMIT 1),
-                           'Miscellaneous'
-                       ) as category
-                FROM inventory i
-                WHERE LOWER(i.character_name) = LOWER(?)
-                ORDER BY category, display_name
-            """, (name,))
-            results = cursor.fetchall()
+        categorized = {category: [] for category in config.ITEM_CATEGORIES}
+        categorized.setdefault('Miscellaneous', [])
+        for item_key, raw_name, quantity in rows:
+            display, category = catalog.get(item_key, (raw_name, 'Miscellaneous'))
+            bucket = categorized.get(self.normalise_category(category), categorized['Miscellaneous'])
+            bucket.append({'item_name': display, 'quantity': quantity})
+        for items in categorized.values():
+            items.sort(key=lambda i: i['item_name'].lower())
+        return categorized
 
-            # Categorize items
-            categorized = {
-                'Consumables': [],
-                'Tools': [],
-                'Collectibles': [],
-                'Miscellaneous': [],
-                'Cosmetics': [],
-                'Pets': [],
-                'Shelter': [],
-                'NSFW': [],
-            }
-
-            for item_key, display_name, category in results:
-                item_data = {
-                    'item_name': display_name,
-                    'quantity': inventory_counts.get(item_key, 0)
-                }
-                # Normalise on read too, so items whose category was saved with
-                # stray casing/whitespace (e.g. "consumables" instead of
-                # "Consumables") still land in the right bucket instead of
-                # silently falling through to Miscellaneous.
-                category = self.normalise_category(category)
-                if category in categorized:
-                    categorized[category].append(item_data)
-                else:
-                    categorized['Miscellaneous'].append(item_data)
-
-            return categorized
-        finally:
-            conn.close()
-    
-    # Shop Methods
-    def buy_item(self, name, item_name):
-        with self._write_lock:
-            conn = self.get_connection()
+    @_serialize_writes
+    def add_items_with_quantity(self, name, item_quantities):
+        """Returns (success, message, items_added)."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            stored = self._profile_name(cursor, name)
+            if not stored:
+                return False, f"Profile {name} not found!", {}
             try:
-                cursor = conn.cursor()
-
-                # Check if profile exists and get both currencies
-                cursor.execute("SELECT bloodpoints, auric_cells, name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                result = cursor.fetchone()
-                if not result:
-                    return False, f"Profile {name} not found!", 0, None
-
-                bloodpoints, auric_cells, name = result[0], result[1], result[2]
-
-                # Check if item exists in shop and get its currency type
-                cursor.execute("SELECT item_name, price, currency_type FROM shop_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                result = cursor.fetchone()
-                if not result:
-                    return False, f"Item {item_name} not found in shop!", 0, None
-
-                item_name = result[0]  # Use the exact stored name
-                price = result[1]
-                currency_type = result[2] if result[2] else 'bloodpoints'  # Default to bloodpoints if NULL
-
-                # Check currency and balance based on type
-                if currency_type == 'auric_cells':
-                    current_balance = auric_cells
-                    currency_name = "Auric Cells"
-                    currency_column = "auric_cells"
-                else:
-                    current_balance = bloodpoints
-                    currency_name = "Bloodpoints"
-                    currency_column = "bloodpoints"
-
-                # Check if enough currency
-                if current_balance < price:
-                    return False, f"Insufficient {currency_name}! This item costs **{price:,}**, you have **{current_balance:,}**.", price, currency_type
-
-                # Deduct currency and add item
-                cursor.execute(f"UPDATE profiles SET {currency_column} = {currency_column} - ? WHERE LOWER(name) = LOWER(?)", (price, name))
-                cursor.execute("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)", (name, item_name))
-
+                for item_name, quantity in item_quantities.items():
+                    self._insert_items(cursor, stored, item_name, quantity)
                 conn.commit()
-                return True, f"Purchased {item_name}", price, currency_type
+                return True, "Items added successfully", dict(item_quantities)
             except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", 0, None
-            finally:
-                conn.close()
-    
-    def buy_items_bulk(self, name, item_names):
-        """Buy multiple items at once. Returns (success, message, total_price, currency_type, items_purchased)"""
-        with self._write_lock:
-            conn = self.get_connection()
+                return False, f"Error: {e}", {}
+
+    @_serialize_writes
+    def remove_items_with_quantity(self, name, item_quantities, verb="remove"):
+        """Remove (or use) items; all-or-nothing. Returns (success, message, items_removed)."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            stored = self._profile_name(cursor, name)
+            if not stored:
+                return False, f"Profile {name} not found!", {}
+            for item_name, quantity in item_quantities.items():
+                count = self._count_item(cursor, stored, item_name)
+                if count < quantity:
+                    return False, (f"Not enough **{item_name}** in inventory! "
+                                   f"You have {count}, trying to {verb} {quantity}."), {}
+            for item_name, quantity in item_quantities.items():
+                self._delete_items(cursor, stored, item_name, quantity)
+            conn.commit()
+            return True, f"Items {verb}d successfully", dict(item_quantities)
+
+    def use_items_with_quantity(self, name, item_quantities):
+        return self.remove_items_with_quantity(name, item_quantities, verb="use")
+
+    @_serialize_writes
+    def rename_inventory_item(self, old_name, new_name):
+        """Rename an item in every character's inventory. Returns how many copies were renamed."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE inventory SET item_name = ? WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))",
+                           (new_name.strip(), old_name))
+            conn.commit()
+            return cursor.rowcount
+
+    @_serialize_writes
+    def transfer_items(self, sender, receiver, item_quantities):
+        """Move items between characters in one transaction (keeps the exact item names).
+
+        Returns (success, message, items_moved).
+        """
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            sender_stored = self._profile_name(cursor, sender)
+            if not sender_stored:
+                return False, f"Profile {sender} not found!", {}
+            receiver_stored = self._profile_name(cursor, receiver)
+            if not receiver_stored:
+                return False, f"Receiver character **{receiver}** not found!", {}
+            for item_name, quantity in item_quantities.items():
+                count = self._count_item(cursor, sender_stored, item_name)
+                if count < quantity:
+                    return False, (f"Not enough **{item_name}** in inventory! "
+                                   f"You have {count}, trying to give {quantity}."), {}
+            moved = {}
+            for item_name, quantity in item_quantities.items():
+                cursor.execute(
+                    "SELECT TRIM(item_name) FROM inventory WHERE character_name = ? "
+                    "AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT 1", (sender_stored, item_name))
+                display = cursor.fetchone()[0]
+                cursor.execute(
+                    "UPDATE inventory SET character_name = ? WHERE id IN (SELECT id FROM inventory "
+                    "WHERE character_name = ? AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT ?)",
+                    (receiver_stored, sender_stored, item_name, quantity))
+                moved[display] = quantity
+            conn.commit()
+            return True, "Items transferred", moved
+
+    # ==================== SHOP ====================
+
+    def get_shop_items(self):
+        """[(item_name, price, description, currency_type)] sorted by price."""
+        with self._conn() as conn:
+            return conn.execute(
+                "SELECT item_name, price, description, currency_type FROM shop_items ORDER BY price").fetchall()
+
+    @_serialize_writes
+    def buy_items_with_quantity(self, name, item_quantities):
+        """Buy items, e.g. {"Oil Lantern": 2}. All items must use the same currency.
+
+        Returns (success, message, total_price, currency_key, items_purchased).
+        """
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT name, currency_main, currency_premium FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+            result = cursor.fetchone()
+            if not result:
+                return False, f"Profile {name} not found!", 0, None, {}
+            stored, balances = result[0], {"main": result[1], "premium": result[2]}
+
+            total_cost, currency, purchases = 0, None, {}
+            for item_name, quantity in item_quantities.items():
+                cursor.execute(
+                    "SELECT item_name, price, currency_type FROM shop_items "
+                    "WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
+                row = cursor.fetchone()
+                if not row:
+                    return False, f"Item **{item_name}** not found in shop!", 0, None, {}
+                actual_name, price, item_currency = row
+                item_currency = item_currency if item_currency in config.CURRENCY_COLUMNS else 'main'
+                if currency is None:
+                    currency = item_currency
+                elif currency != item_currency:
+                    names = " or ".join(c["name"] for c in config.CURRENCIES.values())
+                    return False, f"Cannot mix currencies! All items must use the same currency ({names}).", 0, None, {}
+                purchases[actual_name] = purchases.get(actual_name, 0) + quantity
+                total_cost += price * quantity
+
+            if balances[currency] < total_cost:
+                return (False, f"Insufficient {self.currency_name(currency)}! Total cost is **{total_cost:,}**, "
+                               f"you have **{balances[currency]:,}**.", total_cost, currency, {})
+
+            column = self._currency_column(currency)
             try:
-                cursor = conn.cursor()
-
-                # Check if profile exists and get both currencies
-                cursor.execute("SELECT bloodpoints, auric_cells, name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                result = cursor.fetchone()
-                if not result:
-                    return False, f"Profile {name} not found!", 0, None, []
-
-                bloodpoints, auric_cells, name = result[0], result[1], result[2]
-
-                # Get all items and calculate total per currency type
-                items_to_buy = []
-                bp_total = 0
-                ac_total = 0
-
-                for item_name in item_names:
-                    cursor.execute("SELECT item_name, price, currency_type FROM shop_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                    result = cursor.fetchone()
-
-                    if not result:
-                        return False, f"Item **{item_name}** not found in shop!", 0, None, []
-
-                    actual_name = result[0]  # Use the exact stored name
-                    price = result[1]
-                    currency_type = result[2] if result[2] else 'bloodpoints'
-
-                    items_to_buy.append({
-                        'name': actual_name,
-                        'price': price,
-                        'currency_type': currency_type
-                    })
-
-                    if currency_type == 'auric_cells':
-                        ac_total += price
-                    else:
-                        bp_total += price
-
-                # Check if mixing currencies
-                if bp_total > 0 and ac_total > 0:
-                    return False, "❌ Cannot mix Bloodpoints and Auric Cells items in one purchase! Please buy them separately.", 0, None, []
-
-                # Determine which currency we're using
-                if ac_total > 0:
-                    total_price = ac_total
-                    currency_type = 'auric_cells'
-                    current_balance = auric_cells
-                    currency_name = "Auric Cells"
-                    currency_column = "auric_cells"
-                else:
-                    total_price = bp_total
-                    currency_type = 'bloodpoints'
-                    current_balance = bloodpoints
-                    currency_name = "Bloodpoints"
-                    currency_column = "bloodpoints"
-
-                # Check if enough currency
-                if current_balance < total_price:
-                    return False, f"Insufficient {currency_name}! Total cost is **{total_price:,}**, you have **{current_balance:,}**.", total_price, currency_type, []
-
-                # Deduct currency and add all items
-                cursor.execute(f"UPDATE profiles SET {currency_column} = {currency_column} - ? WHERE LOWER(name) = LOWER(?)", (total_price, name))
-
-                for item in items_to_buy:
-                    cursor.execute("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)", (name, item['name']))
-
+                cursor.execute(f"UPDATE profiles SET {column} = {column} - ? WHERE name = ?", (total_cost, stored))
+                for item_name, quantity in purchases.items():
+                    self._insert_items(cursor, stored, item_name, quantity)
                 conn.commit()
-                item_names_list = [item['name'] for item in items_to_buy]
-                return True, f"Purchased {len(items_to_buy)} items", total_price, currency_type, item_names_list
-
+                return True, "Purchase successful", total_cost, currency, purchases
             except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", 0, None, []
-            finally:
-                conn.close()
-    
-    def use_items(self, name, item_names):
-        """Use (remove) multiple items from inventory. Returns (success, message, items_used)"""
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
+                return False, f"Error: {e}", 0, None, {}
 
-                # Check if profile exists
-                cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                if not cursor.fetchone():
-                    return False, f"Profile **{name}** not found!", []
+    # ==================== SELLING ====================
 
-                items_used = []
-                items_not_found = []
-
-                for item_name in item_names:
-                    # Check if item exists in inventory
-                    cursor.execute("SELECT id FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT 1",
-                                 (name, item_name))
-                    result = cursor.fetchone()
-
-                    if result:
-                        # Remove one instance of the item
-                        cursor.execute("DELETE FROM inventory WHERE id = ?", (result[0],))
-                        items_used.append(item_name)
-                    else:
-                        items_not_found.append(item_name)
-
-                conn.commit()
-
-                if not items_used:
-                    return False, f"None of the items were found in **{name}**'s inventory!", []
-
-                if items_not_found:
-                    message = f"Some items not found: **{', '.join(items_not_found)}**"
-                    return True, message, items_used
-
-                return True, "Items used successfully", items_used
-
-            except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", []
-            finally:
-                conn.close()
-    
     def get_item_values(self, name, item_names):
-        """Get sell values for items. Returns (success, message, items_with_values, total_value)"""
-        conn = self.get_connection()
-        try:
+        """Returns (success, message, items_with_values, total_value)."""
+        with self._conn() as conn:
             cursor = conn.cursor()
-
-            # Check if profile exists
-            cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            if not cursor.fetchone():
+            stored = self._profile_name(cursor, name)
+            if not stored:
                 return False, f"Profile **{name}** not found!", [], 0
-
-            items_info = []
-            total_value = 0
-            items_not_found = []
-
+            catalog = self._item_catalog(cursor)
+            items_info, total_value, not_found = [], 0, []
             for item_name in item_names:
-                # Check if item exists in inventory
-                cursor.execute("SELECT COUNT(*) FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?))",
-                             (name, item_name))
-                quantity = cursor.fetchone()[0]
-
+                quantity = self._count_item(cursor, stored, item_name)
                 if quantity == 0:
-                    items_not_found.append(item_name)
+                    not_found.append(item_name)
                     continue
-
-                # Get sell value from minigame tables
-                sell_value = 0
-
-                # Check hunting_items
-                cursor.execute("SELECT sell_value FROM hunting_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                result = cursor.fetchone()
-                if result:
-                    sell_value = result[0] or 0
-
-                # Check fishing_items if not found
-                if sell_value == 0:
-                    cursor.execute("SELECT sell_value FROM fishing_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                    result = cursor.fetchone()
-                    if result:
-                        sell_value = result[0] or 0
-
-                # Check scavenging_items if not found
-                if sell_value == 0:
-                    cursor.execute("SELECT sell_value FROM scavenging_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                    result = cursor.fetchone()
-                    if result:
-                        sell_value = result[0] or 0
-
-                items_info.append({
-                    'name': item_name,
-                    'quantity': quantity,
-                    'sell_value': sell_value,
-                    'total': sell_value * quantity
-                })
+                sell_value = self._sell_value(cursor, item_name)
+                display = catalog.get(item_name.strip().lower(), (item_name,))[0]
+                items_info.append({'name': display, 'quantity': quantity,
+                                   'sell_value': sell_value, 'total': sell_value * quantity})
                 total_value += sell_value * quantity
 
-            if not items_info:
-                return False, f"None of the items were found in **{name}**'s inventory!", [], 0
+        if not items_info:
+            return False, f"None of the items were found in **{name}**'s inventory!", [], 0
+        if not_found:
+            return True, f"Some items not found: **{', '.join(not_found)}**", items_info, total_value
+        return True, "Items valued successfully", items_info, total_value
 
-            if items_not_found:
-                message = f"Some items not found: **{', '.join(items_not_found)}**"
-                return True, message, items_info, total_value
-
-            return True, "Items valued successfully", items_info, total_value
-
-        except Exception as e:
-            return False, f"Error: {str(e)}", [], 0
-        finally:
-            conn.close()
-    
+    @_serialize_writes
     def sell_items(self, name, item_quantities):
-        """Sell items and add bloodpoints.
-        
-        Args:
-            name: Character name
-            item_quantities: dict of {item_name: quantity}, e.g. {"Fresh Meat": 3, "Old Coins": 1}
-        Returns:
-            (success, message, items_sold, total_earned)
-        """
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
+        """Sell items for the main currency. Returns (success, message, items_sold, total_earned)."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            stored = self._profile_name(cursor, name)
+            if not stored:
+                return False, f"Profile **{name}** not found!", [], 0
+            catalog = self._item_catalog(cursor)
 
-                # Check if profile exists
-                cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                if not cursor.fetchone():
-                    return False, f"Profile **{name}** not found!", [], 0
+            items_sold, total_earned = [], 0
+            not_found, no_value, not_enough = [], [], []
+            for item_name, quantity in item_quantities.items():
+                count = self._count_item(cursor, stored, item_name)
+                if count == 0:
+                    not_found.append(item_name)
+                    continue
+                if count < quantity:
+                    not_enough.append(f"{item_name} (have {count}, need {quantity})")
+                    continue
+                sell_value = self._sell_value(cursor, item_name)
+                if sell_value == 0:
+                    no_value.append(item_name)
+                    continue
+                self._delete_items(cursor, stored, item_name, quantity)
+                earned = sell_value * quantity
+                cursor.execute("UPDATE profiles SET currency_main = currency_main + ? WHERE name = ?",
+                               (earned, stored))
+                display = catalog.get(item_name.strip().lower(), (item_name,))[0]
+                items_sold.append({'name': display, 'quantity': quantity, 'sell_value': sell_value, 'total': earned})
+                total_earned += earned
+            conn.commit()
 
-                items_sold = []
-                total_earned = 0
-                items_not_found = []
-                items_no_value = []
-                items_not_enough = []
+        if not items_sold:
+            if not_enough:
+                return False, f"Not enough items: **{', '.join(not_enough)}**", [], 0
+            if not_found:
+                return False, f"Items not found in inventory: **{', '.join(not_found)}**", [], 0
+            if no_value:
+                return False, f"Items have no sell value: **{', '.join(no_value)}**", [], 0
+            return False, "No items could be sold!", [], 0
 
-                for item_name, quantity in item_quantities.items():
-                    # Check how many the character has
-                    cursor.execute(
-                        "SELECT COUNT(*) FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?))",
-                        (name, item_name)
-                    )
-                    count = cursor.fetchone()[0]
+        warnings = []
+        if not_found:
+            warnings.append(f"Not found: {', '.join(not_found)}")
+        if no_value:
+            warnings.append(f"No value: {', '.join(no_value)}")
+        if not_enough:
+            warnings.append(f"Not enough: {', '.join(not_enough)}")
+        message = "Items sold successfully" + (" (" + " | ".join(warnings) + ")" if warnings else "")
+        return True, message, items_sold, total_earned
 
-                    if count == 0:
-                        items_not_found.append(item_name)
-                        continue
+    # ==================== MATCHES & LOCATIONS ====================
 
-                    if count < quantity:
-                        items_not_enough.append(f"{item_name} (have {count}, need {quantity})")
-                        continue
-
-                    # Get sell value from minigame tables
-                    sell_value = 0
-
-                    for table in ("hunting_items", "fishing_items", "scavenging_items"):
-                        cursor.execute(f"SELECT sell_value FROM {table} WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                        result = cursor.fetchone()
-                        if result and result[0]:
-                            sell_value = result[0]
-                            break
-
-                    if sell_value == 0:
-                        items_no_value.append(item_name)
-                        continue
-
-                    # Remove exactly `quantity` copies from inventory
-                    cursor.execute(
-                        "DELETE FROM inventory WHERE id IN "
-                        "(SELECT id FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT ?)",
-                        (name, item_name, quantity)
-                    )
-
-                    earned = sell_value * quantity
-                    cursor.execute(
-                        "UPDATE profiles SET bloodpoints = bloodpoints + ? WHERE LOWER(name) = LOWER(?)",
-                        (earned, name)
-                    )
-
-                    items_sold.append({
-                        'name': item_name,
-                        'quantity': quantity,
-                        'sell_value': sell_value,
-                        'total': earned
-                    })
-                    total_earned += earned
-
+    @_serialize_writes
+    def complete_match(self, name):
+        """Random match result 0-4 with rewards. Returns a dict, or None if the profile doesn't exist."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT name, role FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+            row = cursor.fetchone()
+            if not row:
+                return None
+            stored, role = row
+            performance = random.randint(0, 4)
+            cursor.execute(
+                "SELECT message FROM match_messages WHERE role = ? AND performance_level = ? "
+                "ORDER BY RANDOM() LIMIT 1", (role, performance))
+            result = cursor.fetchone()
+            main_reward, premium_reward = config.MATCH_REWARDS[performance]
+            if main_reward or premium_reward:
+                cursor.execute(
+                    "UPDATE profiles SET currency_main = currency_main + ?, currency_premium = currency_premium + ? "
+                    "WHERE name = ?", (main_reward, premium_reward, stored))
                 conn.commit()
 
-                if not items_sold:
-                    if items_not_enough:
-                        return False, f"Not enough items: **{', '.join(items_not_enough)}**", [], 0
-                    elif items_not_found:
-                        return False, f"Items not found in inventory: **{', '.join(items_not_found)}**", [], 0
-                    elif items_no_value:
-                        return False, f"Items have no sell value: **{', '.join(items_no_value)}**", [], 0
-                    else:
-                        return False, "No items could be sold!", [], 0
-
-                message = "Items sold successfully"
-                warnings = []
-                if items_not_found:
-                    warnings.append(f"Not found: {', '.join(items_not_found)}")
-                if items_no_value:
-                    warnings.append(f"No value: {', '.join(items_no_value)}")
-                if items_not_enough:
-                    warnings.append(f"Not enough: {', '.join(items_not_enough)}")
-                if warnings:
-                    message += " (" + " | ".join(warnings) + ")"
-
-                return True, message, items_sold, total_earned
-
-            except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", [], 0
-            finally:
-                conn.close()
-    
-    # Trial Methods
-    @_serialize_writes
-    def complete_trial(self, name):
-        # Get the character's profile to check their role
-        profile = self.get_profile(name)
-        if not profile:
-            return None
-        
-        # Extract the role (either "Killer" or "Survivor")
-        role = profile['role']
-        
-        # Performance-based rewards
-        # Random performance: 0-4 escapes/kills
-        performance = random.randint(0, 4)
-        
-        # Get a RANDOM trial message for THIS SPECIFIC ROLE AND PERFORMANCE LEVEL
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT message FROM trial_messages WHERE role = ? AND performance_level = ? ORDER BY RANDOM() LIMIT 1", 
-            (role, performance)
-        )
-        result = cursor.fetchone()
-        
-        # Use the random message, or fallback if none found
-        message = result[0] if result else f"You completed a trial as {role}."
-        
-        bp_rewards = {
-            0: 0,
-            1: 3000,
-            2: 6000,
-            3: 9000,
-            4: 12000
-        }
-        bloodpoints = bp_rewards[performance]
-        
-        ac_rewards = {
-            0: 0,
-            1: 0,
-            2: 0,
-            3: 1,
-            4: 2
-        }
-        auric_cells = ac_rewards[performance]
-        
-        # Performance description
-        if role == "Killer":
-            performance_text = {
-                0: "0 Kills (Total Failure)",
-                1: "1 Kill",
-                2: "2 Kills",
-                3: "3 Kills",
-                4: "4 Kills (Perfect!)"
-            }
-        else:  # Survivor
-            performance_text = {
-                0: "0 Survivors Escaped (Total Failure)",
-                1: "1 Survivor Escaped",
-                2: "2 Survivors Escaped",
-                3: "3 Survivors Escaped",
-                4: "4 Survivors Escaped (Perfect!)"
-            }
-        
-        # Add the rewards to the character's profile (only if performance > 0)
-        if performance > 0:
-            cursor.execute(
-                "UPDATE profiles SET bloodpoints = bloodpoints + ?, auric_cells = auric_cells + ? WHERE LOWER(name) = LOWER(?)",
-                (bloodpoints, auric_cells, name)
-            )
-            conn.commit()
-        
-        conn.close()
-        
-        # Return all the information to display in Discord
         return {
-            'role': role,                      # "Killer" or "Survivor"
-            'message': message,                # Random message from database matching performance
-            'bloodpoints': bloodpoints,        # 0 / 5,000 / 10,000 / 15,000 / 20,000
-            'auric_cells': auric_cells,       # 0 / 1 / 2 / 3 / 4
-            'performance': performance,        # 0 / 1 / 2 / 3 / 4
-            'performance_text': performance_text[performance]  # Display text
+            'role': role,
+            'message': result[0] if result else f"You completed a match as {role}.",
+            'main': main_reward,
+            'premium': premium_reward,
+            'performance': performance,
+            'performance_text': config.MATCH_RESULT_TEXT.get(role, {}).get(performance, f"Result: {performance}/4"),
         }
-    
-    # Other Methods
-    def get_random_realm(self):
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT name FROM realms ORDER BY RANDOM() LIMIT 1")
-        result = cursor.fetchone()
-        conn.close()
-        return result[0] if result else "Unknown Realm"
-    
-    def hunting_minigame(self, name):
-        profile = self.get_profile(name)
-        if not profile:
-            return None
 
-        conn = self.get_connection()
-        try:
+    def get_random_location(self):
+        with self._conn() as conn:
+            result = conn.execute("SELECT name FROM locations ORDER BY RANDOM() LIMIT 1").fetchone()
+        return result[0] if result else "Unknown Location"
+
+    # ==================== MINIGAMES ====================
+
+    def roll_minigame(self, name, game):
+        """Pick a weighted random outcome for a minigame. None if the profile doesn't exist."""
+        table = self.loot_table(game)
+        with self._conn() as conn:
             cursor = conn.cursor()
-
-            # Get all hunting items with their weights, difficulty, and messages
-            cursor.execute("SELECT item_name, message, description, weight, difficulty, flee_message, fail_message FROM hunting_items")
-            items = cursor.fetchall()
-
-            if not items:
+            if not self._profile_name(cursor, name):
                 return None
+            cursor.execute(f"SELECT item_name, message, description, weight, difficulty, flee_message, fail_message "
+                           f"FROM {table}")
+            outcomes = cursor.fetchall()
 
-            # Weighted random selection
-            items_list = []
-            weights = []
-            for item in items:
-                items_list.append(item)
-                weights.append(item[3] if item[3] and item[3] > 0 else 10)  # Default weight 10
+        if not outcomes:
+            return {'item': None, 'message': "There is nothing to find here yet.",
+                    'description': "There is nothing to find here yet.",
+                    'difficulty': 10, 'flee_message': None, 'fail_message': None}
 
-            # Use random.choices for weighted selection
-            selected = random.choices(items_list, weights=weights, k=1)[0]
+        weights = [o[3] if o[3] and o[3] > 0 else 10 for o in outcomes]
+        item_name, message, description, _, difficulty, flee, fail = random.choices(outcomes, weights=weights, k=1)[0]
+        has_item = item_name and item_name.strip() and item_name.strip().lower() not in ('none', 'nothing', 'null')
+        return {
+            'item': item_name.strip() if has_item else None,
+            'message': message,
+            'description': description or message,
+            'difficulty': difficulty or 10,
+            'flee_message': flee or None,
+            'fail_message': fail or None,
+        }
 
-            item_name = selected[0]
-            message = selected[1]
-            description = selected[2] if len(selected) > 2 and selected[2] else message
-            difficulty = selected[4] if len(selected) > 4 and selected[4] else 10  # Default difficulty 10
-            flee_message = selected[5] if len(selected) > 5 and selected[5] else None
-            fail_message = selected[6] if len(selected) > 6 and selected[6] else None
-
-            return {
-                'item': item_name if (item_name and item_name.strip() and item_name.lower() not in ['none', 'nothing', 'null']) else None,
-                'message': message,
-                'description': description,
-                'difficulty': difficulty,
-                'flee_message': flee_message,
-                'fail_message': fail_message
-            }
-        finally:
-            conn.close()
-    
-    def fishing_minigame(self, name):
-        profile = self.get_profile(name)
-        if not profile:
-            return None
-
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-
-            # Get all fishing items with their weights and difficulty
-            cursor.execute("SELECT item_name, message, description, weight, difficulty, flee_message, fail_message FROM fishing_items")
-            items = cursor.fetchall()
-
-            if not items:
-                return None
-
-            # Weighted random selection
-            items_list = []
-            weights = []
-            for item in items:
-                items_list.append(item)
-                weights.append(item[3] if item[3] and item[3] > 0 else 10)  # Default weight 10
-
-            # Use random.choices for weighted selection
-            selected = random.choices(items_list, weights=weights, k=1)[0]
-
-            item_name = selected[0]
-            message = selected[1]
-            description = selected[2] if len(selected) > 2 and selected[2] else message
-            difficulty = selected[4] if len(selected) > 4 and selected[4] else 10  # Default difficulty 10
-            flee_message = selected[5] if len(selected) > 5 and selected[5] else None
-            fail_message = selected[6] if len(selected) > 6 and selected[6] else None
-
-            return {
-                'item': item_name if (item_name and item_name.strip() and item_name.lower() not in ['none', 'nothing', 'null']) else None,
-                'message': message,
-                'description': description,
-                'difficulty': difficulty,
-                'flee_message': flee_message,
-                'fail_message': fail_message
-            }
-        finally:
-            conn.close()
-    
-    def scavenging_minigame(self, name):
-        profile = self.get_profile(name)
-        if not profile:
-            return None
-
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-
-            # Get all scavenging items with their weights and difficulty
-            cursor.execute("SELECT item_name, message, description, weight, difficulty, flee_message, fail_message FROM scavenging_items")
-            items = cursor.fetchall()
-
-            if not items:
-                return None
-
-            # Weighted random selection
-            items_list = []
-            weights = []
-            for item in items:
-                items_list.append(item)
-                weights.append(item[3] if item[3] and item[3] > 0 else 10)  # Default weight 10
-
-            # Use random.choices for weighted selection
-            selected = random.choices(items_list, weights=weights, k=1)[0]
-
-            item_name = selected[0]
-            message = selected[1]
-            description = selected[2] if len(selected) > 2 and selected[2] else message
-            difficulty = selected[4] if len(selected) > 4 and selected[4] else 10  # Default difficulty 10
-            flee_message = selected[5] if len(selected) > 5 and selected[5] else None
-            fail_message = selected[6] if len(selected) > 6 and selected[6] else None
-
-            return {
-                'item': item_name if (item_name and item_name.strip() and item_name.lower() not in ['none', 'nothing', 'null']) else None,
-                'message': message,
-                'description': description,
-                'difficulty': difficulty,
-                'flee_message': flee_message,
-                'fail_message': fail_message
-            }
-        finally:
-            conn.close()
-    
     @_serialize_writes
     def add_minigame_item(self, name, item_name):
-        """Add item to inventory after successful minigame roll"""
-        if not item_name or not item_name.strip() or item_name.lower() in ['none', 'nothing', 'null']:
+        """Add one item to the inventory after a successful minigame roll."""
+        if not item_name or not item_name.strip():
             return False
-
-        # Strip stray whitespace before it gets copied into inventory. The
-        # source definition row (hunting/fishing/scavenging_items) may still
-        # contain a stray space from a dashboard edit that skipped normalise();
-        # this keeps that from propagating into every future catch.
-        item_name = item_name.strip()
-
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)", (name, item_name))
-        conn.commit()
-        conn.close()
-        return True
-    
-    def add_xp(self, name, xp_amount, minigame_type='hunting'):
-        """Add XP to character and handle level ups for specific minigame"""
-        assert minigame_type in ('hunting', 'fishing', 'scavenging'), f"Invalid minigame_type: {minigame_type}"
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
-
-                # Determine which level/xp columns to use
-                level_col = f"{minigame_type}_level"
-                xp_col = f"{minigame_type}_xp"
-
-                # Get current level and XP
-                cursor.execute(f"SELECT {level_col}, {xp_col} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                result = cursor.fetchone()
-
-                if not result:
-                    return None
-
-                current_level = result[0] or 1
-                current_xp = result[1] or 0
-
-                # Add XP
-                new_xp = current_xp + xp_amount
-
-                # Calculate level ups (XP needed = level * 100)
-                # Level 1->2 needs 100 XP, Level 2->3 needs 200 XP, etc.
-                leveled_up = False
-                new_level = current_level
-
-                while new_xp >= new_level * 100:
-                    new_xp -= new_level * 100
-                    new_level += 1
-                    leveled_up = True
-
-                # Update database
-                cursor.execute(f"UPDATE profiles SET {level_col} = ?, {xp_col} = ? WHERE LOWER(name) = LOWER(?)", (new_level, new_xp, name))
-                conn.commit()
-
-                return {
-                    'leveled_up': leveled_up,
-                    'old_level': current_level,
-                    'new_level': new_level,
-                    'current_xp': new_xp,
-                    'xp_for_next': new_level * 100,
-                    'xp_gained': xp_amount
-                }
-            except Exception as e:
-                conn.rollback()
-                return None
-            finally:
-                conn.close()
-    
-    def get_level_bonus(self, name, minigame_type='hunting'):
-        """Get roll bonus based on character level for specific minigame"""
-        assert minigame_type in ('hunting', 'fishing', 'scavenging'), f"Invalid minigame_type: {minigame_type}"
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
-            level_col = f"{minigame_type}_level"
-            cursor.execute(f"SELECT {level_col} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-            result = cursor.fetchone()
-
-            if not result:
-                return 0
-
-            level = result[0] or 1
-
-            # +1 bonus every 5 levels
-            # Level 1-4: +0
-            # Level 5-9: +1
-            # Level 10-14: +2
-            # Level 15-19: +3
-            # etc.
-            return (level - 1) // 5
-        finally:
-            conn.close()
-
-    def buy_items_with_quantity(self, name, item_quantities):
-        """
-        Buy multiple items with quantities
-        Args:
-            name: Character name
-            item_quantities: Dict like {"Medkit": 3, "Flashlight": 2}
-        Returns:
-            (success, message, total_price, currency_type, items_purchased)
-        """
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
-
-                # Check if profile exists — fetch exact stored name too
-                cursor.execute("SELECT bloodpoints, auric_cells, name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                result = cursor.fetchone()
-                if not result:
-                    return False, f"Profile {name} not found!", 0, None, {}
-
-                bloodpoints, auric_cells, name = result[0], result[1], result[2]
-
-                # First pass: validate all items exist and calculate total cost
-                total_cost = 0
-                currency_type = None
-                item_prices = {}
-
-                actual_quantities = {}  # Remapped with exact shop names
-                for item_name, quantity in item_quantities.items():
-                    cursor.execute("SELECT item_name, price, currency_type FROM shop_items WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (item_name,))
-                    result = cursor.fetchone()
-                    if not result:
-                        return False, f"Item **{item_name}** not found in shop!", 0, None, {}
-
-                    actual_name = result[0]  # Use the exact stored name
-                    price = result[1]
-                    item_currency = result[2] if result[2] else 'bloodpoints'
-
-                    # Check currency consistency
-                    if currency_type is None:
-                        currency_type = item_currency
-                    elif currency_type != item_currency:
-                        return False, f"Cannot mix currencies! All items must use the same currency (Bloodpoints or Auric Cells).", 0, None, {}
-
-                    item_prices[actual_name] = price
-                    actual_quantities[actual_name] = quantity
-                    total_cost += price * quantity
-
-                item_quantities = actual_quantities  # Use exact names for INSERT
-
-                # Check if enough currency
-                if currency_type == 'auric_cells':
-                    current_balance = auric_cells
-                    currency_name = "Auric Cells"
-                    currency_column = "auric_cells"
-                else:
-                    current_balance = bloodpoints
-                    currency_name = "Bloodpoints"
-                    currency_column = "bloodpoints"
-
-                if current_balance < total_cost:
-                    return False, f"Insufficient {currency_name}! Total cost is **{total_cost:,}**, you have **{current_balance:,}**.", total_cost, currency_type, {}
-
-                # Deduct currency
-                cursor.execute(f"UPDATE profiles SET {currency_column} = {currency_column} - ? WHERE LOWER(name) = LOWER(?)", (total_cost, name))
-
-                # Add all items to inventory
-                items_purchased = {}
-                for item_name, quantity in item_quantities.items():
-                    for _ in range(quantity):
-                        cursor.execute("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)", (name, item_name))
-                    items_purchased[item_name] = quantity
-
-                conn.commit()
-                return True, "Purchase successful", total_cost, currency_type, items_purchased
-
-            except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", 0, None, {}
-            finally:
-                conn.close()
-
-
-    def add_items_with_quantity(self, name, item_quantities):
-        """
-        Add multiple items with quantities to inventory (admin function)
-        Args:
-            name: Character name
-            item_quantities: Dict like {"Medkit": 3, "Flashlight": 2}
-        Returns:
-            (success, message, items_added)
-        """
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
-
-                # Check if profile exists
-                cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                if not cursor.fetchone():
-                    return False, f"Profile {name} not found!", {}
-
-                # Add all items
-                items_added = {}
-                for item_name, quantity in item_quantities.items():
-                    for _ in range(quantity):
-                        cursor.execute("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)", (name, item_name))
-                    items_added[item_name] = quantity
-
-                conn.commit()
-                return True, "Items added successfully", items_added
-
-            except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", {}
-            finally:
-                conn.close()
-    
-    
-    def remove_items_with_quantity(self, name, item_quantities):
-        """
-        Remove multiple items with quantities from inventory
-        Args:
-            name: Character name
-            item_quantities: Dict like {"Medkit": 3, "Flashlight": 2}
-        Returns:
-            (success, message, items_removed)
-        """
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
-
-                # Check if profile exists
-                cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                if not cursor.fetchone():
-                    return False, f"Profile {name} not found!", {}
-
-                # First pass: check if user has enough of each item
-                for item_name, quantity in item_quantities.items():
-                    cursor.execute("SELECT COUNT(*) FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (name, item_name))
-                    count = cursor.fetchone()[0]
-
-                    if count < quantity:
-                        return False, f"Not enough **{item_name}** in inventory! You have {count}, trying to remove {quantity}.", {}
-
-                # Remove items
-                items_removed = {}
-                for item_name, quantity in item_quantities.items():
-                    # Delete exact number of items
-                    cursor.execute(
-                        f"DELETE FROM inventory WHERE id IN (SELECT id FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT ?)",
-                        (name, item_name, quantity)
-                    )
-                    items_removed[item_name] = quantity
-
-                conn.commit()
-                return True, "Items removed successfully", items_removed
-
-            except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", {}
-            finally:
-                conn.close()
-    
-    
-    def use_items_with_quantity(self, name, item_quantities):
-        """
-        Use (consume) multiple items with quantities from inventory
-        Args:
-            name: Character name
-            item_quantities: Dict like {"Medkit": 3, "Flashlight": 2}
-        Returns:
-            (success, message, items_used)
-        """
-        with self._write_lock:
-            conn = self.get_connection()
-            try:
-                cursor = conn.cursor()
-
-                # Check if profile exists
-                cursor.execute("SELECT name FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
-                if not cursor.fetchone():
-                    return False, f"Profile {name} not found!", {}
-
-                # First pass: check if user has enough of each item
-                for item_name, quantity in item_quantities.items():
-                    cursor.execute("SELECT COUNT(*) FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?))", (name, item_name))
-                    count = cursor.fetchone()[0]
-
-                    if count < quantity:
-                        return False, f"Not enough **{item_name}** in inventory! You have {count}, trying to use {quantity}.", {}
-
-                # Remove (use) items
-                items_used = {}
-                for item_name, quantity in item_quantities.items():
-                    # Delete exact number of items
-                    cursor.execute(
-                        f"DELETE FROM inventory WHERE id IN (SELECT id FROM inventory WHERE LOWER(character_name) = LOWER(?) AND LOWER(TRIM(item_name)) = LOWER(TRIM(?)) LIMIT ?)",
-                        (name, item_name, quantity)
-                    )
-                    items_used[item_name] = quantity
-
-                conn.commit()
-                return True, "Items used successfully", items_used
-
-            except Exception as e:
-                conn.rollback()
-                return False, f"Error: {str(e)}", {}
-            finally:
-                conn.close()
-            
-    # Reservation Methods
-    @_serialize_writes
-    def create_reservation(self, guild_id, channel_id, user_id, title, description, color,
-                            footer_text, image_url, thumbnail_url, duration_hours):
-        import time
-        created_at = int(time.time())
-        expires_at = created_at + int(duration_hours * 3600)
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO reservations
-                (guild_id, channel_id, user_id, title, description, color,
-                 footer_text, image_url, thumbnail_url, created_at, expires_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (str(guild_id), str(channel_id), str(user_id), title, description, color,
-                  footer_text, image_url, thumbnail_url, created_at, expires_at))
+            stored = self._profile_name(cursor, name)
+            if not stored:
+                return False
+            self._insert_items(cursor, stored, item_name.strip(), 1)
             conn.commit()
-            return cursor.lastrowid, expires_at
-        finally:
-            conn.close()
+            return True
+
+    @_serialize_writes
+    def add_xp(self, name, xp_amount, game):
+        """Add minigame XP and handle level ups (level N -> N+1 needs N*100 XP)."""
+        self.loot_table(game)  # validates the game name
+        level_col, xp_col = f"{game}_level", f"{game}_xp"
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT name, {level_col}, {xp_col} FROM profiles WHERE LOWER(name) = LOWER(?)", (name,))
+            result = cursor.fetchone()
+            if not result:
+                return None
+            stored = result[0]
+            current_level, new_xp = result[1] or 1, (result[2] or 0) + xp_amount
+            new_level = current_level
+            while new_xp >= new_level * 100:
+                new_xp -= new_level * 100
+                new_level += 1
+            cursor.execute(f"UPDATE profiles SET {level_col} = ?, {xp_col} = ? WHERE name = ?",
+                           (new_level, new_xp, stored))
+            conn.commit()
+        return {
+            'leveled_up': new_level > current_level,
+            'old_level': current_level,
+            'new_level': new_level,
+            'current_xp': new_xp,
+            'xp_for_next': new_level * 100,
+            'xp_gained': xp_amount,
+        }
+
+    @staticmethod
+    def level_bonus(level):
+        """Roll bonus: +1 every 5 levels (1-4: +0, 5-9: +1, ...)."""
+        return ((level or 1) - 1) // 5
+
+    def get_level_bonus(self, name, game):
+        profile = self.get_profile(name)
+        return self.level_bonus(profile[f"{game}_level"]) if profile else 0
+
+    # ==================== WELCOME & REACTION ROLES ====================
+
+    def get_welcome_embed(self):
+        """(embed_row, channel_id) if welcome messages are enabled and configured, else None."""
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT enabled, embed_id, channel_id FROM welcome_settings WHERE id = 1")
+            settings = cursor.fetchone()
+            if not settings or not settings[0] or not settings[1] or not settings[2]:
+                return None
+            cursor.execute("SELECT title, description, color, footer_text, image_url, thumbnail_url "
+                           "FROM embeds WHERE id = ?", (settings[1],))
+            embed = cursor.fetchone()
+        return (embed, settings[2]) if embed else None
+
+    def get_reaction_role(self, message_id, emoji):
+        with self._conn() as conn:
+            result = conn.execute("SELECT role_id FROM reaction_roles WHERE message_id = ? AND emoji = ?",
+                                  (str(message_id), emoji)).fetchone()
+        return int(result[0]) if result else None
+
+    # ==================== MAINTENANCE ====================
+
+    def checkpoint(self):
+        """Truncate the WAL file without blocking other writers (unlike VACUUM)."""
+        with self._conn() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    # ==================== SETTINGS ====================
+
+    def get_settings(self, prefix):
+        """{key without prefix: value} for all settings starting with `prefix`."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT key, value FROM settings WHERE key LIKE ?", (prefix + '%',)).fetchall()
+        return {key[len(prefix):]: value for key, value in rows}
+
+    @_serialize_writes
+    def set_settings(self, prefix, values):
+        with self._conn() as conn:
+            conn.executemany("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                             [(prefix + key, value) for key, value in values.items()])
+            conn.commit()
+
+    # ==================== RESERVATIONS ====================
 
     @_serialize_writes
     def set_reservation_message(self, reservation_id, message_id):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("UPDATE reservations SET message_id = ? WHERE id = ?",
-                            (str(message_id), reservation_id))
+        with self._conn() as conn:
+            conn.execute("UPDATE reservations SET message_id = ? WHERE id = ?", (str(message_id), reservation_id))
             conn.commit()
-        finally:
-            conn.close()
 
-    def get_reservation(self, reservation_id):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,))
-            return cursor.fetchone()
-        finally:
-            conn.close()
+    def get_reservation_end_dates(self):
+        """{roster_id: expires_at} for all active roster reservations (shown on the Roster page)."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT r.roster_id, r.expires_at, ro.linked_id FROM reservations r "
+                                "LEFT JOIN roster ro ON ro.id = r.roster_id "
+                                "WHERE r.status = 'active' AND r.roster_id IS NOT NULL").fetchall()
+        end_dates = {}
+        for roster_id, expires_at, linked_id in rows:
+            end_dates[roster_id] = expires_at
+            if linked_id:
+                end_dates[linked_id] = expires_at  # the linked identity ends at the same time
+        return end_dates
 
     def get_active_reservations(self):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM reservations WHERE active = 1 ORDER BY expires_at ASC")
-            return cursor.fetchall()
-        finally:
-            conn.close()
+        with self._conn() as conn:
+            return conn.execute("SELECT * FROM reservations WHERE active = 1 ORDER BY expires_at ASC").fetchall()
 
     def get_due_reservations(self):
-        import time
-        now = int(time.time())
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute(
+        with self._conn() as conn:
+            return conn.execute(
                 "SELECT * FROM reservations WHERE active = 1 AND notified = 0 AND expires_at <= ?",
-                (now,)
-            )
-            return cursor.fetchall()
-        finally:
-            conn.close()
+                (int(time.time()),)).fetchall()
+
+    @staticmethod
+    def _free_reserved_character(cursor, roster_id, user_id):
+        """Free a roster character that is reserved by this user (taken ones stay taken)."""
+        cursor.execute("UPDATE roster SET status = 'free', player_id = NULL, player_name = NULL "
+                       "WHERE id = ? AND status = 'reserved' AND player_id = ?", (roster_id, str(user_id)))
+        Database._sync_linked(cursor, roster_id)
 
     @_serialize_writes
-    def mark_reservation_notified(self, reservation_id):
-        conn = self.get_connection()
-        try:
+    def expire_reservation(self, reservation_id):
+        """Mark a due reservation as done and free its roster character. Returns the reservation dict."""
+        info = self.get_reservation_info(reservation_id)
+        with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("UPDATE reservations SET notified = 1, active = 0 WHERE id = ?",
-                            (reservation_id,))
+            cursor.execute("UPDATE reservations SET notified = 1, active = 0, extension_pending = 0, "
+                           "status = CASE WHEN roster_id IS NOT NULL THEN 'expired' ELSE status END WHERE id = ?",
+                           (reservation_id,))
+            if info and info['roster_id']:
+                self._free_reserved_character(cursor, info['roster_id'], info['user_id'])
             conn.commit()
-        finally:
-            conn.close()
+        return info
 
     @_serialize_writes
     def delete_reservation(self, reservation_id):
-        conn = self.get_connection()
-        try:
+        """Cancel a reservation completely (frees its roster character if it was reserved)."""
+        info = self.get_reservation_info(reservation_id)
+        if not info:
+            return False, "Reservation not found!"
+        with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM reservations WHERE id = ?", (reservation_id,))
-            if not cursor.fetchone():
-                return False, "Reservation not found!"
+            if info['roster_id'] and info['status'] == 'active':
+                self._free_reserved_character(cursor, info['roster_id'], info['user_id'])
             cursor.execute("DELETE FROM reservations WHERE id = ?", (reservation_id,))
             conn.commit()
-            return True, "Reservation removed!"
-        finally:
-            conn.close()
+        return True, "Reservation removed!"
+
+    # ==================== RESERVATION REQUESTS (roster characters) ====================
+
+    _RES_FIELDS = ("id", "guild_id", "channel_id", "message_id", "user_id", "title", "created_at", "expires_at",
+                   "status", "roster_id", "request_message_id", "reminder_message_id", "reminded",
+                   "extension_pending", "note", "player_name")
+
+    def _res_select(self):
+        return "SELECT " + ", ".join(self._RES_FIELDS) + " FROM reservations"
+
+    def get_reservation_info(self, reservation_id):
+        with self._conn() as conn:
+            row = conn.execute(self._res_select() + " WHERE id = ?", (reservation_id,)).fetchone()
+        return dict(zip(self._RES_FIELDS, row)) if row else None
+
+    @staticmethod
+    def _count_member_reservations(cursor, user_id, statuses):
+        cursor.execute(
+            f"SELECT COUNT(*) FROM reservations WHERE user_id = ? AND roster_id IS NOT NULL "
+            f"AND status IN ({','.join('?' * len(statuses))})", (str(user_id), *statuses))
+        return cursor.fetchone()[0]
+
+    @_serialize_writes
+    def create_reservation_request(self, guild_id, channel_id, user_id, player_name, character_id, note):
+        """A member asks for a roster character. Returns (success, message, reservation_id)."""
+        limit = config.MAX_RESERVATIONS_PER_MEMBER
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            character = self._roster_dict(cursor.execute(self._ROSTER_SELECT + " WHERE id = ?",
+                                                         (character_id,)).fetchone())
+            if not character:
+                return False, "That character isn't on the roster.", None
+            if character['status'] != 'free':
+                return False, f"**{character['display']}** is already {character['status']}.", None
+            ids = self._with_linked(cursor, character['id'])  # the linked identity counts too
+            cursor.execute(f"SELECT 1 FROM reservations WHERE roster_id IN ({','.join('?' * len(ids))}) "
+                           f"AND status = 'pending'", ids)
+            if cursor.fetchone():
+                return False, f"**{character['display']}** was already requested and is waiting for staff.", None
+            if self._count_member_reservations(cursor, user_id, ('pending', 'active')) >= limit:
+                return False, (f"You can have at most {limit} reservations at a time "
+                               f"(requests that are waiting for staff count too)."), None
+            cursor.execute(
+                "INSERT INTO reservations (guild_id, channel_id, user_id, title, created_at, expires_at, active, "
+                "status, roster_id, note, player_name) VALUES (?, ?, ?, ?, ?, 0, 0, 'pending', ?, ?, ?)",
+                (str(guild_id), str(channel_id), str(user_id), character['display'], int(time.time()),
+                 character['id'], note, player_name))
+            conn.commit()
+            return True, "", cursor.lastrowid
+
+    @_serialize_writes
+    def set_request_message(self, reservation_id, message_id):
+        with self._conn() as conn:
+            conn.execute("UPDATE reservations SET request_message_id = ? WHERE id = ?", (str(message_id), reservation_id))
+            conn.commit()
+
+    @_serialize_writes
+    def cancel_request(self, reservation_id):
+        with self._conn() as conn:
+            conn.execute("UPDATE reservations SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+                         (reservation_id,))
+            conn.commit()
+
+    @_serialize_writes
+    def approve_reservation(self, reservation_id, days, staff_id):
+        """Staff approved a request: the reservation starts now. Returns (success, message)."""
+        info = self.get_reservation_info(reservation_id)
+        if not info or info['status'] != 'pending':
+            return False, "This request was already handled."
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            character = self._roster_dict(cursor.execute(self._ROSTER_SELECT + " WHERE id = ?",
+                                                         (info['roster_id'],)).fetchone())
+            if not character:
+                return False, "This character was removed from the roster."
+            if character['status'] != 'free':
+                return False, f"**{character['display']}** is no longer free (it's {character['status']})."
+            if self._count_member_reservations(cursor, info['user_id'], ('active',)) >= config.MAX_RESERVATIONS_PER_MEMBER:
+                return False, (f"<@{info['user_id']}> already has "
+                               f"{config.MAX_RESERVATIONS_PER_MEMBER} active reservations.")
+            now = int(time.time())
+            cursor.execute(
+                "UPDATE reservations SET status = 'active', active = 1, notified = 0, created_at = ?, "
+                "expires_at = ?, decided_by = ? WHERE id = ?",
+                (now, now + days * 86400, str(staff_id), reservation_id))
+            cursor.execute("UPDATE roster SET status = 'reserved', player_id = ?, player_name = ? WHERE id = ?",
+                           (info['user_id'], info['player_name'], character['id']))
+            self._sync_linked(cursor, character['id'])
+            conn.commit()
+        return True, "Approved"
+
+    @_serialize_writes
+    def approve_extension(self, reservation_id, days, staff_id):
+        """Staff approved an extension: the reservation now runs `days` from now."""
+        info = self.get_reservation_info(reservation_id)
+        if not info or info['status'] != 'active' or not info['extension_pending']:
+            return False, "This reservation isn't active anymore or has no open extension request."
+        with self._conn() as conn:
+            conn.execute(
+                "UPDATE reservations SET expires_at = ?, extension_pending = 0, reminded = 0, notified = 0, "
+                "decided_by = ? WHERE id = ?",
+                (int(time.time()) + days * 86400, str(staff_id), reservation_id))
+            conn.commit()
+        return True, "Extended"
+
+    @_serialize_writes
+    def deny_request(self, reservation_id, staff_id):
+        """Deny a new request or an extension. Returns (success, message, 'request' / 'extension')."""
+        info = self.get_reservation_info(reservation_id)
+        with self._conn() as conn:
+            if info and info['status'] == 'pending':
+                conn.execute("UPDATE reservations SET status = 'denied', notified = 1, decided_by = ? WHERE id = ?",
+                             (str(staff_id), reservation_id))
+                conn.commit()
+                return True, "Denied", 'request'
+            if info and info['status'] == 'active' and info['extension_pending']:
+                conn.execute("UPDATE reservations SET extension_pending = 0, decided_by = ? WHERE id = ?",
+                             (str(staff_id), reservation_id))
+                conn.commit()
+                return True, "Denied", 'extension'
+        return False, "This request was already handled.", None
+
+    @_serialize_writes
+    def request_extension(self, reservation_id, user_id):
+        info = self.get_reservation_info(reservation_id)
+        if not info:
+            return False, "Reservation not found."
+        if str(user_id) != info['user_id']:
+            return False, f"Only <@{info['user_id']}> can extend this reservation."
+        if info['status'] != 'active':
+            return False, "This reservation isn't active anymore."
+        if info['extension_pending']:
+            return False, "You already asked for an extension. Staff will get back to you."
+        with self._conn() as conn:
+            conn.execute("UPDATE reservations SET extension_pending = 1 WHERE id = ?", (reservation_id,))
+            conn.commit()
+        return True, "Requested"
+
+    def get_due_reminders(self):
+        """Active roster reservations that end within the reminder window and weren't reminded yet."""
+        now = int(time.time())
+        with self._conn() as conn:
+            rows = conn.execute(
+                self._res_select() + " WHERE status = 'active' AND roster_id IS NOT NULL AND reminded = 0 "
+                "AND expires_at > ? AND expires_at <= ?",
+                (now, now + config.RESERVATION_REMINDER_HOURS * 3600)).fetchall()
+        return [dict(zip(self._RES_FIELDS, r)) for r in rows]
+
+    @_serialize_writes
+    def mark_reminded(self, reservation_id, message_id=None):
+        with self._conn() as conn:
+            conn.execute("UPDATE reservations SET reminded = 1, reminder_message_id = ? WHERE id = ?",
+                         (str(message_id) if message_id else None, reservation_id))
+            conn.commit()
+
+    def get_member_reservations(self, user_id):
+        """{'pending': [...], 'active': [...], 'taken': [...]} for /myreservations and leave alerts."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                self._res_select() + " WHERE user_id = ? AND roster_id IS NOT NULL AND status IN ('pending', 'active') "
+                "ORDER BY expires_at", (str(user_id),)).fetchall()
+        reservations = [dict(zip(self._RES_FIELDS, r)) for r in rows]
+        return {
+            'pending': [r for r in reservations if r['status'] == 'pending'],
+            'active': [r for r in reservations if r['status'] == 'active'],
+            'taken': [c for c in self.characters_of_player(user_id) if c['status'] == 'taken'],
+        }
+
+    # ==================== ROSTER ====================
+
+    _ROSTER_FIELDS = ("id", "name", "title", "role", "status", "player_id", "player_name", "linked_id")
+    _ROSTER_SELECT = "SELECT id, name, title, role, status, player_id, player_name, linked_id FROM roster"
+
+    @staticmethod
+    def _sync_linked(cursor, character_id):
+        """Copy status and player of a character to its linked identity (if it has one)."""
+        cursor.execute(
+            "UPDATE roster SET status = (SELECT status FROM roster WHERE id = ?), "
+            "player_id = (SELECT player_id FROM roster WHERE id = ?), "
+            "player_name = (SELECT player_name FROM roster WHERE id = ?) "
+            "WHERE id = (SELECT linked_id FROM roster WHERE id = ?)", (character_id,) * 4)
+
+    @staticmethod
+    def _with_linked(cursor, character_id):
+        """[character_id] plus the id of its linked identity, if any."""
+        row = cursor.execute("SELECT linked_id FROM roster WHERE id = ?", (character_id,)).fetchone()
+        return [character_id] + ([row[0]] if row and row[0] else [])
+
+    @_serialize_writes
+    def set_roster_link(self, character_id, partner_id):
+        """Link two roster entries (identity switch), or unlink with partner_id=None."""
+        character = self.get_roster_character(character_id)
+        if not character:
+            return False, "Character not found!"
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            if not partner_id:
+                if not character['linked_id']:
+                    return True, ""
+                cursor.execute("UPDATE roster SET linked_id = NULL WHERE id = ? OR linked_id = ?",
+                               (character_id, character_id))
+                conn.commit()
+                return True, f"{character['display']} is no longer linked."
+
+            partner_id = int(partner_id)
+            if partner_id == character_id:
+                return False, "A character can't be linked to itself!"
+            if character['linked_id'] == partner_id:
+                return True, ""
+            partner = self._roster_dict(cursor.execute(self._ROSTER_SELECT + " WHERE id = ?",
+                                                       (partner_id,)).fetchone())
+            if not partner:
+                return False, "Linked character not found!"
+            if partner['linked_id'] and partner['linked_id'] != character_id:
+                return False, f"{partner['display']} is already linked to another character. Unlink it first."
+            if (character['status'] != 'free' and partner['status'] != 'free'
+                    and (character['status'], character['player_id']) != (partner['status'], partner['player_id'])):
+                return False, (f"Can't link: {character['display']} and {partner['display']} are reserved/taken "
+                               f"differently. Release one of them first.")
+
+            ids = (character_id, partner_id)
+            cursor.execute("UPDATE roster SET linked_id = NULL WHERE id IN (?, ?) OR linked_id IN (?, ?)", ids * 2)
+            cursor.execute("UPDATE roster SET linked_id = ? WHERE id = ?", (partner_id, character_id))
+            cursor.execute("UPDATE roster SET linked_id = ? WHERE id = ?", (character_id, partner_id))
+            # The one that is reserved/taken passes its status on to the other
+            self._sync_linked(cursor, character_id if character['status'] != 'free' else partner_id)
+            conn.commit()
+        return True, f"{character['display']} and {partner['display']} are now linked."
+
+    @classmethod
+    def _roster_dict(cls, row):
+        if not row:
+            return None
+        character = dict(zip(cls._ROSTER_FIELDS, row))
+        character['display'] = (f"{character['name']} | {character['title']}"
+                                 if character['title'] else character['name'])
+        return character
+
+    def get_roster(self, role=None):
+        sql, params = self._ROSTER_SELECT, ()
+        if role:
+            sql, params = sql + " WHERE role = ?", (role,)
+        with self._conn() as conn:
+            rows = conn.execute(sql + " ORDER BY name COLLATE NOCASE", params).fetchall()
+        return [self._roster_dict(r) for r in rows]
+
+    def get_roster_character(self, character_id):
+        with self._conn() as conn:
+            return self._roster_dict(conn.execute(self._ROSTER_SELECT + " WHERE id = ?", (character_id,)).fetchone())
+
+    def find_roster_character(self, text):
+        """Find by id (autocomplete value), name, title or 'Name | Title', ignoring case."""
+        text = (text or "").strip()
+        if text.isdigit():
+            found = self.get_roster_character(int(text))
+            if found:
+                return found
+        with self._conn() as conn:
+            # Exact "Name | Title" first, because one name can belong to two characters
+            row = conn.execute(self._ROSTER_SELECT + " WHERE LOWER(name || ' | ' || title) = LOWER(?)",
+                               (text,)).fetchone()
+            if not row:
+                row = conn.execute(self._ROSTER_SELECT + " WHERE LOWER(title) = LOWER(?) OR LOWER(name) = LOWER(?)",
+                                   (text, text)).fetchone()
+        return self._roster_dict(row)
+
+    @staticmethod
+    def _roster_duplicate(cursor, name, title, exclude_id=None):
+        """True if a character with the same name AND title already exists."""
+        cursor.execute("SELECT 1 FROM roster WHERE LOWER(name) = LOWER(?) "
+                       "AND LOWER(COALESCE(title, '')) = LOWER(?) AND id != ?",
+                       (name, title or '', exclude_id or -1))
+        return cursor.fetchone() is not None
+
+    def search_roster(self, query, statuses=None, role=None, exclude_pending=False, limit=25):
+        """Roster characters whose name or title contains `query` (for autocomplete)."""
+        like = f"%{(query or '').strip().lower()}%"
+        sql = self._ROSTER_SELECT + " WHERE (LOWER(name) LIKE ? OR LOWER(COALESCE(title, '')) LIKE ?)"
+        params = [like, like]
+        if statuses:
+            sql += f" AND status IN ({','.join('?' * len(statuses))})"
+            params += list(statuses)
+        if role:
+            sql += " AND role = ?"
+            params.append(role)
+        if exclude_pending:  # also hide it if its linked identity was requested
+            sql += (" AND NOT EXISTS (SELECT 1 FROM reservations r WHERE r.status = 'pending' "
+                    "AND (r.roster_id = roster.id OR r.roster_id = roster.linked_id))")
+        sql += " ORDER BY name COLLATE NOCASE LIMIT ?"
+        params.append(limit)
+        with self._conn() as conn:
+            return [self._roster_dict(r) for r in conn.execute(sql, params).fetchall()]
+
+    def characters_of_player(self, user_id):
+        with self._conn() as conn:
+            rows = conn.execute(self._ROSTER_SELECT + " WHERE player_id = ? ORDER BY name COLLATE NOCASE",
+                                (str(user_id),)).fetchall()
+        return [self._roster_dict(r) for r in rows]
+
+    @classmethod
+    def _cancel_character_reservations(cls, cursor, roster_id):
+        """Cancel reservations and requests of a character and of its linked identity."""
+        ids = cls._with_linked(cursor, roster_id)
+        cursor.execute(f"UPDATE reservations SET status = 'cancelled', active = 0, notified = 1, extension_pending = 0 "
+                       f"WHERE roster_id IN ({','.join('?' * len(ids))}) AND status IN ('pending', 'active')", ids)
+
+    @_serialize_writes
+    def add_roster_character(self, name, title, role):
+        name, title = (name or "").strip(), (title or "").strip() or None
+        if not name:
+            return False, "A name is required!"
+        if role not in config.ROLES:
+            return False, "Invalid role!"
+        display = f"{name} | {title}" if title else name
+        with self._conn() as conn:
+            if self._roster_duplicate(conn.cursor(), name, title):
+                return False, f"{display} is already on the roster!"
+            conn.execute("INSERT INTO roster (name, title, role) VALUES (?, ?, ?)", (name, title, role))
+            conn.commit()
+        return True, f"{display} added to the roster!"
+
+    def import_roster(self, text, role):
+        """Add many characters at once: one 'Name | Title' (or just 'Name') per line.
+
+        Lines copied from a roster message work too: the '﹕﹒' prefix and
+        everything after '―' are ignored. Returns (added_count, skipped_messages).
+        """
+        added, skipped = 0, []
+        for line in (text or "").splitlines():
+            line = line.split("―")[0].strip().lstrip("﹕﹒").strip()
+            if not line:
+                continue
+            name, _, title = line.partition("|")
+            ok, message = self.add_roster_character(name, title, role)
+            if ok:
+                added += 1
+            else:
+                skipped.append(message)
+        return added, skipped
+
+    @_serialize_writes
+    def update_roster_character(self, character_id, name, title, role):
+        name, title = (name or "").strip(), (title or "").strip() or None
+        if not name or role not in config.ROLES:
+            return False, "Name and role are required!"
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            display = f"{name} | {title}" if title else name
+            if self._roster_duplicate(cursor, name, title, exclude_id=character_id):
+                return False, f"{display} is already on the roster!"
+            cursor.execute("UPDATE roster SET name = ?, title = ?, role = ? WHERE id = ?",
+                           (name, title, role, character_id))
+            cursor.execute("UPDATE reservations SET title = ? WHERE roster_id = ? AND status IN ('pending', 'active')",
+                           (display, character_id))
+            conn.commit()
+        return True, f"{display} updated!"
+
+    @_serialize_writes
+    def release_roster_character(self, character_id):
+        """Make a character free again and cancel its reservation."""
+        character = self.get_roster_character(character_id)
+        if not character:
+            return False, "Character not found!"
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE roster SET status = 'free', player_id = NULL, player_name = NULL WHERE id = ?",
+                           (character_id,))
+            self._sync_linked(cursor, character_id)
+            self._cancel_character_reservations(cursor, character_id)
+            conn.commit()
+        return True, f"{character['display']} is free again!"
+
+    @_serialize_writes
+    def set_roster_taken(self, character_id, player_id=None, player_name=None):
+        """Submission approved: the character is taken and its reservation ends (no expiry ping)."""
+        character = self.get_roster_character(character_id)
+        if not character:
+            return False, "Character not found!"
+        player = str(player_id) if player_id else character['player_id']
+        if not player:
+            return False, f"{character['display']} isn't reserved, so choose who plays them."
+        if character['status'] == 'taken' and player == character['player_id']:
+            return False, f"{character['display']} is already taken by them."
+        if not player_name and player == character['player_id']:
+            player_name = character['player_name']
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE roster SET status = 'taken', player_id = ?, player_name = ? WHERE id = ?",
+                           (player, player_name, character_id))
+            self._sync_linked(cursor, character_id)
+            ids = self._with_linked(cursor, character_id)
+            marks = ','.join('?' * len(ids))
+            cursor.execute(f"UPDATE reservations SET status = 'completed', active = 0, notified = 1, "
+                           f"extension_pending = 0 WHERE roster_id IN ({marks}) AND status = 'active'", ids)
+            cursor.execute(f"UPDATE reservations SET status = 'cancelled' WHERE roster_id IN ({marks}) "
+                           f"AND status = 'pending'", ids)
+            conn.commit()
+        return True, f"{character['display']} is now taken!"
+
+    @_serialize_writes
+    def delete_roster_character(self, character_id):
+        character = self.get_roster_character(character_id)
+        if not character:
+            return False, "Character not found!"
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            self._cancel_character_reservations(cursor, character_id)
+            if character['linked_id'] and character['status'] == 'reserved':
+                # the reservation is gone, so the linked identity must not stay reserved
+                cursor.execute("UPDATE roster SET status = 'free', player_id = NULL, player_name = NULL WHERE id = ?",
+                               (character['linked_id'],))
+            cursor.execute("UPDATE roster SET linked_id = NULL WHERE linked_id = ?", (character_id,))
+            cursor.execute("DELETE FROM roster WHERE id = ?", (character_id,))
+            conn.commit()
+        return True, f"{character['display']} removed from the roster!"
+
+    @_serialize_writes
+    def release_player(self, user_id):
+        """Free every character of a player and cancel their reservations. Returns the freed names."""
+        names = [c['display'] for c in self.characters_of_player(user_id)]
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("UPDATE roster SET status = 'free', player_id = NULL, player_name = NULL "
+                           "WHERE player_id = ?", (str(user_id),))
+            cursor.execute("UPDATE reservations SET status = 'cancelled', active = 0, notified = 1, "
+                           "extension_pending = 0 WHERE user_id = ? AND roster_id IS NOT NULL "
+                           "AND status IN ('pending', 'active')", (str(user_id),))
+            conn.commit()
+        return names
+
+    def get_roster_message_ids(self):
+        with self._conn() as conn:
+            return [r[0] for r in conn.execute("SELECT message_id FROM roster_messages ORDER BY position").fetchall()]
+
+    @_serialize_writes
+    def set_roster_message_ids(self, message_ids):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM roster_messages")
+            conn.executemany("INSERT INTO roster_messages (position, message_id) VALUES (?, ?)",
+                             [(i, str(mid)) for i, mid in enumerate(message_ids)])
+            conn.commit()
 
     # ==================== ACTIVITY CHECK ====================
 
     @_serialize_writes
     def add_activity_character(self, character_name, role, discord_username, discord_user_id):
-        import time
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
+        with self._conn() as conn:
+            conn.execute('''
                 INSERT INTO activity_characters (character_name, role, discord_username, discord_user_id, added_at)
                 VALUES (?, ?, ?, ?, ?)
             ''', (character_name, role, discord_username, discord_user_id, int(time.time())))
             conn.commit()
             return True, "Character added to Activity Check!"
-        finally:
-            conn.close()
 
     @_serialize_writes
     def remove_activity_character(self, character_id):
-        conn = self.get_connection()
-        try:
+        with self._conn() as conn:
             cursor = conn.cursor()
-            cursor.execute("SELECT id FROM activity_characters WHERE id = ?", (character_id,))
-            if not cursor.fetchone():
+            cursor.execute("SELECT id, roster_id FROM activity_characters WHERE id = ?", (character_id,))
+            row = cursor.fetchone()
+            if not row:
                 return False, "Character not found!"
+            if row[1]:
+                return False, ("This character comes from the roster. It leaves the Activity Check "
+                               "automatically when it's released on the Roster page.")
             cursor.execute("UPDATE activity_characters SET removed = 1 WHERE id = ?", (character_id,))
             conn.commit()
             return True, "Character removed from Activity Check!"
-        finally:
-            conn.close()
 
     def get_all_activity_characters(self, include_removed=False):
-        conn = self.get_connection()
-        try:
+        query = ("SELECT id, character_name, role, discord_username, discord_user_id, added_at, removed, roster_id "
+                 "FROM activity_characters ")
+        if not include_removed:
+            query += "WHERE removed = 0 "
+        query += "ORDER BY character_name COLLATE NOCASE"
+        with self._conn() as conn:
+            rows = conn.execute(query).fetchall()
+        return [{'id': r[0], 'character_name': r[1], 'role': r[2], 'discord_username': r[3],
+                 'discord_user_id': r[4], 'added_at': r[5], 'removed': r[6], 'roster_id': r[7],
+                 'is_oc': r[7] is None} for r in rows]
+
+    @_serialize_writes
+    def sync_activity_with_roster(self):
+        """Put every TAKEN roster character on the Activity Check, and take released ones off.
+
+        Linked identities become one entry. An entry belongs to one player: if the
+        character gets a new player, the old entry (with its history) is retired and a
+        new one is made. If the same player takes it again, the old entry comes back.
+        """
+        taken = sorted((c for c in self.get_roster() if c['status'] == 'taken'), key=lambda c: c['id'])
+        by_id = {c['id']: c for c in taken}
+        wanted = {}  # roster_id -> (name, role, player_id, player_name)
+        for c in taken:
+            if c['linked_id'] and c['linked_id'] in wanted:
+                continue  # already covered by its linked identity
+            name, role = c['display'], c['role']
+            partner = by_id.get(c['linked_id'])
+            if partner:
+                name += f" / {partner['title'] or partner['name']}"
+                if partner['role'] != c['role']:
+                    role = f"{c['role']} / {partner['role']}"
+            wanted[c['id']] = (name, role, c['player_id'], c['player_name'])
+
+        with self._conn() as conn:
             cursor = conn.cursor()
-            if include_removed:
-                cursor.execute("SELECT id, character_name, role, discord_username, discord_user_id, added_at, removed FROM activity_characters ORDER BY character_name COLLATE NOCASE")
-            else:
-                cursor.execute("SELECT id, character_name, role, discord_username, discord_user_id, added_at, removed FROM activity_characters WHERE removed = 0 ORDER BY character_name COLLATE NOCASE")
-            rows = cursor.fetchall()
-            return [
-                {
-                    'id': r[0], 'character_name': r[1], 'role': r[2],
-                    'discord_username': r[3], 'discord_user_id': r[4],
-                    'added_at': r[5], 'removed': r[6]
-                } for r in rows
-            ]
-        finally:
-            conn.close()
+            rows = cursor.execute("SELECT id, roster_id, discord_user_id, removed FROM activity_characters "
+                                  "WHERE roster_id IS NOT NULL").fetchall()
+            handled = set()
+            for row_id, roster_id, player_id, removed in rows:
+                target = wanted.get(roster_id)
+                if target and str(player_id) == str(target[2]) and roster_id not in handled:
+                    name, role, _, player_name = target
+                    cursor.execute("UPDATE activity_characters SET character_name = ?, role = ?, removed = 0, "
+                                   "discord_username = COALESCE(?, discord_username) WHERE id = ?",
+                                   (name, role, player_name, row_id))
+                    handled.add(roster_id)
+                elif not removed:
+                    cursor.execute("UPDATE activity_characters SET removed = 1 WHERE id = ?", (row_id,))
+            for roster_id, (name, role, player_id, player_name) in wanted.items():
+                if roster_id not in handled:
+                    cursor.execute(
+                        "INSERT INTO activity_characters (character_name, role, discord_username, discord_user_id, "
+                        "added_at, roster_id) VALUES (?, ?, ?, ?, ?, ?)",
+                        (name, role, player_name, player_id, int(time.time()), roster_id))
+            conn.commit()
+
+    @_serialize_writes
+    def update_player_names(self, names):
+        """Store current Discord display names ({user_id: name}) for the roster and the Activity Check."""
+        if not names:
+            return
+        with self._conn() as conn:
+            for user_id, name in names.items():
+                conn.execute("UPDATE roster SET player_name = ? WHERE player_id = ?", (name, str(user_id)))
+                conn.execute("UPDATE activity_characters SET discord_username = ? WHERE discord_user_id = ?",
+                             (name, str(user_id)))
+            conn.commit()
 
     @_serialize_writes
     def set_activity_status(self, character_id, month, status):
-        import time
         if status not in ('active', 'inactive', 'hiatus'):
             return False, "Invalid status!"
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
+        with self._conn() as conn:
+            conn.execute('''
                 INSERT INTO activity_checks (character_id, month, status, checked_at)
                 VALUES (?, ?, ?, ?)
                 ON CONFLICT(character_id, month) DO UPDATE SET
@@ -1807,42 +1652,25 @@ class Database:
             ''', (character_id, month, status, int(time.time())))
             conn.commit()
             return True, "Status saved!"
-        finally:
-            conn.close()
 
     def get_activity_statuses_for_month(self, month):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT character_id, status FROM activity_checks WHERE month = ?", (month,))
-            return {row[0]: row[1] for row in cursor.fetchall()}
-        finally:
-            conn.close()
+        with self._conn() as conn:
+            rows = conn.execute("SELECT character_id, status FROM activity_checks WHERE month = ?", (month,)).fetchall()
+        return {row[0]: row[1] for row in rows}
 
     def get_all_checked_months(self):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute("SELECT DISTINCT month FROM activity_checks ORDER BY month DESC")
-            return [row[0] for row in cursor.fetchall()]
-        finally:
-            conn.close()
+        with self._conn() as conn:
+            rows = conn.execute("SELECT DISTINCT month FROM activity_checks ORDER BY month DESC").fetchall()
+        return [row[0] for row in rows]
 
     def get_inactive_characters_for_month(self, month):
-        conn = self.get_connection()
-        try:
-            cursor = conn.cursor()
-            cursor.execute('''
+        with self._conn() as conn:
+            rows = conn.execute('''
                 SELECT ac.id, ac.character_name, ac.role, ac.discord_username, ac.discord_user_id
                 FROM activity_checks chk
                 JOIN activity_characters ac ON ac.id = chk.character_id
                 WHERE chk.month = ? AND chk.status = 'inactive'
                 ORDER BY ac.character_name COLLATE NOCASE
-            ''', (month,))
-            rows = cursor.fetchall()
-            return [
-                {'id': r[0], 'character_name': r[1], 'role': r[2], 'discord_username': r[3], 'discord_user_id': r[4]}
-                for r in rows
-            ]
-        finally:
-            conn.close()
+            ''', (month,)).fetchall()
+        return [{'id': r[0], 'character_name': r[1], 'role': r[2], 'discord_username': r[3], 'discord_user_id': r[4]}
+                for r in rows]
