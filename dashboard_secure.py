@@ -4,6 +4,7 @@ import os
 import secrets
 import sqlite3
 import subprocess
+import sys
 import threading
 from functools import wraps
 
@@ -46,12 +47,30 @@ if not users:
 
 LOGIN_ENABLED = True
 
+# Logins that may update and restart the bot (everyone else, e.g. "mod", doesn't even see the buttons).
+# env: DASHBOARD_ADMINS=admin,otheradmin   (default: admin)
+DASHBOARD_ADMINS = {u.strip() for u in os.getenv("DASHBOARD_ADMINS", "admin").split(",") if u.strip()}
+
 
 def login_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if LOGIN_ENABLED and not session.get('logged_in'):
             return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+
+def is_dashboard_admin():
+    return session.get('username') in DASHBOARD_ADMINS
+
+
+def admin_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if not is_dashboard_admin():
+            flash('Only dashboard admins can do that.', 'danger')
+            return redirect(url_for('index'))
         return f(*args, **kwargs)
     return decorated_function
 
@@ -75,6 +94,7 @@ def inject_config():
         'minigames': config.MINIGAMES,
         'roles': config.ROLES,
         'categories': config.ITEM_CATEGORIES,
+        'is_dashboard_admin': is_dashboard_admin(),
     }
 
 
@@ -166,7 +186,10 @@ def index():
 
 
 REPO_DIR = os.path.dirname(os.path.abspath(__file__))
-DASHBOARD_FILES = ("dashboard_secure.py", "database.py", "config.py", "templates/")
+DASHBOARD_FILES = ("dashboard_secure.py", "database.py", "config.py", "roster_format.py", "templates/")
+DB_FILE_NAME = os.path.basename(config.DB_FILE)
+BACKUP_DIR = os.path.join(REPO_DIR, "backups")   # in .gitignore
+BACKUPS_KEPT = 10
 
 
 def _restart_services(restart_dashboard):
@@ -175,24 +198,111 @@ def _restart_services(restart_dashboard):
         subprocess.run(["sudo", "systemctl", "restart", config.DASHBOARD_SERVICE])
 
 
+def _git(*args, timeout=60):
+    """Run git in the bot folder. Returns (success, output)."""
+    result = subprocess.run(["git", "-c", "user.name=Dashboard", "-c", "user.email=dashboard@localhost", *args],
+                            cwd=REPO_DIR, capture_output=True, text=True, timeout=timeout)
+    return result.returncode == 0, (result.stdout + result.stderr).strip()
+
+
+def _backup_database():
+    """Copy the live database into backups/ (safe while the bot is running). Keeps the newest few."""
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    target = os.path.join(BACKUP_DIR, f"{os.path.splitext(DB_FILE_NAME)[0]}_"
+                                      f"{datetime.datetime.now():%Y-%m-%d_%H-%M-%S}.db")
+    with db._conn() as source, sqlite3.connect(target) as copy:
+        source.backup(copy)
+    old = sorted(f for f in os.listdir(BACKUP_DIR) if f.endswith(".db"))
+    for name in old[:-BACKUPS_KEPT]:
+        os.remove(os.path.join(BACKUP_DIR, name))
+    return os.path.relpath(target, REPO_DIR)
+
+
+def _untrack_database():
+    """The live database must never be managed by git, or a pull could overwrite or delete it.
+    If git tracks it here, stop that (the file itself stays untouched). Returns True if it was tracked."""
+    tracked, _ = _git("ls-files", "--error-unmatch", DB_FILE_NAME)
+    if tracked:
+        _git("rm", "--cached", "--quiet", DB_FILE_NAME)
+    return tracked
+
+
+@app.route('/admin/check-updates', methods=['POST'])
+@login_required
+@admin_required
+def admin_check_updates():
+    """Show what an update would do, without changing anything."""
+    try:
+        ok, output = _git("fetch", "origin", timeout=60)
+        if not ok:
+            flash(f"Couldn't reach GitHub: {output}", "danger")
+            return redirect(url_for('index'))
+        _, incoming = _git("log", "--oneline", "HEAD..origin/main")
+        _, local_commits = _git("log", "--oneline", "origin/main..HEAD")
+        _, local_changes = _git("status", "--porcelain", "--untracked-files=no")
+        local_changes = "\n".join(l for l in local_changes.splitlines() if not l.endswith(DB_FILE_NAME))
+        if incoming:
+            flash(f"New on GitHub:\n{incoming}", "info")
+        else:
+            flash("No new updates on GitHub.", "info")
+        if local_changes or local_commits:
+            flash("Changes made on the Pi (will be kept and merged with the update):\n"
+                  + "\n".join(x for x in (local_commits, local_changes) if x), "warning")
+    except Exception as e:
+        flash(f"Error: {e}", "danger")
+    return redirect(url_for('index'))
+
+
 @app.route('/admin/update', methods=['POST'])
 @login_required
+@admin_required
 def admin_update():
+    """Back up the database, keep the Pi's own changes, merge GitHub's changes and restart.
+    .env is never touched (git ignores it). On a merge conflict nothing is changed."""
     try:
-        result = subprocess.run(["git", "pull", "--ff-only"], cwd=REPO_DIR,
-                                capture_output=True, text=True, timeout=30)
-        output = (result.stdout + result.stderr).strip()
-        if result.returncode != 0:
-            flash(f"git pull failed: {output}", "danger")
-        elif "Already up to date" in output:
-            flash("Already up to date — nothing to restart.", "info")
-        else:
-            # The dashboard also uses database.py, config.py and the templates
-            dashboard_changed = any(name in output for name in DASHBOARD_FILES)
-            flash(f"Pulled latest changes, restarting service(s)...\n{output}", "success")
-            threading.Timer(1.5, _restart_services, args=(dashboard_changed,)).start()
+        backup = _backup_database()
+        untracked = _untrack_database()
+
+        # Save changes made directly on the Pi (to files git tracks) so the merge keeps them
+        _, local_changes = _git("status", "--porcelain", "--untracked-files=no")
+        if local_changes:
+            _git("add", "-u")
+            ok, output = _git("commit", "-m", "Changes made on the Pi (saved by the dashboard before updating)")
+            if not ok and "nothing to commit" not in output:
+                flash(f"Couldn't save the Pi's changes, nothing was updated: {output}", "danger")
+                return redirect(url_for('index'))
+
+        ok, output = _git("pull", "--no-rebase", "--no-edit", "origin", "main", timeout=120)
+        if not ok:
+            _, conflicts = _git("diff", "--name-only", "--diff-filter=U")
+            if conflicts:
+                _git("merge", "--abort")
+                flash("The update clashes with changes made on the Pi in: " + ", ".join(conflicts.split())
+                      + ". Nothing was changed and the bot keeps running. Your Pi changes are saved; "
+                        "fix the clash in those files (or ask for help) and update again.", "danger")
+            else:
+                flash(f"Update failed, nothing was changed: {output}", "danger")
+            return redirect(url_for('index'))
+
+        notes = [f"Database backed up to {backup}."]
+        if untracked:
+            notes.append("The live database is no longer managed by git (the file itself is unchanged).")
+        if "Already up to date" in output:
+            flash("Already up to date — nothing to restart. " + " ".join(notes), "info")
+            return redirect(url_for('index'))
+
+        _, changed = _git("diff", "--name-only", "ORIG_HEAD", "HEAD")
+        changed = changed.split()
+        if "requirements.txt" in changed:
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", "-r", "requirements.txt"],
+                           cwd=REPO_DIR, timeout=600)
+            notes.append("New packages installed.")
+        dashboard_changed = any(f.startswith(DASHBOARD_FILES) for f in changed)
+        flash(f"Updated {len(changed)} file(s), restarting {'bot and dashboard' if dashboard_changed else 'bot'}... "
+              + " ".join(notes), "success")
+        threading.Timer(1.5, _restart_services, args=(dashboard_changed,)).start()
     except subprocess.TimeoutExpired:
-        flash("git pull timed out after 30 seconds.", "danger")
+        flash("Update timed out, nothing was restarted. Try again in a moment.", "danger")
     except Exception as e:
         flash(f"Error: {e}", "danger")
     return redirect(url_for('index'))
