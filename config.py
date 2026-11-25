@@ -249,8 +249,10 @@ MINIGAME_XP_LEAVE = 5
 
 # ==================== INVENTORY ====================
 
-ITEM_CATEGORIES = ['Consumables', 'Tools', 'Collectibles', 'Miscellaneous',
-                   'Cosmetics', 'Pets', 'Shelter', 'NSFW']
+# Everything is shown in one list in /profile. (The category column still exists
+# in the database, so more categories could be brought back later.)
+ITEM_CATEGORIES = ['Miscellaneous']
+INVENTORY_ITEMS_PER_PAGE = 15       # /profile inventory: items per page before ◀ ▶ buttons appear
 
 # ==================== LOOK & FEEL ====================
 # Emojis: Unicode defaults work everywhere. To use your server's custom emojis,
@@ -261,6 +263,7 @@ EMOJI = {
     "success": "✅",
     "error": "❌",
     "profile": "⭐",
+    "inventory": "🎒",
     "match": "⚔️",
     "dice": "🎲",
     "choose": "🎯",

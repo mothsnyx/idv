@@ -198,63 +198,89 @@ def _progress_bar(level, xp):
     return "█" * filled + "░" * (10 - filled)
 
 
-class ProfileView(discord.ui.View):
-    """Profile with 'Main Info' / 'Inventory' pages and an NSFW toggle."""
+BLANK = "⠀"        # invisible character: keeps empty lines that Discord would otherwise remove
+INDENT = "⠀⠀"
 
-    def __init__(self, profile_data, inventory_data):
+
+class ProfileView(discord.ui.View):
+    """Profile with 'Main Info' / 'Inventory' pages; the inventory gets ◀ ▶ when it's long."""
+
+    def __init__(self, profile_data, inventory_items):
         super().__init__(timeout=180)
         self.profile_data = profile_data
-        self.inventory_data = inventory_data
-        self.current_page = 0
-        self.show_nsfw = False
+        self.items = inventory_items                       # already sorted A–Z
+        per_page = max(1, config.INVENTORY_ITEMS_PER_PAGE)
+        self.inv_pages = [self.items[i:i + per_page] for i in range(0, len(self.items), per_page)] or [[]]
+        self.current_page = 0                              # 0 = main info, 1 = inventory
+        self.inv_page = 0
+        self._update_buttons()
 
-    @discord.ui.button(label="Main Info", style=discord.ButtonStyle.danger)
+    def _update_buttons(self):
+        on_inventory = self.current_page == 1
+        self.main_info_button.style = discord.ButtonStyle.secondary if on_inventory else discord.ButtonStyle.primary
+        self.inventory_button.style = discord.ButtonStyle.primary if on_inventory else discord.ButtonStyle.secondary
+        paged = on_inventory and len(self.inv_pages) > 1
+        for button in (self.prev_button, self.next_button):
+            if paged and button not in self.children:
+                self.add_item(button)
+            elif not paged and button in self.children:
+                self.remove_item(button)
+        self.prev_button.disabled = self.inv_page == 0
+        self.next_button.disabled = self.inv_page >= len(self.inv_pages) - 1
+
+    async def _show(self, interaction):
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+
+    @discord.ui.button(label="Main Info", style=discord.ButtonStyle.primary)
     async def main_info_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 0
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        await self._show(interaction)
 
     @discord.ui.button(label="Inventory", style=discord.ButtonStyle.secondary)
     async def inventory_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         self.current_page = 1
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+        await self._show(interaction)
 
-    @discord.ui.button(label="🔞 Show NSFW", style=discord.ButtonStyle.secondary)
-    async def toggle_nsfw_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        self.show_nsfw = not self.show_nsfw
-        button.label = "👁️ Hide NSFW" if self.show_nsfw else "🔞 Show NSFW"
-        button.style = discord.ButtonStyle.danger if self.show_nsfw else discord.ButtonStyle.secondary
-        await interaction.response.edit_message(embed=self.create_embed(), view=self)
+    @discord.ui.button(label="◀", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.inv_page = max(0, self.inv_page - 1)
+        await self._show(interaction)
+
+    @discord.ui.button(label="▶", style=discord.ButtonStyle.secondary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.inv_page = min(len(self.inv_pages) - 1, self.inv_page + 1)
+        await self._show(interaction)
 
     def create_embed(self):
         p = self.profile_data
         if self.current_page == 0:
-            embed = discord.Embed(color=COLOR_DEFAULT)
-            embed.add_field(name=f"{EMOJI['profile']} ┃ **{p['name']}**'s Profile", value="", inline=False)
-            embed.add_field(name=".✦ Role:", value=p['role'], inline=True)
-            levels_text = "\n".join(
-                f"{cfg['emoji']} **Lv.{p[f'{game}_level']}** {_progress_bar(p[f'{game}_level'], p[f'{game}_xp'])}"
+            currency = "\n".join(f"{INDENT}{c['emoji']}　**{p[key]:,}** {c['name']}" for key, c in CURRENCIES.items())
+            levels = "\n".join(
+                f"{INDENT}{cfg['emoji']}　{cfg['label']} · **Lv. {p[f'{game}_level']}**\n"
+                f"{INDENT}{_progress_bar(p[f'{game}_level'], p[f'{game}_xp'])}　"
+                f"{p[f'{game}_xp']}/{p[f'{game}_level'] * 100} XP"
                 for game, cfg in MINIGAMES.items())
-            embed.add_field(name=".✦ Levels:", value=levels_text or "—", inline=True)
-            currency_text = "\n".join(f"{c['emoji']} {p[key]:,} {c['name']}" for key, c in CURRENCIES.items())
-            embed.add_field(name=".✦ Currency:", value=currency_text, inline=True)
-            return embed
+            sections = [f".✦ **Role**\n{INDENT}{p['role']}", f".✦ **Currency**\n{currency}"]
+            if levels:
+                sections.append(f".✦ **Levels**\n{levels}")
+            return discord.Embed(title=f"{EMOJI['profile']} ┃ {p['name']}",
+                                 description=f"{BLANK}\n" + f"\n{BLANK}\n".join(sections) + f"\n{BLANK}",
+                                 color=COLOR_DEFAULT)
 
-        embed = discord.Embed(title=f"{EMOJI['profile']} ┃ **{p['name']}**'s Inventory", color=COLOR_DEFAULT)
-        total_items = sum(item['quantity'] for items in self.inventory_data.values() for item in items)
-        if not total_items:
-            embed.description = "*Inventory is empty*\n\nUse `/buy` to purchase items or play minigames to collect loot!"
+        embed = discord.Embed(title=f"{EMOJI.get('inventory', '🎒')} ┃ {p['name']}'s Inventory", color=COLOR_DEFAULT)
+        if not self.items:
+            embed.description = (f"{BLANK}\n*The inventory is empty.*\n{BLANK}\n"
+                                 f"Play minigames or matches to collect items!\n{BLANK}")
             return embed
-        for category, items in self.inventory_data.items():
-            if not items:
-                continue
-            if category == 'NSFW' and not self.show_nsfw:
-                value = f"*{len(items)} NSFW item(s) hidden. Click '🔞 Show NSFW' to reveal.*"
-            elif category == 'NSFW':
-                value = "\n".join(f"||{item['item_name']}|| ― `{item['quantity']}`" for item in items)
-            else:
-                value = "\n".join(f"{item['item_name']} ― `{item['quantity']}`" for item in items)
-            embed.add_field(name=f"·········•✦ {category}", value=value[:1024], inline=False)
-        embed.set_footer(text=f"Total: {total_items} items")
+        lines = "\n".join(f"{INDENT}﹒{item['item_name']}　`×{item['quantity']}`"
+                          for item in self.inv_pages[self.inv_page])
+        embed.description = f"{BLANK}\n.✦ **Miscellaneous**\n{BLANK}\n{lines}\n{BLANK}"
+        total = sum(item['quantity'] for item in self.items)
+        footer = f"{total} item{'s' if total != 1 else ''} in total · {len(self.items)} different"
+        if len(self.inv_pages) > 1:
+            footer += f" · Page {self.inv_page + 1}/{len(self.inv_pages)}"
+        embed.set_footer(text=footer)
         return embed
 
 

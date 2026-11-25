@@ -761,7 +761,7 @@ class Database:
                            [(character, item_name)] * quantity)
 
     def get_inventory(self, name):
-        """{category: [{'item_name', 'quantity'}]} for every category in config.ITEM_CATEGORIES."""
+        """[{'item_name', 'quantity'}] sorted A–Z. Spelling variants (medkit / Medkit) count as one item."""
         with self._conn() as conn:
             cursor = conn.cursor()
             # Group case/whitespace-insensitively so spelling variants count as one item
@@ -772,15 +772,10 @@ class Database:
             rows = cursor.fetchall()
             catalog = self._item_catalog(cursor)
 
-        categorized = {category: [] for category in config.ITEM_CATEGORIES}
-        categorized.setdefault('Miscellaneous', [])
-        for item_key, raw_name, quantity in rows:
-            display, category = catalog.get(item_key, (raw_name, 'Miscellaneous'))
-            bucket = categorized.get(self.normalise_category(category), categorized['Miscellaneous'])
-            bucket.append({'item_name': display, 'quantity': quantity})
-        for items in categorized.values():
-            items.sort(key=lambda i: i['item_name'].lower())
-        return categorized
+        items = [{'item_name': catalog.get(item_key, (self.normalise(raw_name), None))[0], 'quantity': quantity}
+                 for item_key, raw_name, quantity in rows]
+        items.sort(key=lambda i: i['item_name'].lower())
+        return items
 
     @_serialize_writes
     def add_items_with_quantity(self, name, item_quantities):
