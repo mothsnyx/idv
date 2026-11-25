@@ -33,6 +33,19 @@ SEED_LOOT = {
 }
 
 
+# Starter texts for /cnmatch (one per result type, for both maps). Placeholders:
+# {character}, {map}, {anomaly}, {count}
+SEED_CN_MESSAGES = [
+    ("barely", "{character} scraped together just enough to meet the quota and stumbled out of {map} "
+               "with {count} classic(s), the {anomaly} close behind."),
+    ("normal", "{character} met the quota in {map}, kept clear of the {anomaly} and left with {count} classics."),
+    ("great", "{character} cleared {map} and walked out with a heavy bag of {count} classics. "
+              "The {anomaly} never stood a chance of catching up."),
+    ("death_anomaly", "The {anomaly} caught {character} in {map}."),
+    ("death_other", "{character} didn't make it out of {map}. The quota wasn't met in time."),
+]
+
+
 def _seed_match_messages():
     """One placeholder message per role and result level."""
     return [(role, level, f"[Placeholder] {role} result {level}/4 - edit this message in the dashboard.")
@@ -107,7 +120,11 @@ class Database:
 
     def _item_tables(self):
         """Tables that define items, in priority order for display name/category."""
-        return ["shop_items"] + [self.loot_table(g) for g in config.MINIGAMES]
+        return ["shop_items"] + [self.loot_table(g) for g in config.MINIGAMES] + ["cn_items"]
+
+    def _sellable_tables(self):
+        """Tables whose items can be sold with /sell (minigame loot and Cryptic Notes classics)."""
+        return [self.loot_table(g) for g in config.MINIGAMES] + ["cn_items"]
 
     # ==================== TEXT NORMALISATION ====================
 
@@ -238,7 +255,18 @@ class Database:
                     decided_by TEXT
                 )''')
 
-            # Character roster: who plays which character
+            # Character roster: who plays which character.
+            # Databases created by an early version allowed each name only once (UNIQUE), which
+            # crashed adding "Norton Campbell | Fool's Gold" next to "Norton Campbell | Prospector".
+            # Rebuild such a table without that rule; all entries are kept.
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'roster'")
+            old_roster = cursor.fetchone()
+            rebuild_roster = bool(old_roster and 'UNIQUE' in old_roster[0].upper())
+            if rebuild_roster:
+                # One transaction (committed at the end of init_database), so the bot and the
+                # dashboard starting at the same time can't interfere with each other
+                cursor.execute("BEGIN IMMEDIATE")
+                cursor.execute("ALTER TABLE roster RENAME TO roster_old")
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS roster (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -251,6 +279,61 @@ class Database:
                 )''')
             # Identity switches: two linked entries always share status and player
             self._ensure_columns(cursor, "roster", {"linked_id": "INTEGER"})
+            if rebuild_roster:
+                old_columns = {c[1] for c in cursor.execute("PRAGMA table_info(roster_old)").fetchall()}
+                columns = ", ".join(c for c in ("id", "name", "title", "role", "status", "player_id",
+                                                "player_name", "linked_id") if c in old_columns)
+                cursor.execute(f"INSERT INTO roster ({columns}) SELECT {columns} FROM roster_old")
+                cursor.execute("DROP TABLE roster_old")
+                print("✓ Roster table upgraded: the same name may now be used with different titles")
+
+            # ----- Cryptic Notes (/cnmatch) -----
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cn_maps (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL,
+                    other_death_chance INTEGER DEFAULT 8   -- % for quota not met, falls, ...
+                )''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cn_anomalies (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    danger INTEGER DEFAULT 2,              -- 1 (weak) .. 5 (deadliest)
+                    description TEXT
+                )''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cn_items (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_name TEXT NOT NULL,
+                    tier TEXT NOT NULL DEFAULT 'B',        -- key of config.CN_TIERS
+                    sell_value INTEGER DEFAULT 0,
+                    weight INTEGER DEFAULT 10,             -- how common within its tier
+                    category TEXT DEFAULT 'Collectibles',
+                    description TEXT
+                )''')
+            # Which anomaly / classic can appear on which map
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cn_spawns (
+                    kind TEXT NOT NULL,                    -- 'anomaly' or 'item'
+                    entry_id INTEGER NOT NULL,
+                    map_id INTEGER NOT NULL,
+                    PRIMARY KEY (kind, entry_id, map_id)
+                )''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cn_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    map_id INTEGER,                        -- NULL = both maps
+                    outcome TEXT NOT NULL,                 -- key of config.CN_OUTCOMES
+                    message TEXT NOT NULL
+                )''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS cn_runs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    profile_name TEXT NOT NULL,
+                    map_id INTEGER,
+                    outcome TEXT,
+                    created_at INTEGER NOT NULL
+                )''')
 
             # Simple key/value settings edited on the dashboard (e.g. the roster layout)
             cursor.execute('''
@@ -259,11 +342,19 @@ class Database:
                     value TEXT
                 )''')
 
-            # The roster messages the bot keeps updated in Discord, in posting order
+            # Old: roster messages of the single roster post (only kept to clean them up once)
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS roster_messages (
                     position INTEGER PRIMARY KEY,
                     message_id TEXT NOT NULL
+                )''')
+            # Roster messages per role (Hunters and Survivors each have their own forum post), in posting order
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS roster_post_messages (
+                    role TEXT NOT NULL,
+                    position INTEGER NOT NULL,
+                    message_id TEXT NOT NULL,
+                    PRIMARY KEY (role, position)
                 )''')
 
             cursor.execute('''
@@ -349,7 +440,34 @@ class Database:
                     cursor.executemany(
                         f"INSERT INTO {self.loot_table(game)} (item_name, message, category, sell_value, weight, difficulty) "
                         f"VALUES (?, ?, ?, ?, ?, ?)", rows)
+
+            # Cryptic Notes: maps from config (new ones are added, existing settings are kept)
+            for map_name, death_chance in config.CN_MAPS.items():
+                cursor.execute("INSERT OR IGNORE INTO cn_maps (name, other_death_chance) VALUES (?, ?)",
+                               (map_name, death_chance))
+            if is_empty("cn_messages"):
+                cursor.executemany("INSERT INTO cn_messages (map_id, outcome, message) VALUES (NULL, ?, ?)",
+                                   SEED_CN_MESSAGES)
+            if is_empty("cn_anomalies") and is_empty("cn_items"):
+                self._seed_cn_examples(cursor)
             conn.commit()
+
+    @staticmethod
+    def _seed_cn_examples(cursor):
+        """The three examples from the server's codex, so the codex isn't empty on first start."""
+        maps = {name: map_id for map_id, name in cursor.execute("SELECT id, name FROM cn_maps").fetchall()}
+        abod, pd = maps.get("A Bringer of Doom"), maps.get("Phosphorescence Disease")
+        cursor.execute("INSERT INTO cn_anomalies (name, danger) VALUES ('Wraith', 3)")
+        if abod:
+            cursor.execute("INSERT INTO cn_spawns VALUES ('anomaly', ?, ?)", (cursor.lastrowid, abod))
+        cursor.execute("INSERT INTO cn_items (item_name, tier, sell_value) VALUES ('Pickaxe', 'B', 150)")
+        if pd:
+            cursor.execute("INSERT INTO cn_spawns VALUES ('item', ?, ?)", (cursor.lastrowid, pd))
+        cursor.execute("INSERT INTO cn_items (item_name, tier, sell_value) VALUES ('Cursed Sapphire', 'S', 1000)")
+        sapphire = cursor.lastrowid
+        for map_id in (abod, pd):
+            if map_id:
+                cursor.execute("INSERT INTO cn_spawns VALUES ('item', ?, ?)", (sapphire, map_id))
 
     # ==================== PROFILES ====================
 
@@ -476,6 +594,13 @@ class Database:
             profile[f"{game}_level"] = profile.get(f"{game}_level") or 1
             profile[f"{game}_xp"] = profile.get(f"{game}_xp") or 0
         return profile
+
+    def search_profile_names(self, query, limit=25):
+        """Character names containing `query` (for autocomplete of other players' characters)."""
+        with self._conn() as conn:
+            rows = conn.execute("SELECT name FROM profiles WHERE LOWER(name) LIKE ? ORDER BY name COLLATE NOCASE "
+                                "LIMIT ?", (f"%{(query or '').strip().lower()}%", limit)).fetchall()
+        return [r[0] for r in rows]
 
     def get_profiles_for_user(self, user_id):
         """[(name, role, main, premium)] for one Discord user, sorted by name."""
@@ -608,9 +733,9 @@ class Database:
 
     def _sell_value(self, cursor, item_name):
         """Sell value from the first loot table that gives the item a value (0 = not sellable)."""
-        for game in config.MINIGAMES:
+        for table in self._sellable_tables():
             cursor.execute(
-                f"SELECT sell_value FROM {self.loot_table(game)} "
+                f"SELECT sell_value FROM {table} "
                 f"WHERE LOWER(TRIM(item_name)) = LOWER(TRIM(?)) AND sell_value > 0 LIMIT 1", (item_name,))
             result = cursor.fetchone()
             if result:
@@ -991,6 +1116,265 @@ class Database:
     def get_level_bonus(self, name, game):
         profile = self.get_profile(name)
         return self.level_bonus(profile[f"{game}_level"]) if profile else 0
+
+    # ==================== CRYPTIC NOTES ====================
+
+    def get_cn_maps(self):
+        with self._conn() as conn:
+            rows = conn.execute("SELECT id, name, other_death_chance FROM cn_maps ORDER BY id").fetchall()
+        return [{'id': r[0], 'name': r[1], 'other_death_chance': r[2]} for r in rows]
+
+    def find_cn_map(self, text):
+        """By id (autocomplete value) or name, ignoring case."""
+        text = (text or "").strip()
+        for cn_map in self.get_cn_maps():
+            if text == str(cn_map['id']) or text.lower() == cn_map['name'].lower():
+                return cn_map
+        return None
+
+    @_serialize_writes
+    def update_cn_map(self, map_id, other_death_chance):
+        with self._conn() as conn:
+            conn.execute("UPDATE cn_maps SET other_death_chance = ? WHERE id = ?",
+                         (max(0, min(100, int(other_death_chance))), map_id))
+            conn.commit()
+
+    @staticmethod
+    def _set_cn_spawns(cursor, kind, entry_id, map_ids):
+        cursor.execute("DELETE FROM cn_spawns WHERE kind = ? AND entry_id = ?", (kind, entry_id))
+        cursor.executemany("INSERT OR IGNORE INTO cn_spawns (kind, entry_id, map_id) VALUES (?, ?, ?)",
+                           [(kind, entry_id, int(m)) for m in map_ids])
+
+    def get_cn_codex(self, kind):
+        """All anomalies ('anomaly') or classics ('item'), each with a 'maps' list of map ids."""
+        with self._conn() as conn:
+            if kind == 'anomaly':
+                rows = conn.execute("SELECT id, name, danger, description FROM cn_anomalies "
+                                    "ORDER BY name COLLATE NOCASE").fetchall()
+                entries = [{'id': r[0], 'name': r[1], 'danger': r[2], 'description': r[3]} for r in rows]
+            else:
+                rows = conn.execute("SELECT id, item_name, tier, sell_value, weight, category, description "
+                                    "FROM cn_items ORDER BY item_name COLLATE NOCASE").fetchall()
+                entries = [{'id': r[0], 'name': r[1], 'tier': r[2], 'sell_value': r[3], 'weight': r[4],
+                            'category': r[5], 'description': r[6]} for r in rows]
+            spawns = conn.execute("SELECT entry_id, map_id FROM cn_spawns WHERE kind = ?", (kind,)).fetchall()
+        maps_of = {}
+        for entry_id, map_id in spawns:
+            maps_of.setdefault(entry_id, []).append(map_id)
+        for entry in entries:
+            entry['maps'] = sorted(maps_of.get(entry['id'], []))
+        return entries
+
+    @_serialize_writes
+    def save_cn_anomaly(self, anomaly_id, name, danger, description, map_ids):
+        """Add (anomaly_id=None) or update an anomaly. Returns (success, message)."""
+        name = (name or "").strip()
+        if not name:
+            return False, "The anomaly needs a name!"
+        danger = max(1, min(5, int(danger or 2)))
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM cn_anomalies WHERE LOWER(name) = LOWER(?) AND id != ?",
+                           (name, anomaly_id or -1))
+            if cursor.fetchone():
+                return False, f"{name} is already in the codex!"
+            if anomaly_id:
+                cursor.execute("UPDATE cn_anomalies SET name = ?, danger = ?, description = ? WHERE id = ?",
+                               (name, danger, description or None, anomaly_id))
+            else:
+                cursor.execute("INSERT INTO cn_anomalies (name, danger, description) VALUES (?, ?, ?)",
+                               (name, danger, description or None))
+                anomaly_id = cursor.lastrowid
+            self._set_cn_spawns(cursor, 'anomaly', anomaly_id, map_ids)
+            conn.commit()
+        return True, f"{name} saved!"
+
+    @_serialize_writes
+    def save_cn_item(self, item_id, name, tier, sell_value, weight, category, description, map_ids):
+        """Add (item_id=None) or update a classic. Renaming also renames it in every inventory."""
+        name = self.normalise((name or "").strip())
+        if not name:
+            return False, "The classic needs a name!"
+        tier = tier if tier in config.CN_TIERS else 'B'
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM cn_items WHERE LOWER(item_name) = LOWER(?) AND id != ?",
+                           (name, item_id or -1))
+            if cursor.fetchone():
+                return False, f"{name} is already in the codex!"
+            values = (name, tier, max(0, int(sell_value or 0)), max(1, int(weight or 10)),
+                      self.normalise_category(category or 'Collectibles'), description or None)
+            old_name = None
+            if item_id:
+                row = cursor.execute("SELECT item_name FROM cn_items WHERE id = ?", (item_id,)).fetchone()
+                old_name = row[0] if row else None
+                cursor.execute("UPDATE cn_items SET item_name = ?, tier = ?, sell_value = ?, weight = ?, "
+                               "category = ?, description = ? WHERE id = ?", values + (item_id,))
+            else:
+                cursor.execute("INSERT INTO cn_items (item_name, tier, sell_value, weight, category, description) "
+                               "VALUES (?, ?, ?, ?, ?, ?)", values)
+                item_id = cursor.lastrowid
+            self._set_cn_spawns(cursor, 'item', item_id, map_ids)
+            conn.commit()
+        if old_name and old_name.strip() != name:
+            self.rename_inventory_item(old_name, name)
+        return True, f"{name} saved!"
+
+    @_serialize_writes
+    def delete_cn_entry(self, kind, entry_id):
+        table = "cn_anomalies" if kind == 'anomaly' else "cn_items"
+        with self._conn() as conn:
+            conn.execute(f"DELETE FROM {table} WHERE id = ?", (entry_id,))
+            conn.execute("DELETE FROM cn_spawns WHERE kind = ? AND entry_id = ?", (kind, entry_id))
+            conn.commit()
+        return True, "Removed from the codex."
+
+    def import_cn_codex(self, kind, text, map_ids):
+        """Many entries at once.
+
+        Anomalies: one per line "Name | danger 1-5"   (danger optional, default 2)
+        Classics:  one per line "Name | tier | sell value"  (tier B/A/S/EX, value optional)
+        Returns (added_count, skipped_messages).
+        """
+        added, skipped = 0, []
+        tier_lookup = {key.lower(): key for key in config.CN_TIERS}
+        tier_lookup.update({t['label'].lower(): key for key, t in config.CN_TIERS.items()})
+        tier_lookup.update({'exquisite': 'EX', 'exquisite classic': 'EX'})
+        for line in (text or "").splitlines():
+            parts = [p.strip() for p in line.split("|")]
+            if not parts[0]:
+                continue
+            if kind == 'anomaly':
+                danger = parts[1] if len(parts) > 1 and parts[1].isdigit() else 2
+                ok, message = self.save_cn_anomaly(None, parts[0], danger, None, map_ids)
+            else:
+                raw = (parts[1] if len(parts) > 1 and parts[1] else 'B').lower()
+                # accepts "S", "S-Tier", "S-Tier Classic", "Exquisite", "Exquisite Classic", ...
+                tier = tier_lookup.get(raw) or tier_lookup.get(raw.replace('-tier', '').replace('classic', '').strip())
+                if not tier:
+                    skipped.append(f"{parts[0]}: unknown tier '{parts[1]}' (use B, A, S or EX)")
+                    continue
+                value = parts[2].replace(',', '').replace('.', '') if len(parts) > 2 else ''
+                value = int(value) if value.isdigit() else config.CN_TIERS[tier]['value']
+                ok, message = self.save_cn_item(None, parts[0], tier, value, 10, 'Collectibles', None, map_ids)
+            if ok:
+                added += 1
+            else:
+                skipped.append(message)
+        return added, skipped
+
+    def get_cn_messages(self):
+        with self._conn() as conn:
+            rows = conn.execute("SELECT id, map_id, outcome, message FROM cn_messages ORDER BY outcome, id").fetchall()
+        return [{'id': r[0], 'map_id': r[1], 'outcome': r[2], 'message': r[3]} for r in rows]
+
+    @_serialize_writes
+    def save_cn_message(self, message_id, map_id, outcome, message):
+        message = (message or "").strip()
+        if outcome not in config.CN_OUTCOMES or not message:
+            return False, "Choose a result type and write a message!"
+        map_id = int(map_id) if str(map_id or '').isdigit() else None
+        with self._conn() as conn:
+            if message_id:
+                conn.execute("UPDATE cn_messages SET map_id = ?, outcome = ?, message = ? WHERE id = ?",
+                             (map_id, outcome, message, message_id))
+            else:
+                conn.execute("INSERT INTO cn_messages (map_id, outcome, message) VALUES (?, ?, ?)",
+                             (map_id, outcome, message))
+            conn.commit()
+        return True, "Message saved!"
+
+    @_serialize_writes
+    def delete_cn_message(self, message_id):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM cn_messages WHERE id = ?", (message_id,))
+            conn.commit()
+        return True, "Message deleted."
+
+    def pick_cn_anomaly(self, map_id):
+        """A random anomaly that can appear on this map (the whole group meets the same one), or None."""
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT a.id, a.name, a.danger FROM cn_anomalies a JOIN cn_spawns s "
+                "ON s.kind = 'anomaly' AND s.entry_id = a.id WHERE s.map_id = ? ORDER BY RANDOM() LIMIT 1",
+                (map_id,)).fetchone()
+        return {'id': row[0], 'name': row[1], 'danger': row[2] or 1} if row else None
+
+    @_serialize_writes
+    def run_cryptic_notes(self, name, cn_map, anomaly):
+        """One character's Cryptic Notes run. Returns a result dict, or None if the profile doesn't exist."""
+        now = int(time.time())
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            stored = self._profile_name(cursor, name)
+            if not stored:
+                return None
+
+            cursor.execute("SELECT COUNT(*) FROM cn_runs WHERE profile_name = ? AND created_at > ?",
+                           (stored, now - config.CN_EXHAUSTION_WINDOW))
+            earlier_runs = cursor.fetchone()[0]
+            exhausted = earlier_runs >= config.CN_EXHAUSTION_RUNS   # 4th run within the hour or later
+
+            # 1) Does the character die? The anomaly (by its danger) or something else (quota, fall, ...)
+            anomaly_kill = config.CN_DANGER_KILL_CHANCE.get(anomaly['danger'], 0) if anomaly else 0
+            other_death = cn_map['other_death_chance'] + (config.CN_EXHAUSTED_EXTRA_DEATH if exhausted else 0)
+            items, reward = [], 0
+            if random.random() * 100 < anomaly_kill:
+                outcome = 'death_anomaly'
+            elif random.random() * 100 < other_death:
+                outcome = 'death_other'
+            else:
+                # 2) Survived: find classics that can appear on this map
+                cursor.execute(
+                    "SELECT i.item_name, i.tier, i.sell_value, i.weight FROM cn_items i JOIN cn_spawns s "
+                    "ON s.kind = 'item' AND s.entry_id = i.id WHERE s.map_id = ?", (cn_map['id'],))
+                pool = {}
+                for item_name, tier, sell_value, weight in cursor.fetchall():
+                    pool.setdefault(tier, []).append((item_name, sell_value or 0, weight or 10))
+                tiers = [t for t in config.CN_TIERS if t in pool]
+                if tiers:
+                    counts = config.CN_ITEM_COUNT_WEIGHTS
+                    for _ in range(random.choices(list(counts), weights=list(counts.values()))[0]):
+                        tier = random.choices(tiers, weights=[config.CN_TIERS[t]['weight'] for t in tiers])[0]
+                        item_name, sell_value, _w = random.choices(pool[tier], weights=[i[2] for i in pool[tier]])[0]
+                        items.append({'name': item_name, 'tier': tier, 'sell_value': sell_value})
+                rare = sum(1 for i in items if i['tier'] in ('S', 'EX'))
+                outcome = 'barely' if len(items) <= 3 else ('great' if len(items) >= 7 or rare >= 2 else 'normal')
+                reward = config.CN_REWARDS.get(outcome, 0)
+                self._insert_items_many(cursor, stored, [i['name'] for i in items])
+                if reward:
+                    cursor.execute("UPDATE profiles SET currency_main = currency_main + ? WHERE name = ?",
+                                   (reward, stored))
+
+            # 3) Story text for this result (map-specific or for both maps)
+            cursor.execute("SELECT message FROM cn_messages WHERE outcome = ? AND (map_id IS NULL OR map_id = ?) "
+                           "ORDER BY RANDOM() LIMIT 1", (outcome, cn_map['id']))
+            row = cursor.fetchone()
+            text = row[0] if row else config.CN_OUTCOMES[outcome]
+            for key, value in {'{character}': stored, '{map}': cn_map['name'], '{count}': str(len(items)),
+                               '{anomaly}': anomaly['name'] if anomaly else 'unknown anomaly'}.items():
+                text = text.replace(key, value)
+
+            cursor.execute("INSERT INTO cn_runs (profile_name, map_id, outcome, created_at) VALUES (?, ?, ?, ?)",
+                           (stored, cn_map['id'], outcome, now))
+            conn.commit()
+
+        return {
+            'character': stored,
+            'outcome': outcome,
+            'died': outcome.startswith('death'),
+            'message': text,
+            'items': items,
+            'total_value': sum(i['sell_value'] for i in items),
+            'reward': reward,
+            'runs_this_hour': earlier_runs + 1,
+            'exhausted': exhausted,
+        }
+
+    @staticmethod
+    def _insert_items_many(cursor, character, item_names):
+        cursor.executemany("INSERT INTO inventory (character_name, item_name) VALUES (?, ?)",
+                           [(character, n) for n in item_names])
 
     # ==================== WELCOME & REACTION ROLES ====================
 
@@ -1417,8 +1801,11 @@ class Database:
         with self._conn() as conn:
             if self._roster_duplicate(conn.cursor(), name, title):
                 return False, f"{display} is already on the roster!"
-            conn.execute("INSERT INTO roster (name, title, role) VALUES (?, ?, ?)", (name, title, role))
-            conn.commit()
+            try:
+                conn.execute("INSERT INTO roster (name, title, role) VALUES (?, ?, ?)", (name, title, role))
+                conn.commit()
+            except sqlite3.IntegrityError as e:  # show a message instead of crashing the page
+                return False, f"{display} couldn't be added: {e}"
         return True, f"{display} added to the roster!"
 
     def import_roster(self, text, role):
@@ -1530,16 +1917,29 @@ class Database:
             conn.commit()
         return names
 
-    def get_roster_message_ids(self):
+    def get_roster_message_ids(self, role):
+        """IDs of the roster messages the bot posted in this role's forum post, in order."""
+        with self._conn() as conn:
+            return [r[0] for r in conn.execute(
+                "SELECT message_id FROM roster_post_messages WHERE role = ? ORDER BY position", (role,)).fetchall()]
+
+    @_serialize_writes
+    def set_roster_message_ids(self, role, message_ids):
+        with self._conn() as conn:
+            conn.execute("DELETE FROM roster_post_messages WHERE role = ?", (role,))
+            conn.executemany("INSERT INTO roster_post_messages (role, position, message_id) VALUES (?, ?, ?)",
+                             [(role, i, str(mid)) for i, mid in enumerate(message_ids)])
+            conn.commit()
+
+    def get_old_roster_message_ids(self):
+        """Messages from the time there was only one roster post (cleaned up once by the bot)."""
         with self._conn() as conn:
             return [r[0] for r in conn.execute("SELECT message_id FROM roster_messages ORDER BY position").fetchall()]
 
     @_serialize_writes
-    def set_roster_message_ids(self, message_ids):
+    def clear_old_roster_message_ids(self):
         with self._conn() as conn:
             conn.execute("DELETE FROM roster_messages")
-            conn.executemany("INSERT INTO roster_messages (position, message_id) VALUES (?, ?)",
-                             [(i, str(mid)) for i, mid in enumerate(message_ids)])
             conn.commit()
 
     # ==================== ACTIVITY CHECK ====================

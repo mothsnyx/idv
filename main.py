@@ -46,7 +46,7 @@ class GameBot(commands.Bot):
 
 
 # Slash commands only; a prefix is required by discord.py but no prefix commands exist
-bot = GameBot(command_prefix=commands.when_mentioned, intents=intents)
+bot = GameBot(command_prefix=commands.when_mentioned, intents=intents, help_command=None)  # /help is the help
 db = Database()
 api = Flask(__name__)  # internal API used by the dashboard
 
@@ -466,33 +466,239 @@ async def match_reward(interaction: discord.Interaction, name: str, count: app_c
     await interaction.response.send_message(embed=embed)
 
 
+# ==================== CRYPTIC NOTES (/cnmatch) ====================
+
+CN_SHORT = {'barely': "Barely made quota", 'normal': "Made quota", 'great': "Big haul",
+            'death_anomaly': "Killed", 'death_other': "Didn't make it"}
+
+
+async def cn_location_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=m['name'], value=str(m['id'])) for m in db.get_cn_maps()
+            if current.lower() in m['name'].lower()][:25]
+
+
+async def own_character_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=p[0], value=p[0]) for p in db.get_profiles_for_user(interaction.user.id)
+            if current.lower() in p[0].lower()][:25]
+
+
+async def any_character_autocomplete(interaction: discord.Interaction, current: str):
+    return [app_commands.Choice(name=n, value=n) for n in db.search_profile_names(current)]
+
+
+def _cn_items_text(result):
+    """'⚪ **Pickaxe** ×2 · 150 each' lines plus the total, for one character's result."""
+    counted = {}
+    for item in result['items']:
+        entry = counted.setdefault(item['name'], [item, 0])
+        entry[1] += 1
+    lines = []
+    for name, (item, qty) in sorted(counted.items(), key=lambda kv: -kv[1][0]['sell_value']):
+        tier = config.CN_TIERS.get(item['tier'], {})
+        lines.append(f"{tier.get('emoji', '•')} **{name}**{f' ×{qty}' if qty > 1 else ''} · "
+                     f"{tier.get('label', item['tier'])} · {item['sell_value']:,} each")
+    lines.append(f"**Total value:** {amount_text('main', result['total_value'])}")
+    if result['reward']:
+        lines.append(f"**Survival bonus:** {amount_text('main', result['reward'])}")
+    return "\n".join(lines)
+
+
+def _cn_exhaustion_text(result):
+    if result['runs_this_hour'] < config.CN_EXHAUSTION_RUNS:
+        return ""
+    text = (f"{config.CN_ICONS['exhausted']} **{result['character']}** is exhausted "
+            f"({result['runs_this_hour']} runs within the hour). "
+            f"Another run could easily end in death.")
+    if result['exhausted']:
+        text += " The exhaustion already made this run more dangerous."
+    return text
+
+
+def run_cn_group(cn_map, names):
+    """Run Cryptic Notes for one or more characters (same anomaly for everyone) and build the result embed."""
+    anomaly = db.pick_cn_anomaly(cn_map['id'])
+    results = [r for r in (db.run_cryptic_notes(n, cn_map, anomaly) for n in names) if r]
+    all_dead = bool(results) and all(r['died'] for r in results)
+    embed = discord.Embed(title=f"{config.CN_EMOJI} ┃ Cryptic Notes · {cn_map['name']}",
+                          color=COLOR_ERROR if all_dead else COLOR_DEFAULT)
+    icons = config.CN_ICONS
+    anomaly_line = (f"**Anomaly:** {anomaly['name']} · danger "
+                    f"{icons['danger_full'] * anomaly['danger']}{icons['danger_empty'] * (5 - anomaly['danger'])}"
+                    if anomaly else "")
+
+    if len(results) == 1:  # solo run: the story is the main text
+        r = results[0]
+        embed.description = f"{anomaly_line}\n\n{r['message']}".strip()[:4000]
+        if r['died']:
+            embed.add_field(name=f"{icons['died']} {CN_SHORT[r['outcome']]}", value=config.CN_RESPAWN_TEXT,
+                            inline=False)
+        else:
+            embed.add_field(name=f"Classics found ({len(r['items'])})", value=_cn_items_text(r)[:1024], inline=False)
+        if _cn_exhaustion_text(r):
+            embed.add_field(name="Exhausted", value=_cn_exhaustion_text(r), inline=False)
+        return embed
+
+    embed.description = anomaly_line or None
+    for r in results:  # group run: one section per character
+        icon = icons['died'] if r['died'] else icons['survived']
+        body = r['message'] + "\n" + (config.CN_RESPAWN_TEXT if r['died'] else _cn_items_text(r))
+        if _cn_exhaustion_text(r):
+            body += "\n" + _cn_exhaustion_text(r)
+        embed.add_field(name=f"{icon} {r['character']} · {CN_SHORT[r['outcome']]}", value=body[:1024], inline=False)
+    survivors = sum(1 for r in results if not r['died'])
+    embed.set_footer(text=f"{survivors}/{len(results)} made it out")
+    return embed
+
+
+class CNGroupView(discord.ui.View):
+    """Group invite: every invited player has to accept for their own character."""
+    ICONS = {key: config.CN_ICONS[key] for key in ('leader', 'accepted', 'declined', 'pending')}
+
+    def __init__(self, leader_id, cn_map, members, owners):
+        super().__init__(timeout=config.CN_INVITE_TIMEOUT)
+        self.leader_id, self.cn_map, self.members, self.owners = leader_id, cn_map, members, owners
+        self.answers = {members[0]: 'leader'}
+        for name in members[1:]:  # characters the leader owns join right away
+            self.answers[name] = 'accepted' if owners[name] == leader_id else 'pending'
+        self.message = None
+        self.done = False
+
+    def pending(self):
+        return [name for name, answer in self.answers.items() if answer == 'pending']
+
+    def team(self):
+        return [name for name, answer in self.answers.items() if answer in ('leader', 'accepted')]
+
+    def invite_embed(self):
+        lines = "\n".join(f"{self.ICONS[self.answers[n]]} **{n}** · <@{self.owners[n]}>" for n in self.members)
+        embed = discord.Embed(
+            title=f"{config.CN_EMOJI} ┃ Cryptic Notes · {self.cn_map['name']}",
+            description=(f"<@{self.leader_id}> wants to enter **{self.cn_map['name']}** as a group.\n"
+                         f"Each invited player has to accept for their own character.\n\n{lines}"),
+            color=COLOR_DEFAULT)
+        embed.set_footer(text=f"Invite expires in {config.CN_INVITE_TIMEOUT // 60} minutes · "
+                              f"the leader can start early with everyone who accepted")
+        return embed
+
+    async def start(self, interaction):
+        if self.done:
+            return
+        self.done = True
+        self.stop()
+        await interaction.response.edit_message(content=None, embed=run_cn_group(self.cn_map, self.team()), view=None)
+
+    async def answer(self, interaction, accept):
+        mine = [n for n in self.pending() if self.owners[n] == interaction.user.id]
+        if not mine:
+            await interaction.response.send_message(
+                embed=error_embed("You don't have a character waiting for an answer in this invite."), ephemeral=True)
+            return
+        for name in mine:
+            self.answers[name] = 'accepted' if accept else 'declined'
+        if not self.pending():  # everyone answered: go
+            await self.start(interaction)
+        else:
+            await interaction.response.edit_message(embed=self.invite_embed(), view=self)
+
+    @discord.ui.button(label="Accept", style=discord.ButtonStyle.success)
+    async def accept_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.answer(interaction, True)
+
+    @discord.ui.button(label="Decline", style=discord.ButtonStyle.danger)
+    async def decline_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.answer(interaction, False)
+
+    @discord.ui.button(label="Start now", style=discord.ButtonStyle.primary)
+    async def start_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.leader_id:
+            await interaction.response.send_message(embed=error_embed("Only the group leader can start."),
+                                                    ephemeral=True)
+            return
+        await self.start(interaction)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.leader_id:
+            await interaction.response.send_message(embed=error_embed("Only the group leader can cancel."),
+                                                    ephemeral=True)
+            return
+        self.done = True
+        self.stop()
+        embed = self.invite_embed()
+        embed.description += "\n\n**Cancelled by the leader.**"
+        embed.set_footer(text=None)
+        await interaction.response.edit_message(content=None, embed=embed, view=None)
+
+    async def on_timeout(self):
+        if self.done or not self.message:
+            return
+        self.done = True
+        embed = self.invite_embed()
+        embed.description += "\n\n**The invite expired.** Use /cnmatch again to try once more."
+        embed.set_footer(text=None)
+        try:
+            await self.message.edit(content=None, embed=embed, view=None)
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(name="cnmatch", description="Play a Cryptic Notes match, alone or as a group of up to 4")
+@app_commands.describe(location="The Cryptic Notes map", character="Your character",
+                       teammate1="Group: another player's character (they have to accept)",
+                       teammate2="Group: another player's character (they have to accept)",
+                       teammate3="Group: another player's character (they have to accept)")
+@app_commands.autocomplete(location=cn_location_autocomplete, character=own_character_autocomplete,
+                           teammate1=any_character_autocomplete, teammate2=any_character_autocomplete,
+                           teammate3=any_character_autocomplete)
+async def cn_match(interaction: discord.Interaction, location: str, character: str,
+                   teammate1: str = None, teammate2: str = None, teammate3: str = None):
+    if not await require_owner(interaction, character):
+        return
+    cn_map = db.find_cn_map(location)
+    if not cn_map:
+        names = " or ".join(f"**{m['name']}**" for m in db.get_cn_maps())
+        await interaction.response.send_message(embed=error_embed(f"Unknown location. Choose {names}."),
+                                                ephemeral=True)
+        return
+    leader = db.get_profile(character)
+
+    teammates = [t for t in (teammate1, teammate2, teammate3) if t][:config.CN_GROUP_MAX - 1]
+    if not teammates:  # solo run
+        await interaction.response.send_message(embed=run_cn_group(cn_map, [leader['name']]))
+        return
+
+    members, owners = [leader['name']], {leader['name']: interaction.user.id}
+    for name in teammates:
+        profile = db.get_profile(name)
+        if not profile:
+            await interaction.response.send_message(embed=error_embed(f"Character **{name}** not found!"),
+                                                    ephemeral=True)
+            return
+        if profile['name'].lower() in (m.lower() for m in members):
+            await interaction.response.send_message(
+                embed=error_embed(f"**{profile['name']}** is in the group twice!"), ephemeral=True)
+            return
+        if not profile['user_id']:
+            await interaction.response.send_message(
+                embed=error_embed(f"**{profile['name']}** has no owner, so nobody can accept the invite."),
+                ephemeral=True)
+            return
+        members.append(profile['name'])
+        owners[profile['name']] = int(profile['user_id'])
+
+    view = CNGroupView(interaction.user.id, cn_map, members, owners)
+    if not view.pending():  # all teammates belong to the leader
+        await interaction.response.send_message(embed=run_cn_group(cn_map, view.team()))
+        return
+    invited = " ".join(sorted({f"<@{owners[n]}>" for n in view.pending()}))
+    await interaction.response.send_message(content=f"{invited} you're invited to a Cryptic Notes match!",
+                                            embed=view.invite_embed(), view=view)
+    view.message = await interaction.original_response()
+
+
 # ==================== SHOP & INVENTORY COMMANDS ====================
 
-@bot.tree.command(name="shop", description="View available items for purchase")
-async def shop(interaction: discord.Interaction):
-    items = db.get_shop_items()
-    embed = discord.Embed(title="Shop", color=COLOR_DEFAULT)
-    if not items:
-        embed.description = "No items available."
-    else:
-        embed.description = "Purchase items with `/buy [name] [items]`"
-        lines = []
-        for item_name, price, description, currency in items:
-            currency = currency if currency in CURRENCIES else 'main'
-            line = f"**{item_name}** - {price:,} {CURRENCIES[currency]['name']}"
-            lines.append(f"{line}\n*{description}*" if description else line)
-        # Split into several fields so a long shop doesn't hit Discord's 1024-character limit
-        chunk, length, first = [], 0, True
-        for line in lines:
-            if chunk and length + len(line) + 1 > 1024:
-                embed.add_field(name="Available Items" if first else "​", value="\n".join(chunk), inline=False)
-                chunk, length, first = [], 0, False
-            chunk.append(line)
-            length += len(line) + 1
-        if chunk:
-            embed.add_field(name="Available Items" if first else "​", value="\n".join(chunk), inline=False)
-    await interaction.response.send_message(embed=embed)
-
+# The shop itself is posted in a channel; the items and prices for /buy are set on the dashboard (Shop page).
 
 @bot.tree.command(name="buy", description="Purchase items from the shop")
 @app_commands.describe(name="Character name",
@@ -857,7 +1063,6 @@ async def help_command(interaction: discord.Interaction):
         "`/givecurrency` - Give currency to another character\n"
         f"`/exchange` - Exchange {MAIN_NAME} and {PREMIUM_NAME}"), inline=False)
     embed.add_field(name=".✦  Inventory & Shop", value=(
-        "`/shop` - View the shop\n"
         "`/buy [name] [items]` - Buy items (e.g. `Lantern:2, Bandage`)\n"
         "`/additem` / `/removeitem` - Add or remove items\n"
         "`/use [name] [items]` - Use items\n"
@@ -867,6 +1072,7 @@ async def help_command(interaction: discord.Interaction):
     embed.add_field(name=".✦  Gameplay", value=(
         "`/match [name]` - Play a match and earn rewards\n"
         "`/matchreward [name] [count]` - Rewards for escapes / eliminations\n"
+        "`/cnmatch [location] [character]` - Cryptic Notes run, alone or in a group of up to 4\n"
         f"{minigame_lines}\n"
         "`/location [name]` - Travel to a random location"), inline=False)
     embed.add_field(name=".✦  Utility", value=(
@@ -874,8 +1080,7 @@ async def help_command(interaction: discord.Interaction):
         "`/choose [options]` - Pick a random option from a comma-separated list"), inline=False)
     embed.add_field(name=".✦  Reservations", value=(
         f"`/reserve [character]` - Request a roster character (in <#{config.RESERVE_CHANNEL_ID}>)\n"
-        "`/myreservations` - Your reservations, requests and characters\n"
-        "`/reservations` - List all active reservations"), inline=False)
+        "`/myreservations` - Your reservations, requests and characters"), inline=False)
     embed.set_footer(text="💡 Tip: Use /profile to see your inventory organized by categories!")
     await interaction.response.send_message(embed=embed)
 
@@ -897,21 +1102,8 @@ async def restart_bot(interaction: discord.Interaction):
 
 # ==================== RESERVATIONS ====================
 
-@bot.tree.command(name="reservations", description="List active reservations")
-async def list_reservations(interaction: discord.Interaction):
-    rows = db.get_active_reservations()
-    embed = discord.Embed(title="📅 Active Reservations", color=COLOR_DEFAULT)
-    if not rows:
-        embed.description = "There are no active reservations."
-    for row in rows[:25]:
-        res_id, channel_id, user_id, r_title, expires_at = row[0], row[2], row[4], row[5], row[12]
-        embed.add_field(name=f"#{res_id} ┃ {r_title or 'Reservation'}",
-                        value=f"<@{user_id}> in <#{channel_id}> ┃ expires <t:{expires_at}:R>", inline=False)
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
 @bot.tree.command(name="cancelreservation", description="[ADMIN] Cancel an active reservation")
-@app_commands.describe(reservation_id="The reservation ID (see /reservations)")
+@app_commands.describe(reservation_id="The number shown as 'Reservation #…' under the confirmation")
 async def cancel_reservation(interaction: discord.Interaction, reservation_id: int):
     if not await require_admin(interaction):
         return
@@ -957,45 +1149,85 @@ def render_roster_part(part):
     return {'content': text, 'embeds': []}
 
 
-async def refresh_roster():
-    """Update the roster messages in Discord. Returns an error text, or None on success."""
-    if not config.ROSTER_CHANNEL_ID:
-        return "No roster channel configured (ROSTER_CHANNEL_ID)."
-    async with bot.roster_lock:
+async def _open_roster_post(channel_id):
+    """The forum post for a roster, reopened if archived. Returns (channel, error_text)."""
+    channel = await resolve_channel(channel_id)
+    if not channel:
+        return None, "post not found (check the post ID)."
+    if isinstance(channel, discord.ForumChannel):
+        return None, "that ID is the forum itself. Use the ID of the post inside the forum."
+    if isinstance(channel, discord.Thread) and channel.archived:
+        # Forum posts archive themselves after inactivity; archived messages can't be edited
+        try:
+            await channel.edit(archived=False)
+        except discord.HTTPException as e:
+            return None, f"couldn't reopen the archived post (give the bot 'Manage Threads'): {e}"
+    return channel, None
+
+
+async def _remove_old_single_roster():
+    """Once: delete the messages of the old single roster post (before Hunters/Survivors were split)."""
+    old_ids = db.get_old_roster_message_ids()
+    if not old_ids:
+        return
+    if config.ROSTER_CHANNEL_ID:
         channel = await resolve_channel(config.ROSTER_CHANNEL_ID)
-        if not channel:
-            return "Roster channel not found."
-        if isinstance(channel, discord.ForumChannel):
-            return "ROSTER_CHANNEL_ID is the forum itself. Use the ID of the post inside the forum."
-        if isinstance(channel, discord.Thread) and channel.archived:
-            # Forum posts archive themselves after inactivity; archived messages can't be edited
+        if channel:
+            for message_id in old_ids:
+                try:
+                    await channel.get_partial_message(int(message_id)).delete()
+                except discord.HTTPException:
+                    pass
+    db.clear_old_roster_message_ids()
+
+
+async def _refresh_role_roster(role):
+    """Update one role's roster post. Returns an error text, or None."""
+    post_id = roster_format.post_id(db, role)
+    if not post_id:
+        return "no post ID set on the Roster page."
+    channel, error = await _open_roster_post(post_id)
+    if error:
+        return error
+
+    contents = [render_roster_part(part) for part in roster_format.build_roster(db, role)]
+    stored = db.get_roster_message_ids(role)
+    no_ping = discord.AllowedMentions.none()  # show mentions without pinging anyone
+
+    if len(stored) == len(contents):
+        try:
+            for message_id, content in zip(stored, contents):
+                await channel.get_partial_message(int(message_id)).edit(**content, allowed_mentions=no_ping)
+            return None
+        except discord.NotFound:
+            pass  # a roster message was deleted (or the post ID changed): post everything again below
+
+    # Number of messages changed, the post changed, or first post: repost all so the order stays right
+    for message_id in stored:
+        try:
+            await channel.get_partial_message(int(message_id)).delete()
+        except discord.HTTPException:
+            pass
+    new_ids = []
+    for content in contents:
+        new_ids.append((await channel.send(**content, allowed_mentions=no_ping)).id)
+    db.set_roster_message_ids(role, new_ids)
+    return None
+
+
+async def refresh_roster(roles=None):
+    """Update the roster posts in Discord (default: all roles). Returns an error text, or None."""
+    errors = []
+    async with bot.roster_lock:
+        await _remove_old_single_roster()
+        for role in roles or config.ROLES:
             try:
-                await channel.edit(archived=False)
+                error = await _refresh_role_roster(role)
             except discord.HTTPException as e:
-                return f"Couldn't reopen the archived roster post (give the bot 'Manage Threads'): {e}"
-        contents = [render_roster_part(part) for part in roster_format.build_roster(db)]
-        stored = db.get_roster_message_ids()
-        no_ping = discord.AllowedMentions.none()  # show mentions without pinging anyone
-
-        if len(stored) == len(contents):
-            try:
-                for message_id, content in zip(stored, contents):
-                    await channel.get_partial_message(int(message_id)).edit(**content, allowed_mentions=no_ping)
-                return None
-            except discord.NotFound:
-                pass  # a roster message was deleted: post everything again below
-
-        # Number of messages changed (or first post): repost all so the order stays Hunters -> Survivors
-        for message_id in stored:
-            try:
-                await channel.get_partial_message(int(message_id)).delete()
-            except discord.HTTPException:
-                pass
-        new_ids = []
-        for content in contents:
-            new_ids.append((await channel.send(**content, allowed_mentions=no_ping)).id)
-        db.set_roster_message_ids(new_ids)
-        return None
+                error = str(e)
+            if error:
+                errors.append(f"{role} roster: {error}")
+    return " ".join(errors) or None
 
 
 def schedule_roster_refresh():
@@ -1685,9 +1917,11 @@ def api_member_names():
 
 @api.route('/refresh_roster', methods=['POST'])
 def api_refresh_roster():
-    """Called by the dashboard after every roster change."""
+    """Called by the dashboard after every roster change. Optional JSON {"role": "Hunter"}."""
     try:
-        error = run_on_bot(refresh_roster(), timeout=60)
+        role = (request.get_json(silent=True) or {}).get('role')
+        roles = [role] if role in config.ROLES else None
+        error = run_on_bot(refresh_roster(roles), timeout=60)
         if error:
             return jsonify({'status': 'error', 'message': error}), 400
         return jsonify({'status': 'success'}), 200

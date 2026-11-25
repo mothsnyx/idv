@@ -1,46 +1,56 @@
 {% extends "base.html" %}
 
-{% block title %}Roster{% endblock %}
+{% block title %}{{ role }} Roster{% endblock %}
 
 {% block content %}
-<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+{% set role_slug = role.lower() %}
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-3 mb-3">
     <div>
         <h1 class="mb-1"><i class="bi bi-person-lines-fill"></i> Roster</h1>
-        <p class="text-muted mb-0">Who plays which character. Changes here update the roster messages in Discord automatically.</p>
+        <p class="text-muted mb-0">Who plays which character. Every change updates the roster posts in Discord automatically.</p>
     </div>
-    <div class="d-flex gap-2 align-items-center">
+    <ul class="nav nav-pills gap-1">
+        {% for r in roles %}
+        <li class="nav-item">
+            <a class="nav-link {% if r == role %}active{% endif %}" href="{{ url_for('roster_page', role_slug=r.lower()) }}">
+                {{ r }}s <span class="badge bg-secondary ms-1">{{ all_characters|selectattr('role', 'equalto', r)|list|length }}</span>
+            </a>
+        </li>
+        {% endfor %}
+    </ul>
+</div>
+
+<div class="d-flex justify-content-between align-items-center flex-wrap gap-2 mb-3">
+    <div class="d-flex gap-2 align-items-center flex-wrap">
+        <h4 class="mb-0 me-2">{{ role }}s</h4>
         <span class="badge bg-success fs-6">{{ counts.free }} free</span>
         <span class="badge bg-warning fs-6">{{ counts.reserved }} reserved</span>
         <span class="badge bg-danger fs-6">{{ counts.taken }} taken</span>
-        <form method="POST" action="{{ url_for('roster_refresh') }}" class="mb-0">
-            <button class="btn btn-sm btn-outline-light" title="Post / update the roster messages in Discord">
-                <i class="bi bi-arrow-repeat"></i> Update in Discord
-            </button>
-        </form>
     </div>
+    <form method="POST" action="{{ url_for('roster_refresh', role_slug=role_slug) }}" class="mb-0">
+        <button class="btn btn-sm btn-outline-light" title="Post / update this roster in its forum post">
+            <i class="bi bi-arrow-repeat"></i> Update {{ role }} roster in Discord
+        </button>
+    </form>
 </div>
 
-{% if not roster_channel %}
+{% if not layout['channel_id'] %}
 <div class="alert alert-warning">
-    <i class="bi bi-exclamation-triangle"></i> No roster channel is set yet, so the roster isn't posted in Discord.
-    Add <code>ROSTER_CHANNEL_ID=...</code> to the <code>.env</code> file and restart the bot and dashboard.
+    <i class="bi bi-exclamation-triangle"></i> No forum post is set for the <strong>{{ role }}</strong> roster yet.
+    Open <strong>Roster Layout in Discord</strong> below and paste the post ID (right-click the forum post → Copy ID).
 </div>
 {% endif %}
 
 <div class="row g-3 mb-4">
     <div class="col-lg-6">
         <div class="card h-100 mb-0">
-            <div class="card-header"><i class="bi bi-plus-circle"></i> Add Character</div>
+            <div class="card-header"><i class="bi bi-plus-circle"></i> Add {{ role }}</div>
             <div class="card-body">
                 <form method="POST" action="{{ url_for('add_roster_character') }}">
+                    <input type="hidden" name="role" value="{{ role }}">
                     <div class="row g-2">
-                        <div class="col-md-5"><input type="text" name="name" class="form-control" placeholder="Name, e.g. Norton Campbell" required></div>
-                        <div class="col-md-4"><input type="text" name="title" class="form-control" placeholder="Title (optional)"></div>
-                        <div class="col-md-3">
-                            <select name="role" class="form-select" required>
-                                {% for role in roles %}<option value="{{ role }}">{{ role }}</option>{% endfor %}
-                            </select>
-                        </div>
+                        <div class="col-md-6"><input type="text" name="name" class="form-control" placeholder="Name, e.g. Norton Campbell" required></div>
+                        <div class="col-md-6"><input type="text" name="title" class="form-control" placeholder="Title (optional)"></div>
                     </div>
                     <button type="submit" class="btn btn-primary mt-2"><i class="bi bi-plus"></i> Add</button>
                 </form>
@@ -52,12 +62,12 @@
             <div class="card-header"><i class="bi bi-person-x"></i> Player Left or Dropped Everything</div>
             <div class="card-body">
                 <form method="POST" action="{{ url_for('roster_release_player') }}"
-                      onsubmit="return confirm('Free ALL characters of this player and cancel their reservations?');">
+                      onsubmit="return confirm('Free ALL characters of this player (Hunters and Survivors) and cancel their reservations?');">
                     <div class="input-group">
                         <input type="text" name="player_id" class="form-control" placeholder="Their Discord user ID" required>
                         <button class="btn btn-danger" type="submit">Release all</button>
                     </div>
-                    <small class="text-muted">Frees every character of this player and cancels their reservations and requests.</small>
+                    <small class="text-muted">Frees every character of this player on both rosters and cancels their reservations and requests.</small>
                 </form>
             </div>
         </div>
@@ -67,25 +77,20 @@
 <div class="card mb-4">
     <div class="card-header d-flex justify-content-between align-items-center" role="button"
          data-bs-toggle="collapse" data-bs-target="#importBox">
-        <span><i class="bi bi-list-columns"></i> Import Many Characters at Once</span>
+        <span><i class="bi bi-list-columns"></i> Import Many {{ role }}s at Once</span>
         <i class="bi bi-chevron-down"></i>
     </div>
     <div class="collapse" id="importBox">
         <div class="card-body">
             <form method="POST" action="{{ url_for('import_roster') }}">
+                <input type="hidden" name="role" value="{{ role }}">
                 <p class="text-muted small mb-2">
-                    One character per line as <code>Name | Title</code> or just <code>Name</code>.
-                    You can also paste lines straight from an old roster message, since the <code>﹕﹒</code> and everything after <code>―</code> are ignored.
+                    One character per line as <code>Name | Title</code> or just <code>Name</code>. They're all added as <strong>{{ role }}s</strong>.
+                    Lines copied from an old roster message work too (the <code>﹕﹒</code> and everything after <code>―</code> are ignored).
                     Characters that already exist are skipped.
                 </p>
-                <textarea name="lines" class="form-control mb-2" rows="8" placeholder="Norton Campbell | The Prospector&#10;Emma Woods | The Gardener" required></textarea>
-                <div class="d-flex gap-2">
-                    <select name="role" class="form-select" style="max-width:200px;" required>
-                        <option value="">Add them as...</option>
-                        {% for role in roles %}<option value="{{ role }}">{{ role }}s</option>{% endfor %}
-                    </select>
-                    <button type="submit" class="btn btn-primary"><i class="bi bi-upload"></i> Import</button>
-                </div>
+                <textarea name="lines" class="form-control mb-2" rows="8" placeholder="Norton Campbell | Prospector&#10;Emma Woods | Gardener" required></textarea>
+                <button type="submit" class="btn btn-primary"><i class="bi bi-upload"></i> Import as {{ role }}s</button>
             </form>
         </div>
     </div>
@@ -94,14 +99,20 @@
 <div class="card mb-4">
     <div class="card-header d-flex justify-content-between align-items-center" role="button"
          data-bs-toggle="collapse" data-bs-target="#layoutBox">
-        <span><i class="bi bi-palette"></i> Roster Layout in Discord</span>
+        <span><i class="bi bi-palette"></i> {{ role }} Roster Layout in Discord</span>
         <i class="bi bi-chevron-down"></i>
     </div>
-    <div class="collapse" id="layoutBox">
+    <div class="collapse {% if not layout['channel_id'] %}show{% endif %}" id="layoutBox">
         <div class="card-body">
             <div class="row g-4">
                 <div class="col-lg-6">
-                    <form method="POST" action="{{ url_for('roster_layout') }}">
+                    <form method="POST" action="{{ url_for('roster_layout', role_slug=role_slug) }}" id="layoutForm">
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Forum post ID for the {{ role }} roster</label>
+                            <input type="text" name="channel_id" class="form-control" value="{{ layout['channel_id'] }}" placeholder="e.g. 1574000000000000000" inputmode="numeric">
+                            <small class="text-muted">Right-click the forum post → <strong>Copy ID</strong> (Developer Mode on). The post itself, not the forum.</small>
+                        </div>
+
                         <label class="form-label fw-bold">Show the roster as</label>
                         <div class="mb-3">
                             <div class="form-check form-check-inline">
@@ -114,6 +125,20 @@
                             </div>
                         </div>
 
+                        <div class="row g-2 mb-3">
+                            <div class="col-9">
+                                <label class="form-label fw-bold">Title</label>
+                                <input type="text" name="title" class="form-control" value="{{ layout['title'] }}" maxlength="256">
+                            </div>
+                            <div class="col-3">
+                                <label class="form-label fw-bold">Color</label>
+                                <input type="color" name="color" class="form-control form-control-color w-100" value="{{ layout['color'] or '#000000' }}">
+                            </div>
+                        </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Intro text (above the list)</label>
+                            <textarea name="intro" class="form-control" rows="2">{{ layout['intro'] }}</textarea>
+                        </div>
                         <div class="mb-3">
                             <label class="form-label fw-bold">Line per character</label>
                             <input type="text" name="line_format" class="form-control" value="{{ layout['line_format'] }}" required>
@@ -128,7 +153,7 @@
                                 <input type="text" name="reserved_suffix" class="form-control" value="{{ layout['reserved_suffix'] }}">
                             </div>
                             <div class="col-md-6">
-                                <label class="form-label fw-bold">Text when a list is empty</label>
+                                <label class="form-label fw-bold">Text when the list is empty</label>
                                 <input type="text" name="empty_text" class="form-control" value="{{ layout['empty_text'] }}">
                             </div>
                         </div>
@@ -142,59 +167,31 @@
                                 <label class="form-check-label" for="blankLines">Empty line between characters</label>
                             </div>
                         </div>
-
-                        <ul class="nav nav-tabs mb-3" role="tablist">
-                            {% for role in roles %}
-                            <li class="nav-item"><button class="nav-link {% if loop.first %}active{% endif %}" data-bs-toggle="tab" data-bs-target="#layout-{{ role }}" type="button">{{ role }}s</button></li>
-                            {% endfor %}
-                        </ul>
-                        <div class="tab-content">
-                            {% for role in roles %}
-                            <div class="tab-pane fade {% if loop.first %}show active{% endif %}" id="layout-{{ role }}">
-                                <div class="row g-2">
-                                    <div class="col-9">
-                                        <label class="form-label">Title</label>
-                                        <input type="text" name="{{ role }}_title" class="form-control" value="{{ layout[role ~ '_title'] }}" maxlength="256">
-                                    </div>
-                                    <div class="col-3">
-                                        <label class="form-label">Color</label>
-                                        <input type="color" name="{{ role }}_color" class="form-control form-control-color w-100" value="{{ layout[role ~ '_color'] or '#000000' }}">
-                                    </div>
-                                    <div class="col-12">
-                                        <label class="form-label">Intro text (above the list)</label>
-                                        <textarea name="{{ role }}_intro" class="form-control" rows="2">{{ layout[role ~ '_intro'] }}</textarea>
-                                    </div>
-                                    <div class="col-12">
-                                        <label class="form-label">Footer (below the list)</label>
-                                        <input type="text" name="{{ role }}_footer" class="form-control" value="{{ layout[role ~ '_footer'] }}" maxlength="2048">
-                                    </div>
-                                    <div class="col-md-6">
-                                        <label class="form-label">Thumbnail URL <small class="text-muted">(embed only)</small></label>
-                                        <input type="url" name="{{ role }}_thumbnail" class="form-control" value="{{ layout[role ~ '_thumbnail'] }}">
-                                    </div>
-                                    <div class="col-md-6">
-                                        <label class="form-label">Image URL <small class="text-muted">(embed only)</small></label>
-                                        <input type="url" name="{{ role }}_image" class="form-control" value="{{ layout[role ~ '_image'] }}">
-                                    </div>
-                                </div>
+                        <div class="mb-3">
+                            <label class="form-label fw-bold">Footer (below the list)</label>
+                            <input type="text" name="footer" class="form-control" value="{{ layout['footer'] }}" maxlength="2048">
+                        </div>
+                        <div class="row g-2">
+                            <div class="col-md-6">
+                                <label class="form-label">Thumbnail URL <small class="text-muted">(embed only)</small></label>
+                                <input type="url" name="thumbnail" class="form-control" value="{{ layout['thumbnail'] }}">
                             </div>
-                            {% endfor %}
+                            <div class="col-md-6">
+                                <label class="form-label">Image URL <small class="text-muted">(embed only)</small></label>
+                                <input type="url" name="image" class="form-control" value="{{ layout['image'] }}">
+                            </div>
                         </div>
                         <button type="submit" class="btn btn-primary mt-3"><i class="bi bi-check-circle"></i> Save &amp; Update in Discord</button>
                     </form>
                 </div>
 
                 <div class="col-lg-6">
-                    <label class="form-label fw-bold">Preview <small class="text-muted fw-normal">(current saved layout · Discord formatting like **bold** is shown as typed)</small></label>
-                    {% for part in preview %}
-                    <div class="roster-preview mb-3" style="border-left-color: {{ part.color or '#000000' }};">
-                        {% if part.thumbnail %}<img src="{{ part.thumbnail }}" class="roster-thumb" alt="">{% endif %}
-                        {% if part.title %}<div class="fw-bold mb-1">{{ part.title }}</div>{% endif %}
-                        <div class="roster-text">{{ part.text }}</div>
-                        {% if part.image %}<img src="{{ part.image }}" class="img-fluid mt-2 rounded" alt="">{% endif %}
-                        {% if part.footer %}<div class="small text-muted mt-2">{{ part.footer }}</div>{% endif %}
+                    <div class="position-sticky" style="top: 80px;">
+                        <label class="form-label fw-bold"><i class="bi bi-eye"></i> Live Preview
+                            <small class="text-muted fw-normal" id="previewInfo"></small></label>
+                        <div class="dc-canvas" style="max-height: 75vh; overflow-y: auto;"><div id="rosterPreview"></div></div>
+                        <small class="text-muted d-block mt-2">Players show as "@Name" here; in Discord they're real mentions (without pinging).</small>
                     </div>
-                    {% endfor %}
                 </div>
             </div>
         </div>
@@ -203,12 +200,8 @@
 
 <div class="card">
     <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
-        <span><i class="bi bi-list-ul"></i> All Characters</span>
+        <span><i class="bi bi-list-ul"></i> All {{ role }}s</span>
         <div class="d-flex gap-2 flex-wrap">
-            <select id="filterRole" class="form-select form-select-sm" style="width:auto;">
-                <option value="">All roles</option>
-                {% for role in roles %}<option value="{{ role }}">{{ role }}s</option>{% endfor %}
-            </select>
             <select id="filterStatus" class="form-select form-select-sm" style="width:auto;">
                 <option value="">All statuses</option>
                 <option value="free">Free</option>
@@ -225,7 +218,6 @@
                     <tr>
                         <th>Name</th>
                         <th>Title</th>
-                        <th>Role</th>
                         <th>Status</th>
                         <th>Player</th>
                         <th class="text-end">Actions</th>
@@ -233,13 +225,12 @@
                 </thead>
                 <tbody id="rosterBody">
                     {% for c in characters %}
-                    <tr data-role="{{ c.role }}" data-status="{{ c.status }}">
+                    <tr data-status="{{ c.status }}">
                         <td>
                             <strong>{{ c.name }}</strong>
                             {% if c.linked_id %}<br><small class="text-muted"><i class="bi bi-link-45deg"></i> linked with {{ names.get(c.linked_id, '?') }}</small>{% endif %}
                         </td>
                         <td>{{ c.title or '' }}</td>
-                        <td>{{ c.role }}</td>
                         <td>
                             {% if c.status == 'free' %}<span class="badge bg-success">Free</span>
                             {% elif c.status == 'reserved' %}<span class="badge bg-warning">Reserved</span>
@@ -271,7 +262,7 @@
                         </td>
                     </tr>
                     {% else %}
-                    <tr><td colspan="6" class="text-muted p-3">No characters yet. Add them above, or import a whole list at once.</td></tr>
+                    <tr><td colspan="5" class="text-muted p-3">No {{ role }}s yet. Add them above, or import a whole list at once.</td></tr>
                     {% endfor %}
                 </tbody>
             </table>
@@ -294,14 +285,15 @@
                     <div class="mb-3">
                         <label class="form-label">Role</label>
                         <select name="role" class="form-select">
-                            {% for role in roles %}<option value="{{ role }}" {% if c.role == role %}selected{% endif %}>{{ role }}</option>{% endfor %}
+                            {% for r in roles %}<option value="{{ r }}" {% if c.role == r %}selected{% endif %}>{{ r }}</option>{% endfor %}
                         </select>
+                        <small class="text-muted">Changing the role moves the character to the other roster.</small>
                     </div>
                     <div class="mb-3">
                         <label class="form-label"><i class="bi bi-link-45deg"></i> Linked identity</label>
                         <select name="linked_id" class="form-select">
                             <option value="">— not linked —</option>
-                            {% for other in characters if other.id != c.id %}
+                            {% for other in all_characters if other.id != c.id %}
                             <option value="{{ other.id }}" {% if c.linked_id == other.id %}selected{% endif %}>{{ other.display }} ({{ other.role }})</option>
                             {% endfor %}
                         </select>
@@ -338,7 +330,7 @@
                         <input type="text" name="player_id" class="form-control" {% if c.status == 'free' %}required{% endif %} placeholder="e.g. 790588177240555561">
                     </div>
                     <div class="mb-3">
-                        <label class="form-label">Name (only shown here in the dashboard)</label>
+                        <label class="form-label">Name <small class="text-muted">(optional, filled in automatically from Discord)</small></label>
                         <input type="text" name="player_name" class="form-control" placeholder="e.g. Lark">
                     </div>
                 </div>
@@ -355,24 +347,77 @@
 {% endblock %}
 
 {% block scripts %}
-<style>
-.roster-preview { background:#2b2d31; border-left:4px solid #000; border-radius:4px; padding:10px 12px; overflow:hidden; }
-.roster-text { white-space: pre-wrap; font-size: 0.9rem; max-height: 420px; overflow-y: auto; }
-.roster-thumb { float:right; max-width:64px; max-height:64px; margin-left:8px; border-radius:4px; }
-</style>
+{% include "_discord_preview.html" %}
 <script>
+// ---- Table filters ----
 function filterRoster() {
-    const role = document.getElementById('filterRole').value;
     const status = document.getElementById('filterStatus').value;
     const q = document.getElementById('rosterSearch').value.toLowerCase();
-    document.querySelectorAll('#rosterBody tr[data-role]').forEach(row => {
-        const show = (!role || row.dataset.role === role)
-                  && (!status || row.dataset.status === status)
-                  && (!q || row.innerText.toLowerCase().includes(q));
+    document.querySelectorAll('#rosterBody tr[data-status]').forEach(row => {
+        const show = (!status || row.dataset.status === status) && (!q || row.innerText.toLowerCase().includes(q));
         row.style.display = show ? '' : 'none';
     });
 }
-['filterRole', 'filterStatus'].forEach(id => document.getElementById(id).addEventListener('change', filterRoster));
+document.getElementById('filterStatus').addEventListener('change', filterRoster);
 document.getElementById('rosterSearch').addEventListener('input', filterRoster);
+
+// ---- Live roster preview (same rules as the bot uses in roster_format.py) ----
+const ROSTER = {
+    characters: {{ preview_characters|tojson }},
+    indent: {{ indent|tojson }},
+    limits: {{ limits|tojson }},
+};
+
+function buildRosterParts(f) {
+    const separator = f.blank_lines ? '\n\n' : '\n';
+    let lines = ROSTER.characters.map((c, i) => {
+        let line = f.line_format.split('{character}').join(c.display).split('{name}').join(c.name)
+                                .split('{title}').join(c.title).split('{player}').join(c.player).trimEnd();
+        if (c.status === 'reserved') line += f.reserved_suffix;
+        if (f.alternate_indent && i % 2) line = ROSTER.indent + line;
+        return line;
+    });
+    if (!lines.length) lines = [f.empty_text];
+
+    const title = f.title.trim(), intro = f.intro.trim();
+    const header = f.style === 'embed' ? intro : [title ? `**${title}**` : '', intro].filter(Boolean).join('\n');
+    const limit = ROSTER.limits[f.style];
+    const chunks = [];
+    let chunk = header;
+    for (const line of lines) {
+        const piece = chunk ? separator + line : line;
+        if (chunk && chunk !== header && chunk.length + piece.length > limit) { chunks.push(chunk); chunk = line; }
+        else chunk += piece;
+    }
+    chunks.push(chunk);
+    return chunks.map((text, n) => ({
+        text, first: n === 0, last: n === chunks.length - 1,
+        title: n === 0 ? title : '', footer: n === chunks.length - 1 ? f.footer.trim() : '',
+        thumbnail: n === 0 ? f.thumbnail.trim() : '', image: n === chunks.length - 1 ? f.image.trim() : '',
+    }));
+}
+
+const layoutForm = document.getElementById('layoutForm');
+function renderRosterPreview() {
+    const get = name => layoutForm.querySelector(`[name="${name}"]`);
+    const f = {
+        style: layoutForm.querySelector('[name="style"]:checked')?.value || 'embed',
+        line_format: get('line_format').value, reserved_suffix: get('reserved_suffix').value,
+        empty_text: get('empty_text').value, alternate_indent: get('alternate_indent').checked,
+        blank_lines: get('blank_lines').checked, title: get('title').value, color: get('color').value,
+        intro: get('intro').value, footer: get('footer').value,
+        thumbnail: get('thumbnail').value, image: get('image').value,
+    };
+    const parts = buildRosterParts(f);
+    document.getElementById('rosterPreview').innerHTML = parts.map(p => f.style === 'embed'
+        ? DiscordPreview.embedHtml({ title: p.title, description: p.text, color: f.color, footer: p.footer,
+                                     thumbnail: p.thumbnail, image: p.image })
+        : DiscordPreview.messageHtml(p.text + (p.footer ? '\n\n' + p.footer : ''))).join('');
+    document.getElementById('previewInfo').textContent =
+        `· ${parts.length} ${parts.length === 1 ? 'message' : 'messages'} in Discord`;
+}
+layoutForm.addEventListener('input', renderRosterPreview);
+layoutForm.addEventListener('change', renderRosterPreview);
+renderRosterPreview();
 </script>
 {% endblock %}

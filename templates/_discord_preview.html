@@ -1,0 +1,148 @@
+{# Discord-style preview for embeds and messages. Include once per page:  {% include "_discord_preview.html" %} #}
+<style>
+    .dc-canvas { background: #313338; border-radius: 10px; padding: 14px; }
+    .dc-embed {
+        display: flex; max-width: 520px; background: #2b2d31; border-radius: 4px;
+        border-left: 4px solid #1e1f22; padding: 8px 16px 16px 12px; color: #dbdee1;
+        font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+        font-size: 0.92rem; line-height: 1.375rem; overflow-wrap: anywhere;
+    }
+    .dc-embed + .dc-embed, .dc-message + .dc-message, .dc-message + .dc-embed, .dc-embed + .dc-message { margin-top: 10px; }
+    .dc-embed-body { flex: 1; min-width: 0; }
+    .dc-embed-title { font-weight: 600; color: #f2f3f5; margin-top: 8px; font-size: 1rem; }
+    .dc-embed-desc { margin-top: 8px; white-space: pre-wrap; }
+    .dc-embed-thumb { width: 80px; height: 80px; border-radius: 4px; margin: 8px 0 0 16px; object-fit: contain; flex: none; }
+    .dc-embed-image { max-width: 100%; max-height: 300px; border-radius: 4px; margin-top: 16px; display: block; }
+    .dc-embed-footer { margin-top: 8px; font-size: 0.75rem; color: #b5bac1; }
+    .dc-message { color: #dbdee1; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 0.95rem; line-height: 1.375rem;
+                  font-family: 'gg sans', 'Noto Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif; }
+    .dc-emoji { width: 1.375em; height: 1.375em; vertical-align: -0.3em; object-fit: contain; }
+    .dc-mention { background: rgba(88, 101, 242, 0.3); color: #c9cdfb; border-radius: 3px; padding: 0 2px; font-weight: 500; }
+    .dc-code { background: #1e1f22; padding: 0 0.2em; border-radius: 3px; font-family: Consolas, 'Courier New', monospace; font-size: 85%; }
+    .dc-pre { background: #1e1f22; border-radius: 4px; padding: 0.5em; font-family: Consolas, 'Courier New', monospace; font-size: 85%; margin: 4px 0; }
+    .dc-quote { border-left: 4px solid #4e5058; padding-left: 10px; }
+    .dc-spoiler { background: #1e1f22; color: transparent; border-radius: 3px; cursor: pointer; }
+    .dc-spoiler.revealed { color: inherit; background: rgba(255, 255, 255, 0.1); }
+    .dc-h1 { font-size: 1.5rem; font-weight: 700; line-height: 1.3; margin: 6px 0 2px; color: #f2f3f5; }
+    .dc-h2 { font-size: 1.25rem; font-weight: 700; line-height: 1.3; margin: 6px 0 2px; color: #f2f3f5; }
+    .dc-h3 { font-size: 1rem; font-weight: 700; margin: 6px 0 2px; color: #f2f3f5; }
+    .dc-sub { font-size: 0.8rem; color: #949ba4; }
+    .dc-link { color: #00a8fc; text-decoration: none; }
+    .dc-link:hover { text-decoration: underline; }
+    .dc-empty { color: #80848e; font-style: italic; }
+</style>
+<script>
+/* Renders Discord-like previews. Used by the Embeds and Roster pages. */
+const DiscordPreview = (() => {
+    const esc = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    const safeUrl = u => /^(https?:|data:image\/)/i.test(u || '') ? esc(u) : '';
+    const SAMPLE_VARS = { '{user}': 'NewMember', '{user_tag}': 'NewMember', '{user_id}': '123456789012345678',
+                          '{server}': 'Your Server', '{member_count}': '128' };
+
+    function formatTimestamp(seconds, style) {
+        const d = new Date(seconds * 1000);
+        if (style === 'R') {
+            const diff = Math.round((d - Date.now()) / 1000), abs = Math.abs(diff);
+            const units = [['year', 31536000], ['month', 2592000], ['day', 86400], ['hour', 3600], ['minute', 60], ['second', 1]];
+            const [unit, size] = units.find(([, s]) => abs >= s) || ['second', 1];
+            return new Intl.RelativeTimeFormat('en', { numeric: 'auto' }).format(Math.round(diff / size), unit);
+        }
+        const formats = { t: { timeStyle: 'short' }, T: { timeStyle: 'medium' }, d: { dateStyle: 'short' },
+                          D: { dateStyle: 'long' }, F: { dateStyle: 'full', timeStyle: 'short' } };
+        return d.toLocaleString('en-GB', formats[style] || { dateStyle: 'long', timeStyle: 'short' });
+    }
+
+    /* Discord markdown -> HTML. opts.sampleVars: show welcome variables with example values.
+       opts.users: {id: name} for mentions. */
+    function markdown(text, opts = {}) {
+        if (!text) return '';
+        const stash = [];
+        const keep = html => `\u0000${stash.push(html) - 1}\u0000`;
+        text = text.replace(/```(?:[a-z0-9]*\n)?([\s\S]*?)```/gi, (_, c) => keep(`<div class="dc-pre">${esc(c)}</div>`));
+        text = text.replace(/`([^`\n]+)`/g, (_, c) => keep(`<code class="dc-code">${esc(c)}</code>`));
+        text = esc(text);
+
+        text = text.replace(/&lt;(a?):(\w+):(\d+)&gt;/g, (_, animated, name, id) =>
+            `<img class="dc-emoji" alt=":${name}:" title=":${name}:" src="https://cdn.discordapp.com/emojis/${id}.${animated ? 'gif' : 'webp'}?size=48">`);
+        text = text.replace(/&lt;@!?(\d+)&gt;/g, (_, id) => `<span class="dc-mention">@${esc((opts.users || {})[id] || 'member')}</span>`);
+        text = text.replace(/&lt;@&amp;(\d+)&gt;/g, '<span class="dc-mention">@role</span>');
+        text = text.replace(/&lt;#(\d+)&gt;/g, '<span class="dc-mention">#channel</span>');
+        text = text.replace(/&lt;t:(\d+)(?::([tTdDfFR]))?&gt;/g, (_, ts, style) => `<span class="dc-code">${formatTimestamp(+ts, style)}</span>`);
+        if (opts.sampleVars) {
+            text = text.replace(/\{mention\}/g, '<span class="dc-mention">@NewMember</span>');
+            for (const [key, value] of Object.entries(SAMPLE_VARS)) text = text.split(key).join(value);
+        }
+
+        text = text.split('\n').map(line => {
+            let m;
+            if ((m = line.match(/^### (.+)/))) return `<div class="dc-h3">${m[1]}</div>`;
+            if ((m = line.match(/^## (.+)/))) return `<div class="dc-h2">${m[1]}</div>`;
+            if ((m = line.match(/^# (.+)/))) return `<div class="dc-h1">${m[1]}</div>`;
+            if ((m = line.match(/^-# (.+)/))) return `<div class="dc-sub">${m[1]}</div>`;
+            if ((m = line.match(/^&gt; ?(.*)/))) return `<div class="dc-quote">${m[1] || ' '}</div>`;
+            if ((m = line.match(/^(\s*)[-*] (.+)/))) return `<div>${m[1]}• ${m[2]}</div>`;
+            return line;
+        }).join('\n');
+
+        text = text
+            .replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>')
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            .replace(/__(.+?)__/g, '<u>$1</u>')
+            .replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+            .replace(/(^|[\s(>])_([^_\n]+)_(?=$|[\s).,!?<])/gm, '$1<em>$2</em>')
+            .replace(/~~(.+?)~~/g, '<del>$1</del>')
+            .replace(/\|\|(.+?)\|\|/g, '<span class="dc-spoiler" onclick="this.classList.toggle(\'revealed\')">$1</span>')
+            .replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a class="dc-link" href="$2" target="_blank" rel="noopener">$1</a>')
+            .replace(/<\/div>\n/g, '</div>');
+        return text.replace(/\u0000(\d+)\u0000/g, (_, i) => stash[i]);
+    }
+
+    function embedHtml(d, opts = {}) {
+        const color = /^#?[0-9a-f]{6}$/i.test(d.color || '') ? '#' + d.color.replace('#', '') : '#1e1f22';
+        const footer = opts.sampleVars ? markdown(d.footer || '', { sampleVars: true }).replace(/<[^>]+>/g, '') : esc(d.footer || '');
+        const parts = [];
+        if (d.title) parts.push(`<div class="dc-embed-title">${markdown(d.title, opts)}</div>`);
+        if (d.description) parts.push(`<div class="dc-embed-desc">${markdown(d.description, opts)}</div>`);
+        if (safeUrl(d.image)) parts.push(`<img class="dc-embed-image" src="${safeUrl(d.image)}" alt="" onerror="this.style.display='none'">`);
+        if (d.footer) parts.push(`<div class="dc-embed-footer">${footer}</div>`);
+        const thumb = safeUrl(d.thumbnail) ? `<img class="dc-embed-thumb" src="${safeUrl(d.thumbnail)}" alt="" onerror="this.style.display='none'">` : '';
+        const body = parts.length ? parts.join('') : (thumb ? '' : '<div class="dc-empty" style="margin-top:8px">Empty embed: add a title or description</div>');
+        return `<div class="dc-embed" style="border-left-color:${color}"><div class="dc-embed-body">${body}</div>${thumb}</div>`;
+    }
+
+    function messageHtml(text, opts = {}) {
+        return `<div class="dc-message">${markdown(text, opts) || '<span class="dc-empty">Empty message</span>'}</div>`;
+    }
+
+    /* Live preview for a form with fields named title, description, color, footer_text,
+       image_url, thumbnail_url (and optional image_file / thumbnail_file uploads). */
+    function bindEmbedForm(form, container, opts = {}) {
+        const field = name => form.querySelector(`[name="${name}"]`);
+        const uploads = { image: null, thumbnail: null };
+        const render = () => {
+            container.innerHTML = embedHtml({
+                title: field('title')?.value, description: field('description')?.value,
+                color: field('color')?.value, footer: field('footer_text')?.value,
+                image: uploads.image || field('image_url')?.value,
+                thumbnail: uploads.thumbnail || field('thumbnail_url')?.value,
+            }, opts);
+        };
+        for (const [kind, fileName] of [['image', 'image_file'], ['thumbnail', 'thumbnail_file']]) {
+            const input = field(fileName);
+            if (!input) continue;
+            input.addEventListener('change', () => {
+                const file = input.files && input.files[0];
+                if (!file) { uploads[kind] = null; render(); return; }
+                const reader = new FileReader();
+                reader.onload = e => { uploads[kind] = e.target.result; render(); };
+                reader.readAsDataURL(file);
+            });
+        }
+        form.addEventListener('input', render);
+        form.addEventListener('change', render);
+        render();
+    }
+
+    return { markdown, embedHtml, messageHtml, bindEmbedForm };
+})();
+</script>

@@ -57,10 +57,11 @@ services. The slash command, database table and dashboard page are created autom
 |------|----------|
 | Profiles | `/create`, `/profile`, `/list`, `/editname`, `/editrole`, `/deleteprofile`, `/claim` |
 | Currency | `/givecurrency`, `/exchange` (admins: `/addcurrency`, `/removecurrency`) |
-| Items | `/shop`, `/buy`, `/additem`, `/removeitem`, `/use`, `/giveitem`, `/value`, `/sell` |
+| Items | `/buy`, `/additem`, `/removeitem`, `/use`, `/giveitem`, `/value`, `/sell` |
 | Gameplay | `/match`, `/matchreward`, `/scavenging`, `/foraging`, `/location` |
 | Utility | `/roll`, `/choose`, `/help` |
-| Reservations | `/reserve`, `/myreservations`, `/reservations` |
+| Reservations | `/reserve`, `/myreservations` |
+| Cryptic Notes | `/cnmatch` (solo, or a group of up to 4 where every player accepts for their own character) |
 | Staff | `/approvecharacter`, `/releasecharacter` (and the buttons on requests) |
 | Admin | `/addcurrency`, `/removecurrency`, `/assignowner`, `/cancelreservation`, `/restart`, `/testwelcome` |
 

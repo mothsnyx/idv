@@ -104,7 +104,9 @@ def _id_list(value):
 
 RESERVE_CHANNEL_ID = int(os.getenv("RESERVE_CHANNEL_ID", "1574169279601967184"))  # members use /reserve here
 STAFF_CHANNEL_ID = int(os.getenv("STAFF_CHANNEL_ID", "1574176734520156241"))      # requests & leave alerts
-ROSTER_CHANNEL_ID = int(os.getenv("ROSTER_CHANNEL_ID", "0"))  # where the bot keeps the roster messages (0 = off)
+# Old single roster post (before Hunters and Survivors got their own posts). Only used to clean
+# up the old roster messages once; the per-role post IDs are set on the dashboard Roster page.
+ROSTER_CHANNEL_ID = int(os.getenv("ROSTER_CHANNEL_ID", "0") or 0)
 
 # Besides ADMIN_IDS, members with one of these roles can approve/deny requests. env: STAFF_ROLE_IDS=id,id
 STAFF_ROLE_IDS = _id_list(os.getenv("STAFF_ROLE_IDS"))
@@ -126,6 +128,8 @@ ROSTER_DEFAULTS = {
 }
 for _role in ROLES:
     ROSTER_DEFAULTS.update({
+        # Forum post of this role's roster; set on the dashboard (or env: ROSTER_HUNTER_CHANNEL_ID, ...)
+        f"{_role}_channel_id": os.getenv(f"ROSTER_{_role.upper()}_CHANNEL_ID", ""),
         f"{_role}_title": f"{_role}s",
         f"{_role}_color": "#000000",
         f"{_role}_intro": "",
@@ -133,6 +137,70 @@ for _role in ROLES:
         f"{_role}_thumbnail": "",
         f"{_role}_image": "",
     })
+
+# ==================== CRYPTIC NOTES (/cnmatch) ====================
+# Maps are created on first start; their anomalies, classics (each with its own sell value)
+# and texts are managed on the dashboard (Match Messages -> Cryptic Notes).
+
+# Chance (%) of dying from other causes (quota not met, a fall, ...), per map
+CN_MAPS = {
+    "A Bringer of Doom": 8,
+    "Phosphorescence Disease": 12,   # slightly more difficult
+}
+
+# Classic tiers, from cheapest/most common to most expensive/rarest.
+# weight = how often the tier is picked. value = only a suggestion, pre-filled when an
+# imported line has no price; every classic's real sell value is set on the dashboard.
+CN_TIERS = {
+    "B":  {"label": "B-Tier Classic",    "weight": 55, "value": 150,  "emoji": "⚪"},
+    "A":  {"label": "A-Tier Classic",    "weight": 28, "value": 400,  "emoji": "🔵"},
+    "S":  {"label": "S-Tier Classic",    "weight": 13, "value": 1000, "emoji": "🟣"},
+    "EX": {"label": "Exquisite Classic", "weight": 4,  "value": 3000, "emoji": "🟡"},
+}
+
+# Chance (%) that the anomaly you run into kills you, by its danger level (1 = weak, 5 = deadliest)
+CN_DANGER_KILL_CHANCE = {1: 3, 2: 6, 3: 10, 4: 15, 5: 22}
+
+# How many classics a surviving character finds (1-9): weights, 5-6 most common
+CN_ITEM_COUNT_WEIGHTS = {1: 2, 2: 4, 3: 7, 4: 12, 5: 20, 6: 20, 7: 15, 8: 11, 9: 9}
+
+# Clues for surviving, by result (normal /match gives up to 12,000)
+CN_REWARDS = {"barely": 1000, "normal": 2000, "great": 3000}
+
+# Exhaustion: from the 3rd run within an hour the player is warned;
+# from the 4th run on, the chance of dying from other causes goes up by this many %
+CN_EXHAUSTION_RUNS = 3
+CN_EXHAUSTION_WINDOW = 3600
+CN_EXHAUSTED_EXTRA_DEATH = 20
+
+# Groups: up to this many characters; invites expire after this many seconds
+CN_GROUP_MAX = 4
+CN_INVITE_TIMEOUT = 600
+
+# Result types (texts for each are written on the dashboard)
+CN_OUTCOMES = {
+    "barely": "Barely made quota (1-3 items)",
+    "normal": "Made quota",
+    "great": "Big haul (7+ items or 2+ S-Tier/Exquisite)",
+    "death_anomaly": "Killed by the anomaly",
+    "death_other": "Died another way (quota not met, fall, ...)",
+}
+CN_RESPAWN_TEXT = "No items were kept. Wakes up in the Manor's infirmary."
+
+# Cryptic Notes emojis: replace any value with a custom emoji, e.g. "<:skull:123456789012345678>"
+# (the tier emojis are in CN_TIERS above)
+CN_EMOJI = "📜"                      # title of every /cnmatch message
+CN_ICONS = {
+    "survived": "✅",               # group result: character made it out
+    "died": "☠️",                    # character died
+    "exhausted": "⚠️",               # exhaustion warning
+    "danger_full": "▰",             # danger bar: filled part ...
+    "danger_empty": "▱",            # ... and empty part (5 symbols in total)
+    "leader": "👑",                 # group invite: leader
+    "accepted": "✅",               # group invite: accepted
+    "declined": "❌",               # group invite: declined
+    "pending": "⏳",                # group invite: no answer yet
+}
 
 # ==================== MINIGAMES ====================
 # Each entry becomes a slash command, a dashboard page and a loot table.

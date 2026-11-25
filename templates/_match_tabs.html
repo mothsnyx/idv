@@ -1,0 +1,13 @@
+{# Tabs on top of the Match Messages and Cryptic Notes pages #}
+<ul class="nav nav-pills gap-1 mb-4">
+    <li class="nav-item">
+        <a class="nav-link {% if request.endpoint == 'matches' %}active{% endif %}" href="{{ url_for('matches') }}">
+            <i class="bi bi-trophy-fill"></i> Regular Matches
+        </a>
+    </li>
+    <li class="nav-item">
+        <a class="nav-link {% if request.endpoint == 'cryptic_notes' %}active{% endif %}" href="{{ url_for('cryptic_notes') }}">
+            <i class="bi bi-journal-text"></i> Cryptic Notes
+        </a>
+    </li>
+</ul>

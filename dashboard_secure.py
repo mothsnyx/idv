@@ -7,7 +7,11 @@ import subprocess
 import threading
 from functools import wraps
 
+import re
+from urllib.parse import urlparse
+
 import requests
+from markupsafe import Markup, escape
 from flask import Flask, render_template, request, redirect, url_for, flash, session, abort
 from werkzeug.security import generate_password_hash, check_password_hash
 
@@ -50,6 +54,16 @@ def login_required(f):
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     return decorated_function
+
+
+@app.template_filter('emoji')
+def emoji_filter(text):
+    """Show custom Discord emojis ("<:name:id>") from config.py as images on the dashboard."""
+    def to_img(match):
+        animated, name, emoji_id = match.groups()
+        return (f'<img src="https://cdn.discordapp.com/emojis/{emoji_id}.{"gif" if animated else "webp"}?size=32" '
+                f'alt=":{name}:" title=":{name}:" style="height:1.25em;vertical-align:-0.25em;">')
+    return Markup(re.sub(r'&lt;(a?):(\w+):(\d+)&gt;', to_img, str(escape(text or ''))))
 
 
 @app.context_processor
@@ -347,6 +361,100 @@ def delete_match_message(message_id):
     return redirect(url_for('matches'))
 
 
+# ==================== CRYPTIC NOTES ====================
+
+def _cn_back():
+    return redirect(url_for('cryptic_notes') + (request.form.get('anchor') or ''))
+
+
+@app.route('/matches/cryptic-notes')
+@login_required
+def cryptic_notes():
+    maps = db.get_cn_maps()
+    anomalies, items = db.get_cn_codex('anomaly'), db.get_cn_codex('item')
+    map_counts = {m['id']: {'anomalies': sum(1 for a in anomalies if m['id'] in a['maps']),
+                            'classics': sum(1 for i in items if m['id'] in i['maps'])} for m in maps}
+    return render_template('cryptic_notes.html', maps=maps, map_names={m['id']: m['name'] for m in maps},
+                           map_counts=map_counts, anomalies=anomalies, items=items,
+                           messages=db.get_cn_messages(), tiers=config.CN_TIERS, outcomes=config.CN_OUTCOMES,
+                           kill_chance=config.CN_DANGER_KILL_CHANCE)
+
+
+@app.route('/cn/map/<int:map_id>', methods=['POST'])
+@login_required
+def cn_save_map(map_id):
+    db.update_cn_map(map_id, form_int('other_death_chance', 8))
+    flash('Map settings saved!', 'success')
+    return _cn_back()
+
+
+@app.route('/cn/anomaly', methods=['POST'])
+@app.route('/cn/anomaly/<int:entry_id>', methods=['POST'])
+@login_required
+def cn_save_anomaly(entry_id=None):
+    success, message = db.save_cn_anomaly(entry_id, request.form.get('name'), form_int('danger', 2),
+                                          request.form.get('description'), request.form.getlist('maps'))
+    flash(message, 'success' if success else 'danger')
+    return _cn_back()
+
+
+@app.route('/cn/item', methods=['POST'])
+@app.route('/cn/item/<int:entry_id>', methods=['POST'])
+@login_required
+def cn_save_item(entry_id=None):
+    success, message = db.save_cn_item(entry_id, request.form.get('name'), request.form.get('tier'),
+                                       form_int('sell_value', 0), form_int('weight', 10),
+                                       request.form.get('category'), request.form.get('description'),
+                                       request.form.getlist('maps'))
+    flash(message, 'success' if success else 'danger')
+    return _cn_back()
+
+
+@app.route('/cn/<kind>/delete/<int:entry_id>', methods=['POST'])
+@login_required
+def cn_delete(kind, entry_id):
+    if kind not in ('anomaly', 'item'):
+        abort(404)
+    success, message = db.delete_cn_entry(kind, entry_id)
+    flash(message, 'success' if success else 'danger')
+    return _cn_back()
+
+
+@app.route('/cn/import', methods=['POST'])
+@login_required
+def cn_import():
+    kind = request.form.get('kind')
+    if kind not in ('anomaly', 'item'):
+        abort(400)
+    map_ids = request.form.getlist('maps')
+    if not map_ids:
+        flash('Tick at least one map for the imported entries!', 'danger')
+        return _cn_back()
+    added, skipped = db.import_cn_codex(kind, request.form.get('lines'), map_ids)
+    flash(f"Imported {added} {'anomalies' if kind == 'anomaly' else 'classics'}.", 'success' if added else 'info')
+    for message in skipped[:20]:
+        flash(f'Skipped: {message}', 'warning')
+    return _cn_back()
+
+
+@app.route('/cn/message', methods=['POST'])
+@app.route('/cn/message/<int:message_id>', methods=['POST'])
+@login_required
+def cn_save_message(message_id=None):
+    success, message = db.save_cn_message(message_id, request.form.get('map_id'), request.form.get('outcome'),
+                                          request.form.get('message'))
+    flash(message, 'success' if success else 'danger')
+    return _cn_back()
+
+
+@app.route('/cn/message/delete/<int:message_id>', methods=['POST'])
+@login_required
+def cn_delete_message(message_id):
+    success, message = db.delete_cn_message(message_id)
+    flash(message, 'success' if success else 'danger')
+    return _cn_back()
+
+
 # ==================== MINIGAMES (one set of routes for every minigame in config) ====================
 
 LOOT_COLUMNS = ("id, item_name, message, description, category, sell_value, "
@@ -454,56 +562,88 @@ def delete_profile_dashboard(profile_id):
 
 # ==================== ROSTER ====================
 
-def refresh_roster_in_discord():
-    """Ask the bot to update the roster messages. Problems only produce a warning."""
+ROLE_SLUGS = {role.lower(): role for role in config.ROLES}  # /roster/hunter -> "Hunter"
+
+
+def _role_from_slug(role_slug):
+    role = ROLE_SLUGS.get((role_slug or '').lower())
+    if not role:
+        abort(404)
+    return role
+
+
+def refresh_roster_in_discord(role=None):
+    """Ask the bot to update the roster posts (one role or all). Problems only produce a warning."""
     try:
-        response = bot_api('refresh_roster', timeout=60)
+        response = bot_api('refresh_roster', timeout=60, json={'role': role} if role else {})
         if response.status_code != 200:
             flash(f"Saved, but the roster in Discord wasn't updated: {response.json().get('message')}", 'warning')
     except Exception as e:
         flash(f"Saved, but the roster in Discord wasn't updated (is the bot running?): {e}", 'warning')
 
 
+def _back_to_roster():
+    """Return to the roster tab (Hunters / Survivors) the form was sent from."""
+    path = urlparse(request.referrer or '').path
+    return redirect(path if path.startswith('/roster/') else url_for('roster'))
+
+
 def _roster_result(success, message):
     flash(message, 'success' if success else 'danger')
     if success:
-        refresh_roster_in_discord()
-    return redirect(url_for('roster'))
+        refresh_roster_in_discord()  # a character can affect both posts (role change, linked identity)
+    return _back_to_roster()
 
 
 @app.route('/roster')
 @login_required
 def roster():
+    return redirect(url_for('roster_page', role_slug=config.ROLES[0].lower()))
+
+
+@app.route('/roster/<role_slug>')
+@login_required
+def roster_page(role_slug):
+    role = _role_from_slug(role_slug)
     refresh_player_names(c['player_id'] for c in db.get_roster())
-    characters = db.get_roster()
+    all_characters = db.get_roster()
+    characters = [c for c in all_characters if c['role'] == role]
     counts = {status: sum(1 for c in characters if c['status'] == status) for status in ('free', 'reserved', 'taken')}
     end_dates = {roster_id: datetime.datetime.fromtimestamp(ts).strftime('%d %b %Y, %H:%M')
                  for roster_id, ts in db.get_reservation_end_dates().items()}
-    # Preview shows "@Name" where Discord shows the real mention
-    preview = roster_format.build_roster(db, mention=lambda c: "@" + (c['player_name'] or c['player_id']))
-    names = {c['id']: c['display'] for c in characters}
-    return render_template('roster.html', characters=characters, counts=counts, end_dates=end_dates, names=names,
-                           roster_channel=config.ROSTER_CHANNEL_ID, layout=roster_format.get_layout(db),
-                           preview=preview)
+    names = {c['id']: c['display'] for c in all_characters}
+    # For the live preview: Discord shows real mentions, the preview shows "@Name"
+    preview_characters = [{'display': c['display'], 'name': c['name'], 'title': c['title'] or '',
+                           'status': c['status'],
+                           'player': ('@' + (c['player_name'] or c['player_id'])) if c['player_id'] else ''}
+                          for c in characters]
+    return render_template('roster.html', role=role, characters=characters, all_characters=all_characters,
+                           counts=counts, end_dates=end_dates, names=names,
+                           layout=roster_format.get_layout(db, role), preview_characters=preview_characters,
+                           indent=roster_format.INDENT, limits=roster_format.LIMITS)
 
 
-@app.route('/roster/layout', methods=['POST'])
+@app.route('/roster/layout/<role_slug>', methods=['POST'])
 @login_required
-def roster_layout():
-    keys = ['line_format', 'reserved_suffix', 'empty_text']
-    for role in config.ROLES:
-        keys += [f"{role}_{k}" for k in ('title', 'color', 'intro', 'footer', 'thumbnail', 'image')]
-    values = {key: request.form.get(key, '') for key in keys}
+def roster_layout(role_slug):
+    role = _role_from_slug(role_slug)
+    values = {key: request.form.get(key, '') for key in
+              ('line_format', 'reserved_suffix', 'empty_text', 'title', 'color', 'intro', 'footer',
+               'thumbnail', 'image', 'channel_id')}
+    values['channel_id'] = values['channel_id'].strip()
     values['style'] = 'message' if request.form.get('style') == 'message' else 'embed'
     values['alternate_indent'] = '1' if request.form.get('alternate_indent') else '0'
     values['blank_lines'] = '1' if request.form.get('blank_lines') else '0'
+    if values['channel_id'] and not values['channel_id'].isdigit():
+        flash('The post ID must be a number (right-click the forum post → Copy ID)!', 'danger')
+        return _back_to_roster()
     if '{character}' not in values['line_format'] and '{name}' not in values['line_format']:
         flash('The line format needs {character} or {name}, otherwise no names would be shown!', 'danger')
-        return redirect(url_for('roster'))
-    db.set_settings(roster_format.SETTINGS_PREFIX, values)
-    flash('Roster layout saved!', 'success')
-    refresh_roster_in_discord()
-    return redirect(url_for('roster'))
+        return _back_to_roster()
+    roster_format.save_layout(db, role, values)
+    flash(f'{role} roster layout saved!', 'success')
+    refresh_roster_in_discord(role)
+    return _back_to_roster()
 
 
 @app.route('/roster/add', methods=['POST'])
@@ -519,14 +659,14 @@ def import_roster():
     role = request.form.get('role')
     if role not in config.ROLES:
         flash('Please choose Hunter or Survivor!', 'danger')
-        return redirect(url_for('roster'))
+        return _back_to_roster()
     added, skipped = db.import_roster(request.form.get('lines'), role)
     flash(f'Imported {added} {role} character(s).', 'success' if added else 'info')
     for message in skipped[:20]:
         flash(f'Skipped: {message}', 'warning')
     if added:
-        refresh_roster_in_discord()
-    return redirect(url_for('roster'))
+        refresh_roster_in_discord(role)
+    return _back_to_roster()
 
 
 @app.route('/roster/edit/<int:character_id>', methods=['POST'])
@@ -549,7 +689,7 @@ def roster_mark_taken(character_id):
     player_id = (request.form.get('player_id') or '').strip()
     if player_id and not player_id.isdigit():
         flash('The Discord user ID must be a number!', 'danger')
-        return redirect(url_for('roster'))
+        return _back_to_roster()
     return _roster_result(*db.set_roster_taken(character_id, player_id or None,
                                                (request.form.get('player_name') or '').strip() or None))
 
@@ -572,20 +712,21 @@ def roster_release_player():
     player_id = (request.form.get('player_id') or '').strip()
     if not player_id.isdigit():
         flash('Please enter a Discord user ID!', 'danger')
-        return redirect(url_for('roster'))
+        return _back_to_roster()
     names = db.release_player(player_id)
     if not names:
         flash('That user has no characters on the roster.', 'info')
-        return redirect(url_for('roster'))
+        return _back_to_roster()
     return _roster_result(True, f"Released: {', '.join(names)}")
 
 
-@app.route('/roster/refresh', methods=['POST'])
+@app.route('/roster/refresh/<role_slug>', methods=['POST'])
 @login_required
-def roster_refresh():
-    refresh_roster_in_discord()
-    flash('Roster refresh sent to Discord.', 'info')
-    return redirect(url_for('roster'))
+def roster_refresh(role_slug):
+    role = _role_from_slug(role_slug)
+    refresh_roster_in_discord(role)
+    flash(f'{role} roster sent to Discord.', 'info')
+    return _back_to_roster()
 
 
 # ==================== ACTIVITY CHECK ====================

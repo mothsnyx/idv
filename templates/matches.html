@@ -3,6 +3,7 @@
 {% block title %}Match Messages{% endblock %}
 
 {% block content %}
+{% include "_match_tabs.html" %}
 {% set level_names = {0: 'Total Defeat', 1: 'Poor', 2: 'Draw', 3: 'Good', 4: 'Perfect'} %}
 <h1><i class="bi bi-trophy-fill"></i> Match Messages</h1>
 <p class="lead">The story text <code>/match</code> shows. Each match rolls a result from 0 to 4 and picks a random message for the character's role and that result.</p>

@@ -1,0 +1,393 @@
+{% extends "base.html" %}
+
+{% block title %}Cryptic Notes{% endblock %}
+
+{% macro map_checkboxes(selected, prefix) %}
+<div class="d-flex flex-wrap gap-3">
+    {% for m in maps %}
+    <div class="form-check">
+        <input class="form-check-input" type="checkbox" name="maps" value="{{ m.id }}" id="{{ prefix }}-{{ m.id }}"
+               {% if m.id in selected %}checked{% endif %}>
+        <label class="form-check-label" for="{{ prefix }}-{{ m.id }}">{{ m.name }}</label>
+    </div>
+    {% endfor %}
+</div>
+{% endmacro %}
+
+{% macro map_badges(map_ids) %}
+{% if map_ids|length == maps|length %}<span class="badge bg-primary">Both maps</span>
+{% elif not map_ids %}<span class="badge bg-danger">No map: never appears</span>
+{% else %}{% for id in map_ids %}<span class="badge bg-secondary me-1">{{ map_names.get(id, '?') }}</span>{% endfor %}{% endif %}
+{% endmacro %}
+
+{% block content %}
+{% include "_match_tabs.html" %}
+
+<h1><i class="bi bi-journal-text"></i> Cryptic Notes</h1>
+<p class="lead">Everything for <code>/cnmatch</code>: the maps, the codex (anomalies and classics), and the result texts.
+Anomalies and classics only appear on the maps that are ticked for them.</p>
+
+<div class="card mb-4">
+    <div class="card-header d-flex justify-content-between align-items-center" role="button" data-bs-toggle="collapse" data-bs-target="#rulesBox">
+        <span><i class="bi bi-info-circle"></i> How a run works</span><i class="bi bi-chevron-down"></i>
+    </div>
+    <div class="collapse" id="rulesBox">
+        <div class="card-body small">
+            <ol class="mb-3">
+                <li>The character (or the whole group) runs into <strong>one random anomaly</strong> that can appear on the map.</li>
+                <li>Each character can be <strong>killed by that anomaly</strong>. The higher its danger, the likelier:
+                    {% for level, chance in kill_chance.items() %}danger {{ level }} = {{ chance }}%{% if not loop.last %} · {% endif %}{% endfor %}.</li>
+                <li>Otherwise each character can still <strong>die another way</strong> (quota not met, a fall, ...): the map's chance below.
+                    From the 4th run within an hour the character is exhausted and this chance goes up.</li>
+                <li>Survivors find <strong>1–9 classics</strong> (5–6 is most common) from the map's classics. The tier decides how often:
+                    {% for key, t in tiers.items() %}{{ t.emoji|emoji }} {{ t.label }} {{ t.weight }}%{% if not loop.last %} · {% endif %}{% endfor %}.
+                    Within a tier, a higher "how common" value comes up more often.</li>
+                <li>The dead keep nothing and wake up in the Manor's infirmary. Survivors get a small Clues bonus and can <code>/sell</code> their classics.</li>
+            </ol>
+            <p class="text-muted mb-0">These rules (percentages, bonus, exhaustion) are set in <code>config.py</code> under "CRYPTIC NOTES".</p>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Maps ===== -->
+<div class="card mb-4" id="maps">
+    <div class="card-header"><i class="bi bi-map"></i> Maps</div>
+    <div class="card-body">
+        <div class="row g-3">
+            {% for m in maps %}
+            <div class="col-md-6">
+                <form method="POST" action="{{ url_for('cn_save_map', map_id=m.id) }}" class="p-3 rounded" style="border:1px solid var(--border);">
+                    <input type="hidden" name="anchor" value="#maps">
+                    <h5 class="mb-1">{{ m.name }}</h5>
+                    <p class="text-muted small mb-2">
+                        {{ map_counts[m.id].anomalies }} anomalies · {{ map_counts[m.id].classics }} classics
+                    </p>
+                    <label class="form-label">Chance of dying another way (quota, fall, ...)</label>
+                    <div class="input-group" style="max-width: 260px;">
+                        <input type="number" name="other_death_chance" class="form-control" min="0" max="100" value="{{ m.other_death_chance }}">
+                        <span class="input-group-text">%</span>
+                        <button class="btn btn-primary" type="submit">Save</button>
+                    </div>
+                </form>
+            </div>
+            {% endfor %}
+        </div>
+    </div>
+</div>
+
+<!-- ===== Anomalies ===== -->
+<div class="card mb-4" id="anomalies">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span><i class="bi bi-exclamation-octagon"></i> Codex: Anomalies ({{ anomalies|length }})</span>
+        <select class="form-select form-select-sm map-filter" data-table="anomalyTable" style="width:auto;">
+            <option value="">All maps</option>
+            {% for m in maps %}<option value="{{ m.id }}">{{ m.name }}</option>{% endfor %}
+        </select>
+    </div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('cn_save_anomaly') }}" class="mb-3">
+            <input type="hidden" name="anchor" value="#anomalies">
+            <div class="row g-2 align-items-end">
+                <div class="col-md-4"><label class="form-label">Name</label><input type="text" name="name" class="form-control" placeholder="e.g. Wraith" required></div>
+                <div class="col-md-3">
+                    <label class="form-label">Danger</label>
+                    <select name="danger" class="form-select">
+                        {% for level, chance in kill_chance.items() %}<option value="{{ level }}" {% if level == 2 %}selected{% endif %}>{{ level }} · {{ chance }}% kill chance</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-5"><label class="form-label">Appears in</label>{{ map_checkboxes([], 'new-anomaly') }}</div>
+                <div class="col-md-9"><input type="text" name="description" class="form-control" placeholder="Codex description (optional, only shown here)"></div>
+                <div class="col-md-3"><button class="btn btn-primary w-100" type="submit"><i class="bi bi-plus"></i> Add anomaly</button></div>
+            </div>
+        </form>
+
+        <details class="mb-3">
+            <summary class="text-muted">Import many anomalies at once</summary>
+            <form method="POST" action="{{ url_for('cn_import') }}" class="mt-2">
+                <input type="hidden" name="anchor" value="#anomalies">
+                <input type="hidden" name="kind" value="anomaly">
+                <p class="text-muted small mb-1">One per line: <code>Name | danger 1-5</code> (danger optional, default 2). All of them get the maps ticked below.</p>
+                <textarea name="lines" class="form-control mb-2" rows="5" placeholder="Wraith | 3&#10;Something Else | 5" required></textarea>
+                <div class="d-flex flex-wrap gap-3 align-items-center">{{ map_checkboxes([], 'imp-anomaly') }}
+                    <button class="btn btn-primary btn-sm" type="submit"><i class="bi bi-upload"></i> Import</button></div>
+            </form>
+        </details>
+
+        <div class="table-responsive">
+            <table class="table table-dark table-hover table-sm align-middle mb-0" id="anomalyTable">
+                <thead><tr><th>Anomaly</th><th>Danger</th><th>Appears in</th><th class="text-end">Actions</th></tr></thead>
+                <tbody>
+                    {% for a in anomalies %}
+                    <tr data-maps=",{{ a.maps|join(',') }},">
+                        <td><strong>{{ a.name }}</strong>{% if a.description %}<br><small class="text-muted">{{ a.description }}</small>{% endif %}</td>
+                        <td><span title="{{ kill_chance.get(a.danger, 0) }}% kill chance">{{ '▰' * a.danger }}{{ '▱' * (5 - a.danger) }} {{ a.danger }}</span></td>
+                        <td>{{ map_badges(a.maps) }}</td>
+                        <td class="text-end text-nowrap">
+                            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#anomalyModal{{ a.id }}"><i class="bi bi-pencil"></i></button>
+                            <form method="POST" action="{{ url_for('cn_delete', kind='anomaly', entry_id=a.id) }}" style="display:inline;" onsubmit="return confirm('Remove this anomaly from the codex?');">
+                                <input type="hidden" name="anchor" value="#anomalies">
+                                <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="4" class="text-muted">No anomalies yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Classics ===== -->
+<div class="card mb-4" id="classics">
+    <div class="card-header d-flex justify-content-between align-items-center flex-wrap gap-2">
+        <span><i class="bi bi-gem"></i> Codex: Classics ({{ items|length }})</span>
+        <div class="d-flex gap-2 flex-wrap">
+            <select class="form-select form-select-sm map-filter" data-table="itemTable" style="width:auto;">
+                <option value="">All maps</option>
+                {% for m in maps %}<option value="{{ m.id }}">{{ m.name }}</option>{% endfor %}
+            </select>
+            <select class="form-select form-select-sm" id="tierFilter" style="width:auto;">
+                <option value="">All tiers</option>
+                {% for key, t in tiers.items() %}<option value="{{ key }}">{{ t.label }}</option>{% endfor %}
+            </select>
+            <input type="text" class="form-control form-control-sm" id="itemSearch" placeholder="Search..." style="width:160px;">
+        </div>
+    </div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('cn_save_item') }}" class="mb-3">
+            <input type="hidden" name="anchor" value="#classics">
+            <div class="row g-2 align-items-end">
+                <div class="col-md-4"><label class="form-label">Name</label><input type="text" name="name" class="form-control" placeholder="e.g. Cursed Sapphire" required></div>
+                <div class="col-md-3">
+                    <label class="form-label">Tier</label>
+                    <select name="tier" class="form-select tier-select">
+                        {% for key, t in tiers.items() %}<option value="{{ key }}" data-value="{{ t.value }}">{{ t.label }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-2">
+                    <label class="form-label">Sell value</label>
+                    <input type="number" name="sell_value" class="form-control value-input" min="0" value="{{ tiers['B'].value }}" required>
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">How common <small class="text-muted">(within tier)</small></label>
+                    <input type="number" name="weight" class="form-control" min="1" value="10">
+                </div>
+                <div class="col-md-3">
+                    <label class="form-label">Inventory category</label>
+                    <select name="category" class="form-select">
+                        {% for c in categories %}<option value="{{ c }}" {% if c == 'Collectibles' %}selected{% endif %}>{{ c }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-5"><label class="form-label">Found in</label>{{ map_checkboxes([], 'new-item') }}</div>
+                <div class="col-md-4"><button class="btn btn-primary w-100" type="submit"><i class="bi bi-plus"></i> Add classic</button></div>
+                <div class="col-12"><input type="text" name="description" class="form-control" placeholder="Codex description (optional, only shown here)"></div>
+            </div>
+        </form>
+
+        <details class="mb-3">
+            <summary class="text-muted">Import many classics at once</summary>
+            <form method="POST" action="{{ url_for('cn_import') }}" class="mt-2">
+                <input type="hidden" name="anchor" value="#classics">
+                <input type="hidden" name="kind" value="item">
+                <p class="text-muted small mb-1">
+                    One per line: <code>Name | Tier | Sell value</code>. Tier is <code>B</code>, <code>A</code>, <code>S</code> or <code>EX</code>
+                    (or the full name, e.g. "S-Tier Classic"). Without a sell value, the tier's suggestion is used
+                    ({% for key, t in tiers.items() %}{{ key }} = {{ t.value }}{% if not loop.last %}, {% endif %}{% endfor %}).
+                    You can change every price afterwards. All of them get the maps ticked below.
+                </p>
+                <textarea name="lines" class="form-control mb-2" rows="6" placeholder="Pickaxe | B | 120&#10;Cursed Sapphire | S | 1450&#10;Golden Pocket Watch | EX | 3800" required></textarea>
+                <div class="d-flex flex-wrap gap-3 align-items-center">{{ map_checkboxes([], 'imp-item') }}
+                    <button class="btn btn-primary btn-sm" type="submit"><i class="bi bi-upload"></i> Import</button></div>
+            </form>
+        </details>
+
+        <div class="table-responsive">
+            <table class="table table-dark table-hover table-sm align-middle mb-0" id="itemTable">
+                <thead><tr><th>Classic</th><th>Tier</th><th class="text-end">Sell value</th><th class="text-center">Common</th><th>Found in</th><th class="text-end">Actions</th></tr></thead>
+                <tbody>
+                    {% for i in items %}
+                    {% set t = tiers.get(i.tier, {}) %}
+                    <tr data-maps=",{{ i.maps|join(',') }}," data-tier="{{ i.tier }}">
+                        <td><strong>{{ i.name }}</strong>{% if i.description %}<br><small class="text-muted">{{ i.description }}</small>{% endif %}</td>
+                        <td>{{ t.emoji|emoji }} {{ t.label or i.tier }}</td>
+                        <td class="text-end">{{ currencies['main']['emoji']|emoji }} {{ "{:,}".format(i.sell_value or 0) }}</td>
+                        <td class="text-center">{{ i.weight }}</td>
+                        <td>{{ map_badges(i.maps) }}</td>
+                        <td class="text-end text-nowrap">
+                            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#itemModal{{ i.id }}"><i class="bi bi-pencil"></i></button>
+                            <form method="POST" action="{{ url_for('cn_delete', kind='item', entry_id=i.id) }}" style="display:inline;" onsubmit="return confirm('Remove this classic from the codex? Characters keep the ones they already own.');">
+                                <input type="hidden" name="anchor" value="#classics">
+                                <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="6" class="text-muted">No classics yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ===== Result texts ===== -->
+<div class="card mb-4" id="texts">
+    <div class="card-header"><i class="bi bi-chat-quote"></i> Result Texts</div>
+    <div class="card-body">
+        <p class="text-muted small">
+            For every run the bot picks a random text for the result type, from the texts for that map or for both maps.
+            Placeholders: <code>{character}</code> <code>{map}</code> <code>{anomaly}</code> <code>{count}</code> (number of classics).
+            The infirmary line is added automatically to deaths.
+        </p>
+        <form method="POST" action="{{ url_for('cn_save_message') }}" class="mb-4">
+            <input type="hidden" name="anchor" value="#texts">
+            <div class="row g-2">
+                <div class="col-md-4">
+                    <select name="outcome" class="form-select" required>
+                        {% for key, label in outcomes.items() %}<option value="{{ key }}">{{ label }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-3">
+                    <select name="map_id" class="form-select">
+                        <option value="">Both maps</option>
+                        {% for m in maps %}<option value="{{ m.id }}">Only {{ m.name }}</option>{% endfor %}
+                    </select>
+                </div>
+                <div class="col-md-5"><textarea name="message" class="form-control" rows="2" placeholder="{character} slipped past the {anomaly}..." required></textarea></div>
+                <div class="col-12"><button class="btn btn-primary" type="submit"><i class="bi bi-plus"></i> Add text</button></div>
+            </div>
+        </form>
+
+        {% for key, label in outcomes.items() %}
+        <h6 class="mt-3">{{ label }}</h6>
+        <div class="table-responsive">
+            <table class="table table-dark table-sm align-middle mb-2">
+                <tbody>
+                    {% for msg in messages if msg.outcome == key %}
+                    <tr>
+                        <td style="width:150px;"><span class="badge {{ 'bg-primary' if not msg.map_id else 'bg-secondary' }}">{{ map_names.get(msg.map_id, 'Both maps') }}</span></td>
+                        <td>{{ msg.message }}</td>
+                        <td class="text-end text-nowrap" style="width:110px;">
+                            <button class="btn btn-sm btn-outline-primary" data-bs-toggle="modal" data-bs-target="#msgModal{{ msg.id }}"><i class="bi bi-pencil"></i></button>
+                            <form method="POST" action="{{ url_for('cn_delete_message', message_id=msg.id) }}" style="display:inline;" onsubmit="return confirm('Delete this text?');">
+                                <input type="hidden" name="anchor" value="#texts">
+                                <button class="btn btn-sm btn-outline-danger"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td class="text-muted">No texts yet. The bot uses a short default line.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+        {% endfor %}
+    </div>
+</div>
+
+<!-- ===== Edit windows ===== -->
+{% for a in anomalies %}
+<div class="modal fade" id="anomalyModal{{ a.id }}" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+        <form method="POST" action="{{ url_for('cn_save_anomaly', entry_id=a.id) }}">
+            <input type="hidden" name="anchor" value="#anomalies">
+            <div class="modal-header"><h5 class="modal-title">Edit {{ a.name }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body">
+                <div class="mb-3"><label class="form-label">Name</label><input type="text" name="name" class="form-control" value="{{ a.name }}" required></div>
+                <div class="mb-3"><label class="form-label">Danger</label>
+                    <select name="danger" class="form-select">
+                        {% for level, chance in kill_chance.items() %}<option value="{{ level }}" {% if level == a.danger %}selected{% endif %}>{{ level }} · {{ chance }}% kill chance</option>{% endfor %}
+                    </select></div>
+                <div class="mb-3"><label class="form-label">Appears in</label>{{ map_checkboxes(a.maps, 'edit-anomaly-' ~ a.id) }}</div>
+                <div class="mb-3"><label class="form-label">Codex description</label><textarea name="description" class="form-control" rows="2">{{ a.description or '' }}</textarea></div>
+            </div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary">Save</button></div>
+        </form>
+    </div></div>
+</div>
+{% endfor %}
+
+{% for i in items %}
+<div class="modal fade" id="itemModal{{ i.id }}" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+        <form method="POST" action="{{ url_for('cn_save_item', entry_id=i.id) }}">
+            <input type="hidden" name="anchor" value="#classics">
+            <div class="modal-header"><h5 class="modal-title">Edit {{ i.name }}</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body">
+                <div class="mb-3"><label class="form-label">Name</label><input type="text" name="name" class="form-control" value="{{ i.name }}" required>
+                    <small class="text-muted">Renaming also renames it in every inventory.</small></div>
+                <div class="row g-2 mb-3">
+                    <div class="col-6"><label class="form-label">Tier</label>
+                        <select name="tier" class="form-select">
+                            {% for key, t in tiers.items() %}<option value="{{ key }}" {% if key == i.tier %}selected{% endif %}>{{ t.label }}</option>{% endfor %}
+                        </select></div>
+                    <div class="col-6"><label class="form-label">Sell value</label><input type="number" name="sell_value" class="form-control" min="0" value="{{ i.sell_value or 0 }}" required></div>
+                    <div class="col-6"><label class="form-label">How common (within tier)</label><input type="number" name="weight" class="form-control" min="1" value="{{ i.weight or 10 }}"></div>
+                    <div class="col-6"><label class="form-label">Inventory category</label>
+                        <select name="category" class="form-select">
+                            {% for c in categories %}<option value="{{ c }}" {% if c == i.category %}selected{% endif %}>{{ c }}</option>{% endfor %}
+                        </select></div>
+                </div>
+                <div class="mb-3"><label class="form-label">Found in</label>{{ map_checkboxes(i.maps, 'edit-item-' ~ i.id) }}</div>
+                <div class="mb-3"><label class="form-label">Codex description</label><textarea name="description" class="form-control" rows="2">{{ i.description or '' }}</textarea></div>
+            </div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary">Save</button></div>
+        </form>
+    </div></div>
+</div>
+{% endfor %}
+
+{% for msg in messages %}
+<div class="modal fade" id="msgModal{{ msg.id }}" tabindex="-1">
+    <div class="modal-dialog"><div class="modal-content">
+        <form method="POST" action="{{ url_for('cn_save_message', message_id=msg.id) }}">
+            <input type="hidden" name="anchor" value="#texts">
+            <div class="modal-header"><h5 class="modal-title">Edit text</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div>
+            <div class="modal-body">
+                <div class="mb-3"><label class="form-label">Result type</label>
+                    <select name="outcome" class="form-select">
+                        {% for key, label in outcomes.items() %}<option value="{{ key }}" {% if key == msg.outcome %}selected{% endif %}>{{ label }}</option>{% endfor %}
+                    </select></div>
+                <div class="mb-3"><label class="form-label">Map</label>
+                    <select name="map_id" class="form-select">
+                        <option value="" {% if not msg.map_id %}selected{% endif %}>Both maps</option>
+                        {% for m in maps %}<option value="{{ m.id }}" {% if m.id == msg.map_id %}selected{% endif %}>Only {{ m.name }}</option>{% endfor %}
+                    </select></div>
+                <div class="mb-3"><label class="form-label">Text</label><textarea name="message" class="form-control" rows="4" required>{{ msg.message }}</textarea></div>
+            </div>
+            <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button><button type="submit" class="btn btn-primary">Save</button></div>
+        </form>
+    </div></div>
+</div>
+{% endfor %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Filters for the codex tables (by map, tier and search text)
+function filterTable(tableId) {
+    const mapFilter = document.querySelector(`.map-filter[data-table="${tableId}"]`).value;
+    const tier = tableId === 'itemTable' ? document.getElementById('tierFilter').value : '';
+    const q = tableId === 'itemTable' ? document.getElementById('itemSearch').value.toLowerCase() : '';
+    document.querySelectorAll(`#${tableId} tbody tr[data-maps]`).forEach(row => {
+        const show = (!mapFilter || row.dataset.maps.includes(',' + mapFilter + ','))
+                  && (!tier || row.dataset.tier === tier)
+                  && (!q || row.innerText.toLowerCase().includes(q));
+        row.style.display = show ? '' : 'none';
+    });
+}
+document.querySelectorAll('.map-filter').forEach(s => s.addEventListener('change', () => filterTable(s.dataset.table)));
+document.getElementById('tierFilter').addEventListener('change', () => filterTable('itemTable'));
+document.getElementById('itemSearch').addEventListener('input', () => filterTable('itemTable'));
+
+// "Add classic": picking a tier pre-fills its suggested price (you can still type your own)
+document.querySelectorAll('.tier-select').forEach(select => {
+    select.addEventListener('change', () => {
+        const valueInput = select.closest('form').querySelector('.value-input');
+        if (valueInput) valueInput.value = select.selectedOptions[0].dataset.value;
+    });
+});
+</script>
+{% endblock %}

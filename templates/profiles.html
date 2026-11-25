@@ -51,8 +51,8 @@
                         <td>
                             <span class="badge {{ 'bg-danger' if profile.role == roles[0] else 'bg-success' }}">{{ profile.role }}</span>
                         </td>
-                        <td class="text-end"><small>{{ currencies['main']['emoji'] }} {{ "{:,}".format(profile.currency_main or 0) }}</small></td>
-                        <td class="text-end"><small>{{ currencies['premium']['emoji'] }} {{ "{:,}".format(profile.currency_premium or 0) }}</small></td>
+                        <td class="text-end"><small>{{ currencies['main']['emoji']|emoji }} {{ "{:,}".format(profile.currency_main or 0) }}</small></td>
+                        <td class="text-end"><small>{{ currencies['premium']['emoji']|emoji }} {{ "{:,}".format(profile.currency_premium or 0) }}</small></td>
                         {% for game in minigames %}
                         <td class="text-center"><span class="badge bg-secondary">{{ profile[game ~ '_level'] or 1 }}</span></td>
                         {% endfor %}
