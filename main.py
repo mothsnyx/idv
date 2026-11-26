@@ -13,7 +13,7 @@ from flask import Flask, request, jsonify
 
 import config
 import roster_format
-from config import EMOJI, CURRENCIES, MINIGAMES, currency_label
+from config import EMOJI, CURRENCIES, MINIGAMES, TITLE_SEP, currency_label
 from database import Database, ADMIN_IDS
 
 # ==================== SETUP ====================
@@ -56,18 +56,63 @@ ROLE_CHOICES = [app_commands.Choice(name=r, value=r) for r in config.ROLES]
 
 # ==================== HELPERS ====================
 
-def error_embed(description, title="Error!"):
-    return discord.Embed(title=f"{EMOJI['error']} ┃ {title}", description=description, color=COLOR_ERROR)
+# ---------- Layout: every bot message is built from these ----------
+# Look:  title / empty line / text blocks separated by empty lines / empty line.
+# Change SECTION_STYLE in config.py to restyle all list labels at once.
+
+BLANK = "⠀"  # invisible character: Discord keeps a line holding it, but deletes truly empty lines
 
 
-def success_embed(title, description=None):
-    return discord.Embed(title=f"{EMOJI['success']} ┃ {title}", description=description, color=COLOR_DEFAULT)
+def body(*blocks):
+    """Join text blocks with an empty line between them and air at the top and bottom."""
+    blocks = [b.strip("\n") for b in blocks if b and b.strip()]
+    if not blocks:
+        return None
+    return f"{BLANK}\n" + f"\n{BLANK}\n".join(blocks) + f"\n{BLANK}"
 
 
-def amount_text(key, amount):
+def small(*parts):
+    """One grey small-text line: '-# a · b · c'."""
+    parts = [p for p in parts if p]
+    return "-# " + " · ".join(parts) if parts else ""
+
+
+def section(label, lines):
+    """'˖ Label' above some lines (style set by config.SECTION_STYLE)."""
+    if isinstance(lines, (list, tuple)):
+        lines = "\n".join(lines)
+    return f"{config.SECTION_STYLE.format(name=label)}\n{lines}"
+
+
+def add_block(embed, block):
+    """Append a block to an embed built with body() (keeps the spacing)."""
+    lines = (embed.description or "").split("\n")
+    while lines and lines[0].strip(BLANK + " ") == "":
+        lines.pop(0)
+    while lines and lines[-1].strip(BLANK + " ") == "":
+        lines.pop()
+    embed.description = body("\n".join(lines), block)
+    return embed
+
+
+def make_embed(emoji, title, *blocks, color=None):
+    return discord.Embed(title=f"{emoji}{TITLE_SEP}{title}", description=body(*blocks),
+                         color=color or COLOR_DEFAULT)
+
+
+def error_embed(description, title="Error!", *blocks):
+    return make_embed(EMOJI['error'], title, description, *blocks, color=COLOR_ERROR)
+
+
+def success_embed(title, description=None, *blocks):
+    return make_embed(EMOJI['success'], title, description, *blocks)
+
+
+def amount_text(key, amount, bold=True):
     """'🔍 **1,000** Clues'"""
     c = CURRENCIES[key]
-    return f"{c['emoji']} **{amount:,}** {c['name']}"
+    number = f"**{amount:,}**" if bold else f"{amount:,}"
+    return f"{c['emoji']} {number} {c['name']}"
 
 
 async def require_owner(interaction, name):
@@ -82,7 +127,7 @@ async def require_admin(interaction):
     if interaction.user.id in ADMIN_IDS:
         return True
     await interaction.response.send_message(
-        embed=error_embed("❌ Only admins can use this command!", "Access Denied!"), ephemeral=True)
+        embed=error_embed("Only admins can use this command!", "Access Denied!"), ephemeral=True)
     return False
 
 
@@ -119,8 +164,14 @@ def parse_item_quantities(text):
 
 
 def format_items(item_quantities):
-    """{'A': 2, 'B': 1} -> '**A** x2, **B**'"""
-    return ", ".join(f"**{name}** x{qty}" if qty > 1 else f"**{name}**" for name, qty in item_quantities.items())
+    """{'A': 2, 'B': 1} -> '**A** ×2, **B**'"""
+    return ", ".join(f"**{name}** ×{qty}" if qty > 1 else f"**{name}**" for name, qty in item_quantities.items())
+
+
+def _items_total_line(item_quantities, verb):
+    """'-# 5 items added' when more than one item was involved."""
+    total = sum(item_quantities.values())
+    return small(f"{total} items {verb}") if total > 1 else None
 
 
 async def resolve_channel(channel_id):
@@ -198,7 +249,6 @@ def _progress_bar(level, xp):
     return "█" * filled + "░" * (10 - filled)
 
 
-BLANK = "⠀"        # invisible character: keeps empty lines that Discord would otherwise remove
 INDENT = "⠀⠀"
 
 
@@ -261,21 +311,18 @@ class ProfileView(discord.ui.View):
                 f"{INDENT}{_progress_bar(p[f'{game}_level'], p[f'{game}_xp'])}　"
                 f"{p[f'{game}_xp']}/{p[f'{game}_level'] * 100} XP"
                 for game, cfg in MINIGAMES.items())
-            sections = [f".✦ **Role**\n{INDENT}{p['role']}", f".✦ **Currency**\n{currency}"]
-            if levels:
-                sections.append(f".✦ **Levels**\n{levels}")
-            return discord.Embed(title=f"{EMOJI['profile']} ┃ {p['name']}",
-                                 description=f"{BLANK}\n" + f"\n{BLANK}\n".join(sections) + f"\n{BLANK}",
-                                 color=COLOR_DEFAULT)
+            return make_embed(EMOJI['profile'], p['name'],
+                              section("Role", f"{INDENT}{p['role']}"),
+                              section("Currency", currency),
+                              section("Levels", levels) if levels else None)
 
-        embed = discord.Embed(title=f"{EMOJI.get('inventory', '🎒')} ┃ {p['name']}'s Inventory", color=COLOR_DEFAULT)
+        inventory_emoji = EMOJI.get('inventory', '🎒')
         if not self.items:
-            embed.description = (f"{BLANK}\n*The inventory is empty.*\n{BLANK}\n"
-                                 f"Play minigames or matches to collect items!\n{BLANK}")
-            return embed
+            return make_embed(inventory_emoji, f"{p['name']}'s Inventory", "*The inventory is empty.*",
+                              "Play minigames or matches to collect items!")
         lines = "\n".join(f"{INDENT}﹒{item['item_name']}　`×{item['quantity']}`"
                           for item in self.inv_pages[self.inv_page])
-        embed.description = f"{BLANK}\n.✦ **Miscellaneous**\n{BLANK}\n{lines}\n{BLANK}"
+        embed = make_embed(inventory_emoji, f"{p['name']}'s Inventory", section("Miscellaneous", f"{BLANK}\n{lines}"))
         total = sum(item['quantity'] for item in self.items)
         footer = f"{total} item{'s' if total != 1 else ''} in total · {len(self.items)} different"
         if len(self.inv_pages) > 1:
@@ -298,52 +345,48 @@ async def show_profile(interaction: discord.Interaction, name: str):
 @bot.tree.command(name="list", description="Show all your character profiles")
 async def list_profiles(interaction: discord.Interaction):
     profiles = db.get_profiles_for_user(interaction.user.id)
-    title = f"{EMOJI['profile']} ┃ Your Characters"
     if not profiles:
-        embed = discord.Embed(title=title, description="You don't have any characters yet. Create one with `/create`!",
-                              color=COLOR_DEFAULT)
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=make_embed(
+            EMOJI['profile'], "Your Characters", "You don't have any characters yet.", small("Create one with /create")))
         return
 
     main_emoji, premium_emoji = CURRENCIES['main']['emoji'], CURRENCIES['premium']['emoji']
 
-    def chunk_lines(lines, limit=1024):
-        """Split lines into chunks that each fit into one embed field."""
-        chunks, current, length = [], [], 0
-        for line in lines:
-            if current and length + len(line) + 1 > limit:
-                chunks.append("\n".join(current))
-                current, length = [], 0
-            current.append(line)
-            length += len(line) + 1
-        if current:
-            chunks.append("\n".join(current))
-        return chunks
-
-    # Group by role: configured roles first, then anything else
+    # One '˖ Survivors' / '˖ Hunters' block per role (configured roles first); long lists continue on the next page
     roles = list(config.ROLES) + sorted({p[1] for p in profiles} - set(config.ROLES))
-    fields = []
+    blocks = []
     for role in roles:
-        lines = [f"{EMOJI.get(role, '•')} **{p[0]}** — {main_emoji} {p[2]:,} / {premium_emoji} {p[3]:,}"
+        lines = [f"{EMOJI.get(role, '•')} **{p[0]}** · {main_emoji} {p[2]:,} · {premium_emoji} {p[3]:,}"
                  for p in profiles if p[1] == role]
-        for i, chunk in enumerate(chunk_lines(lines)):
-            fields.append((f"{role}s" if i == 0 else f"{role}s (cont.)", chunk))
+        chunk, first = [], True
+        for line in lines + [None]:
+            if line is None or (chunk and len("\n".join(chunk + [line])) > 1500):
+                if chunk:
+                    blocks.append(section(f"{role}s" if first else f"{role}s (cont.)", chunk))
+                    chunk, first = [], False
+            if line is not None:
+                chunk.append(line)
 
-    pages = [fields[i:i + 25] for i in range(0, max(len(fields), 1), 25)]  # max 25 fields per embed
+    pages, current = [], []
+    for block in blocks:
+        if current and len("\n\n".join(current + [block])) > 3500:
+            pages.append(current)
+            current = []
+        current.append(block)
+    pages.append(current)
 
-    def make_embed(page_num):
-        embed = discord.Embed(title=title, description=f"You have **{len(profiles)}** character(s).",
-                              color=COLOR_DEFAULT)
-        for field_name, value in pages[page_num]:
-            embed.add_field(name=field_name, value=value, inline=False)
-        footer = "Use /profile [name] to view details."
+    def make_page(page_num):
+        embed = make_embed(EMOJI['profile'], "Your Characters",
+                           f"You have **{len(profiles)}** character{'s' if len(profiles) != 1 else ''}.",
+                           *pages[page_num])
+        footer = "/profile [name] shows the details"
         if len(pages) > 1:
-            footer += f"  •  Page {page_num + 1}/{len(pages)}"
+            footer += f" · Page {page_num + 1}/{len(pages)}"
         embed.set_footer(text=footer)
         return embed
 
     if len(pages) == 1:
-        await interaction.response.send_message(embed=make_embed(0))
+        await interaction.response.send_message(embed=make_page(0))
         return
 
     class ListView(discord.ui.View):
@@ -354,14 +397,14 @@ async def list_profiles(interaction: discord.Interaction):
         @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
         async def prev_btn(self, inter: discord.Interaction, button: discord.ui.Button):
             self.page = max(0, self.page - 1)
-            await inter.response.edit_message(embed=make_embed(self.page), view=self)
+            await inter.response.edit_message(embed=make_page(self.page), view=self)
 
         @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
         async def next_btn(self, inter: discord.Interaction, button: discord.ui.Button):
             self.page = min(len(pages) - 1, self.page + 1)
-            await inter.response.edit_message(embed=make_embed(self.page), view=self)
+            await inter.response.edit_message(embed=make_page(self.page), view=self)
 
-    await interaction.response.send_message(embed=make_embed(0), view=ListView())
+    await interaction.response.send_message(embed=make_page(0), view=ListView())
 
 
 @bot.tree.command(name="claim", description="Claim an unowned character")
@@ -379,7 +422,7 @@ async def assign_owner(interaction: discord.Interaction, character: str, user: d
         return
     success, message = db.assign_owner(character, user.id)
     if success:
-        embed = success_embed("Owner assigned!", f"**{character}** is now owned by {user.mention}\n\n{message}")
+        embed = success_embed("Owner assigned!", f"**{character}** is now owned by {user.mention}.", small(message))
     else:
         embed = error_embed(message)
     await interaction.response.send_message(embed=embed)
@@ -447,8 +490,9 @@ async def exchange_currency(interaction: discord.Interaction, name: str, from_cu
     if not success:
         await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
         return
-    embed = success_embed("Exchange Complete!", f"**{name}** exchanged currency!")
-    embed.add_field(name="Received", value=amount_text(to_currency, received), inline=False)
+    embed = success_embed("Exchange Complete!", f"**{name}** exchanged currency!",
+                          small(f"Spent {amount_text(from_currency.value, amount)}",
+                                f"Received {amount_text(to_currency, received)}"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -463,12 +507,10 @@ async def match(interaction: discord.Interaction, name: str):
     if not result:
         await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
         return
-    embed = discord.Embed(title=f"{EMOJI['match']} ┃ {name}'s {result['role']} Match",
-                          description=result['message'], color=COLOR_ERROR)
-    embed.add_field(name="Result:", value=result['performance_text'], inline=True)
-    embed.add_field(name="Rewards",
-                    value=f"{amount_text('main', result['main'])}\n{amount_text('premium', result['premium'])}",
-                    inline=True)
+    embed = make_embed(EMOJI['match'], f"{name}'s {result['role']} Match", result['message'],
+                       small(result['performance_text'], amount_text('main', result['main']),
+                             amount_text('premium', result['premium'])),
+                       color=COLOR_ERROR)
     await interaction.response.send_message(embed=embed)
 
 
@@ -485,10 +527,8 @@ async def match_reward(interaction: discord.Interaction, name: str, count: app_c
     if not success:
         await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
         return
-    embed = success_embed("Match Rewards Granted!", f"**{name}** received their match rewards!")
-    embed.add_field(name="Rewards",
-                    value=f"{amount_text('main', main_reward)}\n{amount_text('premium', premium_reward)}",
-                    inline=False)
+    embed = success_embed("Match Rewards Granted!", f"**{name}** received their match rewards!",
+                          small(amount_text('main', main_reward), amount_text('premium', premium_reward)))
     await interaction.response.send_message(embed=embed)
 
 
@@ -512,32 +552,45 @@ async def any_character_autocomplete(interaction: discord.Interaction, current: 
     return [app_commands.Choice(name=n, value=n) for n in db.search_profile_names(current)]
 
 
-def _cn_items_text(result):
-    """'⚪ **Pickaxe** ×2 · 150 each' lines plus the total, for one character's result."""
+def _cn_item_lines(result):
+    """'🟣 Cursed Sapphire · 1,000' lines, most valuable first (the dot already shows the tier)."""
     counted = {}
     for item in result['items']:
         entry = counted.setdefault(item['name'], [item, 0])
         entry[1] += 1
     lines = []
-    for name, (item, qty) in sorted(counted.items(), key=lambda kv: -kv[1][0]['sell_value']):
+    for name, (item, qty) in sorted(counted.items(), key=lambda kv: (-kv[1][0]['sell_value'], kv[0].lower())):
         tier = config.CN_TIERS.get(item['tier'], {})
-        lines.append(f"{tier.get('emoji', '•')} **{name}**{f' ×{qty}' if qty > 1 else ''} · "
-                     f"{tier.get('label', item['tier'])} · {item['sell_value']:,} each")
-    lines.append(f"**Total value:** {amount_text('main', result['total_value'])}")
-    if result['reward']:
-        lines.append(f"**Survival bonus:** {amount_text('main', result['reward'])}")
-    return "\n".join(lines)
+        lines.append(f"{tier.get('emoji', '•')} {name}{f' ×{qty}' if qty > 1 else ''} · {item['sell_value']:,}")
+    return lines
+
+
+def _cn_value_line(result):
+    """'-# Worth 2,150 Clues · Survival bonus 2,000 Clues'"""
+    return small(f"Worth {amount_text('main', result['total_value'], bold=False)}",
+                 f"Survival bonus {amount_text('main', result['reward'], bold=False)}" if result['reward'] else "")
 
 
 def _cn_exhaustion_text(result):
     if result['runs_this_hour'] < config.CN_EXHAUSTION_RUNS:
         return ""
     text = (f"{config.CN_ICONS['exhausted']} **{result['character']}** is exhausted "
-            f"({result['runs_this_hour']} runs within the hour). "
-            f"Another run could easily end in death.")
+            f"({result['runs_this_hour']} runs within the hour). Another run could easily end in death.")
     if result['exhausted']:
         text += " The exhaustion already made this run more dangerous."
     return text
+
+
+def _cn_outcome_blocks(r, story_limit=None):
+    """The blocks under one character: story, loot or death, exhaustion."""
+    story = r['message'] if not story_limit or len(r['message']) <= story_limit else r['message'][:story_limit] + "…"
+    icons = config.CN_ICONS
+    if r['died']:
+        outcome = f"{icons['died']} **{CN_SHORT[r['outcome']]}**\n{config.CN_RESPAWN_TEXT}"
+    else:
+        outcome = section(f"Classics found ({len(r['items'])})",
+                          _cn_item_lines(r) + [_cn_value_line(r)])
+    return [story, outcome, _cn_exhaustion_text(r)]
 
 
 def run_cn_group(cn_map, names):
@@ -545,32 +598,33 @@ def run_cn_group(cn_map, names):
     anomaly = db.pick_cn_anomaly(cn_map['id'])
     results = [r for r in (db.run_cryptic_notes(n, cn_map, anomaly) for n in names) if r]
     all_dead = bool(results) and all(r['died'] for r in results)
-    embed = discord.Embed(title=f"{config.CN_EMOJI} ┃ Cryptic Notes · {cn_map['name']}",
-                          color=COLOR_ERROR if all_dead else COLOR_DEFAULT)
+    color = COLOR_ERROR if all_dead else COLOR_DEFAULT
+    title = f"Cryptic Notes · {cn_map['name']}"
     icons = config.CN_ICONS
-    anomaly_line = (f"**Anomaly:** {anomaly['name']} · danger "
-                    f"{icons['danger_full'] * anomaly['danger']}{icons['danger_empty'] * (5 - anomaly['danger'])}"
+    anomaly_line = (small(f"Anomaly: {anomaly['name']}",
+                          icons['danger_full'] * anomaly['danger'] + icons['danger_empty'] * (5 - anomaly['danger']))
                     if anomaly else "")
 
     if len(results) == 1:  # solo run: the story is the main text
-        r = results[0]
-        embed.description = f"{anomaly_line}\n\n{r['message']}".strip()[:4000]
-        if r['died']:
-            embed.add_field(name=f"{icons['died']} {CN_SHORT[r['outcome']]}", value=config.CN_RESPAWN_TEXT,
-                            inline=False)
-        else:
-            embed.add_field(name=f"Classics found ({len(r['items'])})", value=_cn_items_text(r)[:1024], inline=False)
-        if _cn_exhaustion_text(r):
-            embed.add_field(name="Exhausted", value=_cn_exhaustion_text(r), inline=False)
+        embed = make_embed(config.CN_EMOJI, title, anomaly_line, *_cn_outcome_blocks(results[0]), color=color)
+        embed.description = embed.description[:4096]
         return embed
 
-    embed.description = anomaly_line or None
-    for r in results:  # group run: one section per character
-        icon = icons['died'] if r['died'] else icons['survived']
-        body = r['message'] + "\n" + (config.CN_RESPAWN_TEXT if r['died'] else _cn_items_text(r))
-        if _cn_exhaustion_text(r):
-            body += "\n" + _cn_exhaustion_text(r)
-        embed.add_field(name=f"{icon} {r['character']} · {CN_SHORT[r['outcome']]}", value=body[:1024], inline=False)
+    def group_blocks(story_limit=None):
+        blocks = [anomaly_line]
+        for r in results:  # one section per character
+            icon = icons['died'] if r['died'] else icons['survived']
+            story, *rest = _cn_outcome_blocks(r, story_limit)
+            blocks.append(f"{icon} **{r['character']}** · {CN_SHORT[r['outcome']]}\n{story}")
+            blocks.extend(rest)
+        return blocks
+
+    embed = make_embed(config.CN_EMOJI, title, *group_blocks(), color=color)
+    for limit in (400, 200, 80):  # a group of 4 with long stories: shorten the stories to fit one message
+        if len(embed.description) <= 4096:
+            break
+        embed.description = body(*group_blocks(limit))
+    embed.description = embed.description[:4096]
     survivors = sum(1 for r in results if not r['died'])
     embed.set_footer(text=f"{survivors}/{len(results)} made it out")
     return embed
@@ -595,15 +649,16 @@ class CNGroupView(discord.ui.View):
     def team(self):
         return [name for name, answer in self.answers.items() if answer in ('leader', 'accepted')]
 
-    def invite_embed(self):
-        lines = "\n".join(f"{self.ICONS[self.answers[n]]} **{n}** · <@{self.owners[n]}>" for n in self.members)
-        embed = discord.Embed(
-            title=f"{config.CN_EMOJI} ┃ Cryptic Notes · {self.cn_map['name']}",
-            description=(f"<@{self.leader_id}> wants to enter **{self.cn_map['name']}** as a group.\n"
-                         f"Each invited player has to accept for their own character.\n\n{lines}"),
-            color=COLOR_DEFAULT)
-        embed.set_footer(text=f"Invite expires in {config.CN_INVITE_TIMEOUT // 60} minutes · "
-                              f"the leader can start early with everyone who accepted")
+    def invite_embed(self, closing_note=None):
+        lines = [f"{self.ICONS[self.answers[n]]} **{n}** · <@{self.owners[n]}>" for n in self.members]
+        embed = make_embed(
+            config.CN_EMOJI, f"Cryptic Notes · {self.cn_map['name']}",
+            f"<@{self.leader_id}> wants to enter **{self.cn_map['name']}** as a group.",
+            section("Group", lines),
+            closing_note or small("Each player accepts for their own character"))
+        if not closing_note:
+            embed.set_footer(text=f"Expires in {config.CN_INVITE_TIMEOUT // 60} minutes · "
+                                  f"the leader can start early with everyone who accepted")
         return embed
 
     async def start(self, interaction):
@@ -650,18 +705,14 @@ class CNGroupView(discord.ui.View):
             return
         self.done = True
         self.stop()
-        embed = self.invite_embed()
-        embed.description += "\n\n**Cancelled by the leader.**"
-        embed.set_footer(text=None)
+        embed = self.invite_embed("**Cancelled by the leader.**")
         await interaction.response.edit_message(content=None, embed=embed, view=None)
 
     async def on_timeout(self):
         if self.done or not self.message:
             return
         self.done = True
-        embed = self.invite_embed()
-        embed.description += "\n\n**The invite expired.** Use /cnmatch again to try once more."
-        embed.set_footer(text=None)
+        embed = self.invite_embed("**The invite expired.** Use /cnmatch again to try once more.")
         try:
             await self.message.edit(content=None, embed=embed, view=None)
         except discord.HTTPException:
@@ -740,12 +791,11 @@ async def buy_item(interaction: discord.Interaction, name: str, items: str):
     if not success:
         await interaction.response.send_message(embed=error_embed(message))
         return
-    embed = success_embed("Purchase successful!",
-                          f"**{name}** purchased {format_items(purchased)} for {amount_text(currency, total_price)}!")
     total_items = sum(purchased.values())
-    if total_items > 1:
-        embed.add_field(name="Total Items", value=f"{total_items} items", inline=True)
-        embed.add_field(name="Total Cost", value=f"{total_price:,} {CURRENCIES[currency]['name']}", inline=True)
+    embed = success_embed("Purchase successful!",
+                          f"**{name}** purchased {format_items(purchased)} for {amount_text(currency, total_price)}!",
+                          small(f"{total_items} items", amount_text(currency, total_price, bold=False))
+                          if total_items > 1 else None)
     await interaction.response.send_message(embed=embed)
 
 
@@ -764,9 +814,8 @@ async def add_item(interaction: discord.Interaction, name: str, items: str):
     if not success:
         await interaction.response.send_message(embed=error_embed(message))
         return
-    embed = success_embed("Items added!", f"Added {format_items(added)} to **{name}**'s inventory!")
-    if sum(added.values()) > 1:
-        embed.add_field(name="Total Items Added", value=f"{sum(added.values())} items", inline=True)
+    embed = success_embed("Items added!", f"Added {format_items(added)} to **{name}**'s inventory!",
+                          _items_total_line(added, "added"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -784,9 +833,8 @@ async def remove_item(interaction: discord.Interaction, name: str, items: str):
     if not success:
         await interaction.response.send_message(embed=error_embed(message))
         return
-    embed = success_embed("Items removed!", f"Removed {format_items(removed)} from **{name}**'s inventory!")
-    if sum(removed.values()) > 1:
-        embed.add_field(name="Total Items Removed", value=f"{sum(removed.values())} items", inline=True)
+    embed = success_embed("Items removed!", f"Removed {format_items(removed)} from **{name}**'s inventory!",
+                          _items_total_line(removed, "removed"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -804,9 +852,7 @@ async def use_items(interaction: discord.Interaction, name: str, items: str):
     if not success:
         await interaction.response.send_message(embed=error_embed(message))
         return
-    embed = success_embed("Items used!", f"**{name}** used {format_items(used)}!")
-    if sum(used.values()) > 1:
-        embed.add_field(name="Total Items Used", value=f"{sum(used.values())} items", inline=True)
+    embed = success_embed("Items used!", f"**{name}** used {format_items(used)}!", _items_total_line(used, "used"))
     await interaction.response.send_message(embed=embed)
 
 
@@ -842,16 +888,15 @@ async def value_items(interaction: discord.Interaction, name: str, items: str):
         return
 
     main = CURRENCIES['main']
-    embed = discord.Embed(title=f"{main['emoji']} ┃ Item Values", description=f"**{name}**'s sellable items:",
-                          color=COLOR_DEFAULT)
-    for info in items_info[:23]:  # leave room for the total field (max 25 fields)
+    lines = []
+    for info in items_info[:60]:
+        qty = f" ×{info['quantity']}" if info['quantity'] > 1 else ""
         if info['sell_value'] == 0:
-            value_text = "❌ Not sellable"
+            lines.append(f"{info['name']}{qty} · *not sellable*")
         else:
-            value_text = (f"{main['emoji']} {info['sell_value']:,} {main['name']} each\n"
-                          f"**Total:** {info['total']:,} {main['name']} ({info['quantity']}x)")
-        embed.add_field(name=f"• {info['name']}", value=value_text, inline=False)
-    embed.add_field(name="━━━━━━━━━━━━━━", value=f"**Total Value:** {amount_text('main', total_value)}", inline=False)
+            lines.append(f"{info['name']}{qty} · {info['sell_value']:,} each")
+    embed = make_embed(main['emoji'], "Item Values", section(f"{name}'s items", lines),
+                       small(f"Total value: {amount_text('main', total_value, bold=False)}"))
     if "not found" in message.lower():
         embed.set_footer(text=f"⚠️ {message}")
     await interaction.response.send_message(embed=embed)
@@ -872,13 +917,10 @@ async def sell_items(interaction: discord.Interaction, name: str, items: str):
         await interaction.response.send_message(embed=error_embed(message))
         return
 
-    main_name = CURRENCIES['main']['name']
-    embed = success_embed("Items sold!", f"**{name}** earned {amount_text('main', total_earned)}!")
-    items_text = "\n".join(
-        f"• {i['name']} x{i['quantity']} → {i['sell_value']:,} {main_name} each = **{i['total']:,} {main_name}**"
-        for i in items_sold)
-    embed.add_field(name="Items Sold", value=items_text[:1024], inline=False)
-    embed.add_field(name="Total Earned", value=amount_text('main', total_earned), inline=False)
+    lines = [f"{i['name']} ×{i['quantity']} · {i['total']:,}" if i['quantity'] > 1 else f"{i['name']} · {i['total']:,}"
+             for i in items_sold[:60]]
+    embed = success_embed("Items sold!", f"**{name}** earned {amount_text('main', total_earned)}!",
+                          section("Sold", lines))
     if any(w in message.lower() for w in ("not found", "no value", "not enough")):
         embed.set_footer(text=f"⚠️ {message}")
     await interaction.response.send_message(embed=embed)
@@ -887,18 +929,18 @@ async def sell_items(interaction: discord.Interaction, name: str, items: str):
 # ==================== MINIGAMES ====================
 # One shared implementation; every entry in config.MINIGAMES becomes a command.
 
-def _add_xp_info(embed, xp_result):
-    if not xp_result:
-        return
-    if xp_result['leveled_up']:
-        bonus_gain = db.level_bonus(xp_result['new_level']) - db.level_bonus(xp_result['old_level'])
-        value = f"Level {xp_result['old_level']} → **Level {xp_result['new_level']}**"
-        if bonus_gain:
-            value += f"\n+{bonus_gain} roll bonus!"
-        embed.add_field(name=f"{EMOJI['level_up']} LEVEL UP!", value=value, inline=False)
-        embed.set_footer(text=f"Next level: {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
-    else:
-        embed.set_footer(text=f"Level {xp_result['new_level']} | XP: {xp_result['current_xp']}/{xp_result['xp_for_next']}")
+def _level_up_line(xp_result):
+    """'✨ **Level up!** 1 → 2 · +1 roll bonus' or '' when there was no level-up."""
+    if not xp_result or not xp_result['leveled_up']:
+        return ""
+    bonus_gain = db.level_bonus(xp_result['new_level']) - db.level_bonus(xp_result['old_level'])
+    return (f"{EMOJI['level_up']} **Level up!** {xp_result['old_level']} → {xp_result['new_level']}"
+            + (f" · +{bonus_gain} roll bonus" if bonus_gain else ""))
+
+
+def _xp_footer(embed, xp_result):
+    if xp_result:
+        embed.set_footer(text=f"Level {xp_result['new_level']} · {xp_result['current_xp']}/{xp_result['xp_for_next']} XP")
 
 
 class MinigameView(discord.ui.View):
@@ -923,9 +965,6 @@ class MinigameView(discord.ui.View):
             ephemeral=True)
         return False
 
-    def _title(self, text):
-        return f"{self.cfg['emoji']} ┃ {text}"
-
     async def _finish(self, interaction, embed):
         self.stop()  # ignore further clicks
         for item in self.children:
@@ -942,19 +981,18 @@ class MinigameView(discord.ui.View):
 
         if success:
             db.add_minigame_item(self.character_name, self.item_name)
-            embed = discord.Embed(title=self._title(self.cfg['success_title']),
-                                  description=f"{roll_text}\n\n{self.cfg['success_text'].format(item=self.item_name)}",
-                                  color=COLOR_DEFAULT)
-            embed.add_field(name="Obtained", value=f"**{self.item_name}**", inline=True)
+            title, text, color = (self.cfg['success_title'], self.cfg['success_text'].format(item=self.item_name),
+                                  COLOR_DEFAULT)
+            result_text = f"Obtained **{self.item_name}**"
         else:
             xp_reward //= 4
-            embed = discord.Embed(title=self._title(self.cfg['fail_title']),
-                                  description=f"{roll_text}\n\n{self.fail_message}", color=COLOR_ERROR)
-            embed.add_field(name="Result", value="No item obtained", inline=True)
+            title, text, color = self.cfg['fail_title'], self.fail_message, COLOR_ERROR
+            result_text = "No item obtained"
 
         xp_result = db.add_xp(self.character_name, xp_reward, self.game)
-        embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
-        _add_xp_info(embed, xp_result)
+        embed = make_embed(self.cfg['emoji'], title, roll_text, text,
+                           small(result_text, f"+{xp_reward} XP"), _level_up_line(xp_result), color=color)
+        _xp_footer(embed, xp_result)
         await self._finish(interaction, embed)
 
     @discord.ui.button(label="Leave It", style=discord.ButtonStyle.gray)
@@ -962,11 +1000,9 @@ class MinigameView(discord.ui.View):
         xp_reward = config.MINIGAME_XP_LEAVE
         xp_result = db.add_xp(self.character_name, xp_reward, self.game)
         leave_text = self.cfg['leave_text'].format(name=self.character_name, item=self.item_name)
-        embed = discord.Embed(title=self._title(self.cfg['leave_title']),
-                              description=f"{leave_text}\n\n{self.flee_message}", color=COLOR_DEFAULT)
-        embed.add_field(name="Result", value="No item obtained", inline=True)
-        embed.add_field(name="XP Gained", value=f"+{xp_reward} XP", inline=True)
-        _add_xp_info(embed, xp_result)
+        embed = make_embed(self.cfg['emoji'], self.cfg['leave_title'], leave_text, self.flee_message,
+                           small("No item obtained", f"+{xp_reward} XP"), _level_up_line(xp_result))
+        _xp_footer(embed, xp_result)
         await self._finish(interaction, embed)
 
 
@@ -979,18 +1015,16 @@ async def run_minigame(interaction, name, game):
         await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
         return
 
-    embed = discord.Embed(title=f"{cfg['emoji']} ┃ {cfg['label']}", description=result['description'],
-                          color=COLOR_DEFAULT)
     item_name = result['item']
     if not item_name:
-        await interaction.response.send_message(embed=embed)
+        await interaction.response.send_message(embed=make_embed(cfg['emoji'], cfg['label'], result['description']))
         return
 
     profile = db.get_profile(name)
     level = profile[f"{game}_level"] if profile else 1
-    embed.add_field(name=cfg['found_field'], value=f"**{item_name}**", inline=True)
-    embed.add_field(name="Difficulty", value=f"**{result['difficulty']}**", inline=True)
-    embed.set_footer(text=f"{name} (Level {level})")
+    embed = make_embed(cfg['emoji'], cfg['label'], result['description'],
+                       small(f"{cfg['found_field']} **{item_name}**", f"Difficulty **{result['difficulty']}**"))
+    embed.set_footer(text=f"{profile['name'] if profile else name} · Level {level}")
     await interaction.response.send_message(embed=embed, view=MinigameView(game, name, item_name, result, interaction.user.id))
 
 
@@ -1025,22 +1059,18 @@ def _roll_dice(expr):
 async def roll_dice(interaction: discord.Interaction, dice: str):
     result = _roll_dice(dice)
     if result is None:
-        await interaction.response.send_message("Invalid dice format! Use format like: 1d20, 2d6, or 1d20+5")
+        await interaction.response.send_message(
+            embed=error_embed("Invalid dice format!", "Error!", small("Use e.g. 1d20, 2d6 or 1d20+5")), ephemeral=True)
         return
     if result == "too_big":
-        await interaction.response.send_message("Too many dice or sides! Keep it reasonable.")
+        await interaction.response.send_message(
+            embed=error_embed("Too many dice or sides! Keep it reasonable."), ephemeral=True)
         return
     rolls, modifier, total = result
-    embed = discord.Embed(title=f"{EMOJI['dice']} ┃ Roll", color=COLOR_DEFAULT)
+    detail = dice.lower().strip()
     if len(rolls) > 1 or modifier != 0:
-        modifier_str = f" {modifier:+d}" if modifier else ""
-        embed.add_field(name="Result:", value=f"**{total}**", inline=False)
-        embed.add_field(name="", value=f"-# Rolling {dice.lower()}\n-# Rolls: {', '.join(map(str, rolls))}{modifier_str}",
-                        inline=False)
-    else:
-        embed.add_field(name="Result:", value=f"**{rolls[0]}**", inline=False)
-        embed.add_field(name="", value=f"-# Rolling {dice.lower()}", inline=False)
-    await interaction.response.send_message(embed=embed)
+        detail += f" · rolls {', '.join(map(str, rolls))}" + (f" {modifier:+d}" if modifier else "")
+    await interaction.response.send_message(embed=make_embed(EMOJI['dice'], "Roll", f"**{total}**\n{small(detail)}"))
 
 
 @bot.tree.command(name="choose", description="Pick a random option from a list")
@@ -1048,10 +1078,10 @@ async def roll_dice(interaction: discord.Interaction, dice: str):
 async def choose(interaction: discord.Interaction, options: str):
     choices = [choice.strip() for choice in options.split(',') if choice.strip()]
     if len(choices) < 2:
-        await interaction.response.send_message("Please provide at least 2 options separated by commas!")
+        await interaction.response.send_message(
+            embed=error_embed("Please give at least 2 options, separated by commas!"), ephemeral=True)
         return
-    embed = discord.Embed(title=f"{EMOJI['choose']} ┃ Random Choice",
-                          description=f"I choose: **{random.choice(choices)}**", color=COLOR_DEFAULT)
+    embed = make_embed(EMOJI['choose'], "Random Choice", f"I choose: **{random.choice(choices)}**")
     embed.set_footer(text=f"Options: {', '.join(choices)}"[:2048])
     await interaction.response.send_message(embed=embed)
 
@@ -1065,49 +1095,46 @@ async def location(interaction: discord.Interaction, name: str):
     if not profile:
         await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
         return
-    embed = discord.Embed(title=f"{EMOJI['location']} ┃ Location",
-                          description=f"**{profile['name']}** sets off and arrives at **{db.get_random_location()}**.",
-                          color=COLOR_DEFAULT)
+    embed = make_embed(EMOJI['location'], "Location",
+                       f"**{profile['name']}** sets off and arrives at **{db.get_random_location()}**.")
     await interaction.response.send_message(embed=embed)
 
 
 @bot.tree.command(name="help", description="Show all available commands")
 async def help_command(interaction: discord.Interaction):
     roles = " / ".join(config.ROLES)
-    embed = discord.Embed(title=f"{EMOJI['profile']} ┃ Bot Commands Help",
-                          description="Here are all available commands for the bot:", color=COLOR_DEFAULT)
-    embed.add_field(name=".✦  Profile Management", value=(
-        f"`/create [name] [role]` - Create a new character ({roles})\n"
-        "`/profile [name]` - View character profile and inventory\n"
-        "`/list` - Show all your character profiles\n"
-        "`/editname [name] [new_name]` - Change character name\n"
-        "`/editrole [name] [new_role]` - Change character role\n"
-        "`/deleteprofile [name]` - Delete a character profile\n"
-        "`/claim [name]` - Claim an unowned character"), inline=False)
-    embed.add_field(name=".✦  Currency", value=(
-        f"`/addcurrency` / `/removecurrency` - [Admin] Add or remove {MAIN_NAME} or {PREMIUM_NAME}\n"
-        "`/givecurrency` - Give currency to another character\n"
-        f"`/exchange` - Exchange {MAIN_NAME} and {PREMIUM_NAME}"), inline=False)
-    embed.add_field(name=".✦  Inventory & Shop", value=(
-        "`/buy [name] [items]` - Buy items (e.g. `Lantern:2, Bandage`)\n"
-        "`/additem` / `/removeitem` - Add or remove items\n"
-        "`/use [name] [items]` - Use items\n"
-        "`/giveitem` - Give items to another character\n"
-        f"`/value` / `/sell` - Check value of / sell items for {MAIN_NAME}"), inline=False)
-    minigame_lines = "\n".join(f"`/{game} [name]` - {cfg['command_description']}" for game, cfg in MINIGAMES.items())
-    embed.add_field(name=".✦  Gameplay", value=(
-        "`/match [name]` - Play a match and earn rewards\n"
-        "`/matchreward [name] [count]` - Rewards for escapes / eliminations\n"
-        "`/cnmatch [location] [character]` - Cryptic Notes run, alone or in a group of up to 4\n"
-        f"{minigame_lines}\n"
-        "`/location [name]` - Travel to a random location"), inline=False)
-    embed.add_field(name=".✦  Utility", value=(
-        "`/roll [dice]` - Roll dice (e.g., 1d20, 2d6+3)\n"
-        "`/choose [options]` - Pick a random option from a comma-separated list"), inline=False)
-    embed.add_field(name=".✦  Reservations", value=(
-        f"`/reserve [character]` - Request a roster character (in <#{config.RESERVE_CHANNEL_ID}>)\n"
-        "`/myreservations` - Your reservations, requests and characters"), inline=False)
-    embed.set_footer(text="💡 Tip: Use /profile to see your inventory organized by categories!")
+    minigame_lines = [f"`/{game}` · {cfg['command_description']}" for game, cfg in MINIGAMES.items()]
+    embed = make_embed(
+        EMOJI['profile'], "Commands",
+        section("Profile", [
+            f"`/create` · New character ({roles})",
+            "`/profile` · Profile and inventory",
+            "`/list` · All your characters",
+            "`/editname` · `/editrole` · Change name or role",
+            "`/deleteprofile` · Delete a character",
+            "`/claim` · Claim an unowned character"]),
+        section("Currency", [
+            "`/givecurrency` · Give currency to another character",
+            f"`/exchange` · Swap {MAIN_NAME} and {PREMIUM_NAME}"]),
+        section("Inventory", [
+            "`/buy` · Buy items, e.g. `Lantern:2, Bandage`",
+            "`/additem` · `/removeitem` · Add or remove items",
+            "`/use` · Use items",
+            "`/giveitem` · Give items to another character",
+            f"`/value` · `/sell` · Check or sell items for {MAIN_NAME}"]),
+        section("Gameplay", [
+            "`/match` · Play a match",
+            "`/matchreward` · Rewards for escapes or eliminations",
+            "`/cnmatch` · Cryptic Notes, alone or in a group of up to 4",
+            *minigame_lines,
+            "`/location` · Travel somewhere random"]),
+        section("Utility", [
+            "`/roll` · Roll dice, e.g. `1d20`, `2d6+3`",
+            "`/choose` · Pick one of several options"]),
+        section("Reservations", [
+            f"`/reserve` · Request a roster character in <#{config.RESERVE_CHANNEL_ID}>",
+            "`/myreservations` · Your reservations and characters"]))
+    embed.set_footer(text="Staff and admin commands are marked [STAFF] / [ADMIN] when you type /")
     await interaction.response.send_message(embed=embed)
 
 
@@ -1117,9 +1144,7 @@ async def help_command(interaction: discord.Interaction):
 async def restart_bot(interaction: discord.Interaction):
     if not await require_admin(interaction):
         return
-    embed = discord.Embed(title="🔄 ┃ Restarting...",
-                          description="Restarting the bot now. It should be back in a few seconds.",
-                          color=COLOR_DEFAULT)
+    embed = make_embed("🔄", "Restarting...", "Restarting the bot now. It should be back in a few seconds.")
     await interaction.response.send_message(embed=embed)
     print(f"[RESTART] Triggered by {interaction.user} ({interaction.user.id})")
     await bot.close()
@@ -1292,7 +1317,10 @@ async def close_staff_message(interaction, decision_text, color):
     if interaction.message and interaction.message.embeds:
         embed = interaction.message.embeds[0]
         embed.color = color
-        embed.add_field(name="Decision", value=decision_text, inline=False)
+        if embed.fields:  # request posted before the new layout: keep its old look
+            embed.add_field(name="Decision", value=decision_text, inline=False)
+        else:
+            add_block(embed, decision_text)
         await interaction.response.edit_message(embed=embed, view=None)
     else:
         await interaction.response.send_message(decision_text, ephemeral=True)
@@ -1323,9 +1351,8 @@ async def handle_approve(interaction, reservation_id, days):
         linked = linked_identity(info['roster_id'])
         if linked:
             description += f"\nThis includes the linked identity **{linked['display']}**."
-        embed = discord.Embed(title=f"📅 ┃ Reservation {'Extended' if is_extension else 'Confirmed'}",
-                              description=description, color=COLOR_DEFAULT)
-        embed.add_field(name="Expires", value=f"<t:{expires}:F> ┃ <t:{expires}:R>", inline=False)
+        embed = make_embed("📅", f"Reservation {'Extended' if is_extension else 'Confirmed'}", description,
+                           small(f"Expires <t:{expires}:F>", f"<t:{expires}:R>"))
         embed.set_footer(text=f"Reservation #{reservation_id}")
         sent = await channel.send(content=f"<@{info['user_id']}>", embed=embed)
         if not is_extension:
@@ -1352,8 +1379,8 @@ async def handle_deny(interaction, reservation_id, reason):
                     f"The reservation still runs out <t:{info['expires_at']}:R>.")
         else:
             text = f"Your reservation request for **{info['title']}** was not approved."
-        embed = discord.Embed(title=f"{EMOJI['error']} ┃ {'Extension' if is_extension else 'Request'} Denied",
-                              description=text + reason_text, color=COLOR_ERROR)
+        embed = error_embed(text, f"{'Extension' if is_extension else 'Request'} Denied",
+                            f"**Reason:** {reason}" if reason else None)
         await channel.send(content=f"<@{info['user_id']}>", embed=embed)
 
 
@@ -1367,11 +1394,9 @@ async def handle_extend_click(interaction, reservation_id):
 
     staff_channel = await resolve_channel(config.STAFF_CHANNEL_ID)
     if staff_channel:
-        embed = discord.Embed(title="🔁 ┃ Extension Request",
-                              description=f"<@{info['user_id']}> would like to extend **{info['title']}**.",
-                              color=COLOR_DEFAULT)
-        embed.add_field(name="Currently expires",
-                        value=f"<t:{info['expires_at']}:F> ┃ <t:{info['expires_at']}:R>", inline=False)
+        embed = make_embed("🔁", "Extension Request",
+                           f"<@{info['user_id']}> would like to extend **{info['title']}**.",
+                           small(f"Currently expires <t:{info['expires_at']}:F>", f"<t:{info['expires_at']}:R>"))
         embed.set_footer(text=f"Reservation #{reservation_id}")
         sent = await staff_channel.send(embed=embed, view=request_view(reservation_id))
         db.set_request_message(reservation_id, sent.id)
@@ -1510,17 +1535,14 @@ async def reserve(interaction: discord.Interaction, character: str,
         return
 
     active = len(db.get_member_reservations(interaction.user.id)['active'])
-    embed = discord.Embed(title="📨 ┃ Reservation Request", color=COLOR_DEFAULT)
-    embed.add_field(name="Member", value=f"{interaction.user.mention} ({interaction.user.display_name})", inline=False)
-    embed.add_field(name="Character", value=f"**{found['display']}** ({found['role']})", inline=False)
     linked = linked_identity(found['id'])
-    if linked:
-        embed.add_field(name="Linked identity (included)", value=f"**{linked['display']}** ({linked['role']})",
-                        inline=False)
-    if note:
-        embed.add_field(name="Note", value=note[:1024], inline=False)
-    embed.add_field(name="Active reservations",
-                    value=f"{active}/{config.MAX_RESERVATIONS_PER_MEMBER}", inline=False)
+    embed = make_embed(
+        "📨", "Reservation Request",
+        f"{interaction.user.mention} ({interaction.user.display_name}) requests "
+        f"**{found['display']}** ({found['role']})",
+        small(f"Linked: {linked['display']} ({linked['role']}), included" if linked else "",
+              f"{active}/{config.MAX_RESERVATIONS_PER_MEMBER} active reservations"),
+        f"*{note[:1500]}*" if note else None)
     embed.set_footer(text=f"Request #{reservation_id}")
     sent = await staff_channel.send(embed=embed, view=request_view(reservation_id))
     db.set_request_message(reservation_id, sent.id)
@@ -1535,15 +1557,14 @@ async def reserve(interaction: discord.Interaction, character: str,
 @bot.tree.command(name="myreservations", description="Show your reservations and characters")
 async def my_reservations(interaction: discord.Interaction):
     data = db.get_member_reservations(interaction.user.id)
-    embed = discord.Embed(title="📅 ┃ Your Reservations", color=COLOR_DEFAULT)
-    embed.add_field(name="Active", inline=False, value="\n".join(
-        f"• **{r['title']}** – expires <t:{r['expires_at']}:F> (<t:{r['expires_at']}:R>)"
-        + (" · extension requested" if r['extension_pending'] else "")
-        for r in data['active']) or "None")
-    embed.add_field(name="Waiting for staff", inline=False,
-                    value="\n".join(f"• **{r['title']}**" for r in data['pending']) or "None")
-    embed.add_field(name="Your characters", inline=False,
-                    value="\n".join(f"• **{c['display']}**" for c in data['taken']) or "None")
+    embed = make_embed(
+        "📅", "Your Reservations",
+        section("Active", [f"**{r['title']}** · expires <t:{r['expires_at']}:R>"
+                           + (" · extension requested" if r['extension_pending'] else "")
+                           for r in data['active']] or ["*None*"]),
+        section("Waiting for staff", [f"**{r['title']}**" for r in data['pending']] or ["*None*"]),
+        section("Your characters", [f"**{c['display']}**" for c in data['taken']] or ["*None*"]))
+    embed.description = embed.description[:4096]
     embed.set_footer(text=f"You can have up to {config.MAX_RESERVATIONS_PER_MEMBER} reservations at a time.")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -1663,12 +1684,10 @@ async def on_member_remove(member):
         staff_channel = await resolve_channel(config.STAFF_CHANNEL_ID)
         if not staff_channel:
             return
-        lines = [f"• **{c['display']}** ({c['status']})" for c in characters]
-        lines += [f"• **{r['title']}** (request waiting for staff)" for r in pending]
-        embed = discord.Embed(title="👋 ┃ Member Left",
-                              description=f"**{member}** ({member.mention}) left the server. They had:\n"
-                                          + "\n".join(lines),
-                              color=COLOR_ERROR)
+        lines = [f"**{c['display']}** · {c['status']}" for c in characters]
+        lines += [f"**{r['title']}** · request waiting for staff" for r in pending]
+        embed = make_embed("👋", "Member Left", f"**{member}** ({member.mention}) left the server.",
+                           section("They had", lines), color=COLOR_ERROR)
         embed.set_footer(text="Nothing was changed. Use the button to free their characters.")
         view = discord.ui.View(timeout=None)
         view.add_item(ReleasePlayerButton(member.id))
@@ -1740,11 +1759,9 @@ async def check_reservations():
         try:
             channel = await resolve_channel(int(info['channel_id']))
             if channel:
-                embed = discord.Embed(
-                    title="⏳ ┃ Reservation Ending Soon",
-                    description=(f"Your reservation for **{info['title']}** runs out <t:{info['expires_at']}:R>.\n"
-                                 f"Need more time? Click **Extend** to ask staff."),
-                    color=COLOR_DEFAULT)
+                embed = make_embed("⏳", "Reservation Ending Soon",
+                                   f"Your reservation for **{info['title']}** runs out <t:{info['expires_at']}:R>.",
+                                   small("Need more time? Click Extend to ask staff"))
                 view = discord.ui.View(timeout=None)
                 view.add_item(ReservationButton('extend', info['id']))
                 message_id = (await channel.send(content=f"<@{info['user_id']}>", embed=embed, view=view)).id
@@ -1770,10 +1787,8 @@ async def check_reservations():
                     await channel.get_partial_message(int(info['reminder_message_id'])).edit(view=None)
                 except discord.HTTPException:
                     pass
-            text = f"Your reservation for **{info['title'] or ''}** has run out."
-            if is_roster:
-                text += " The character is free again."
-            embed = discord.Embed(title=f"{EMOJI['error']} ┃ Reservation Expired", description=text, color=COLOR_ERROR)
+            embed = error_embed(f"Your reservation for **{info['title'] or ''}** has run out.", "Reservation Expired",
+                                small("The character is free again") if is_roster else None)
             await channel.send(content=f"<@{info['user_id']}>", embed=embed)
         except Exception as e:
             print(f"Failed to send reservation expiry notice for #{info['id']}: {e}")

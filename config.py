@@ -273,6 +273,11 @@ EMOJI = {
     "Survivor": "🏃",
 }
 
+# Between the emoji and the text in every embed title: "⭐  .  Norton"
+TITLE_SEP = "  .  "
+# Label above lists in bot messages ("˖ Rewards"). {name} is replaced by the label.
+SECTION_STYLE = "˖ {name}"
+
 COLOR_DEFAULT = (0, 0, 0)       # Normal embeds
 COLOR_ERROR = (116, 7, 14)      # Errors / failures
 
