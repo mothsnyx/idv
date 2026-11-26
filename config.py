@@ -279,7 +279,7 @@ TITLE_SEP = "  .  "
 SECTION_STYLE = "˖ {name}"
 
 COLOR_DEFAULT = (0, 0, 0)       # Normal embeds
-COLOR_ERROR = (116, 7, 14)      # Errors / failures
+COLOR_ERROR = (0, 0, 0)         # Errors / failures
 
 # Bot status, rotated every few hours
 STATUS_ROTATION_HOURS = 3

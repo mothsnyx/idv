@@ -306,15 +306,16 @@ class ProfileView(discord.ui.View):
         p = self.profile_data
         if self.current_page == 0:
             currency = "\n".join(f"{INDENT}{c['emoji']}　**{p[key]:,}** {c['name']}" for key, c in CURRENCIES.items())
-            levels = "\n".join(
+            levels = "\n\n".join(  # an empty line between the minigames
                 f"{INDENT}{cfg['emoji']}　{cfg['label']} · **Lv. {p[f'{game}_level']}**\n"
                 f"{INDENT}{_progress_bar(p[f'{game}_level'], p[f'{game}_xp'])}　"
                 f"{p[f'{game}_xp']}/{p[f'{game}_level'] * 100} XP"
                 for game, cfg in MINIGAMES.items())
+            # The profile uses plain "Role:" labels instead of SECTION_STYLE
             return make_embed(EMOJI['profile'], p['name'],
-                              section("Role", f"{INDENT}{p['role']}"),
-                              section("Currency", currency),
-                              section("Levels", levels) if levels else None)
+                              f"Role:\n{INDENT}{p['role']}",
+                              f"Currency:\n{currency}",
+                              f"Levels:\n{levels}" if levels else None)
 
         inventory_emoji = EMOJI.get('inventory', '🎒')
         if not self.items:
