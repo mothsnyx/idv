@@ -191,14 +191,14 @@ CN_RESPAWN_TEXT = "No items were kept. Wakes up in the Manor's infirmary."
 # (the tier emojis are in CN_TIERS above)
 CN_EMOJI = "📜"                      # title of every /cnmatch message
 CN_ICONS = {
-    "survived": "✅",               # group result: character made it out
+    "survived": "<:6yes:1575234590149447790>",               # group result: character made it out
     "died": "☠️",                    # character died
     "exhausted": "⚠️",               # exhaustion warning
     "danger_full": "▰",             # danger bar: filled part ...
     "danger_empty": "▱",            # ... and empty part (5 symbols in total)
     "leader": "👑",                 # group invite: leader
-    "accepted": "✅",               # group invite: accepted
-    "declined": "❌",               # group invite: declined
+    "accepted": "<:6yes:1575234590149447790>",               # group invite: accepted
+    "declined": "<:no:1575234605059932301>",               # group invite: declined
     "pending": "⏳",                # group invite: no answer yet
 }
 
@@ -260,8 +260,8 @@ INVENTORY_ITEMS_PER_PAGE = 15       # /profile inventory: items per page before 
 # (type \:emoji_name: in Discord to get it; animated ones start with <a:).
 
 EMOJI = {
-    "success": "✅",
-    "error": "❌",
+    "success": "<:6yes:1575234590149447790>",
+    "error": "<:no:1575234605059932301>",
     "profile": "⭐",
     "inventory": "🎒",
     "match": "⚔️",
