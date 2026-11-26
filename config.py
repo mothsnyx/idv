@@ -152,19 +152,14 @@ CN_MAPS = {
 # weight = how often the tier is picked. value = only a suggestion, pre-filled when an
 # imported line has no price; every classic's real sell value is set on the dashboard.
 CN_TIERS = {
-    "B":  {"label": "B-Tier Classic",    "weight": 55, "value": 150,  "emoji": "⚪"},
-    "A":  {"label": "A-Tier Classic",    "weight": 28, "value": 400,  "emoji": "🔵"},
-    "S":  {"label": "S-Tier Classic",    "weight": 13, "value": 1000, "emoji": "🟣"},
-    "EX": {"label": "Exquisite Classic", "weight": 4,  "value": 3000, "emoji": "🟡"},
+    "B":  {"label": "B-Tier Classic",    "weight": 55, "value": 150,  "emoji": "<:btier:1575497460078608384>"},
+    "A":  {"label": "A-Tier Classic",    "weight": 28, "value": 400,  "emoji": "<:atier:1575497461810724894>"},
+    "S":  {"label": "S-Tier Classic",    "weight": 13, "value": 1000, "emoji": "<:stier:1575497458274930708>"},
+    "EX": {"label": "Exquisite Classic", "weight": 4,  "value": 3000, "emoji": "<:exquisite:1575497456408596610>"},
 }
 
-# Chance (%) that an anomaly kills you, by its danger level (1 = weak, 5 = deadliest).
-# With several anomalies, each one rolls on its own; the first that hits is the killer.
+# Chance (%) that the anomaly you run into kills you, by its danger level (1 = weak, 5 = deadliest)
 CN_DANGER_KILL_CHANCE = {1: 3, 2: 6, 3: 10, 4: 15, 5: 22}
-
-# How many anomalies appear in one match: {count: weight}. The whole group meets the same ones.
-# (Never more than the map has.)
-CN_ANOMALY_COUNT_WEIGHTS = {1: 50, 2: 35, 3: 15}
 
 # How many classics a surviving character finds (1-9): weights, 5-6 most common
 CN_ITEM_COUNT_WEIGHTS = {1: 2, 2: 4, 3: 7, 4: 12, 5: 20, 6: 20, 7: 15, 8: 11, 9: 9}
@@ -187,24 +182,24 @@ CN_OUTCOMES = {
     "barely": "Barely made quota (1-3 items)",
     "normal": "Made quota",
     "great": "Big haul (7+ items or 2+ S-Tier/Exquisite)",
-    "death_anomaly": "Killed by an anomaly",
+    "death_anomaly": "Killed by the anomaly",
     "death_other": "Died another way (quota not met, fall, ...)",
 }
 CN_RESPAWN_TEXT = "No items were kept. Wakes up in the Manor's infirmary."
 
 # Cryptic Notes emojis: replace any value with a custom emoji, e.g. "<:skull:123456789012345678>"
 # (the tier emojis are in CN_TIERS above)
-CN_EMOJI = "📜"                      # title of every /cnmatch message
+CN_EMOJI = "<a:book_pages:1575444097081286716>"                      # title of every /cnmatch message
 CN_ICONS = {
     "survived": "<:6yes:1575234590149447790>",               # group result: character made it out
-    "died": "☠️",                    # character died
-    "exhausted": "⚠️",               # exhaustion warning
+    "died": "<:dead:1575494719083909120>",                    # character died
+    "exhausted": "<a:warning:1575442604840194128>",               # exhaustion warning
     "danger_full": "▰",             # danger bar: filled part ...
     "danger_empty": "▱",            # ... and empty part (5 symbols in total)
-    "leader": "👑",                 # group invite: leader
+    "leader": "<:leader:1575454587152896083>",                 # group invite: leader
     "accepted": "<:6yes:1575234590149447790>",               # group invite: accepted
     "declined": "<:no:1575234605059932301>",               # group invite: declined
-    "pending": "⏳",                # group invite: no answer yet
+    "pending": "<a:268692hourglassnotdone:1575448925261922314>",                # group invite: no answer yet
 }
 
 # ==================== MINIGAMES ====================
@@ -216,7 +211,7 @@ MINIGAMES = {
     "scavenging": {
         "label": "Scavenging",
         "command_description": "Go scavenging for useful items!",
-        "emoji": "🧰",
+        "emoji": "<:scavenging:1575490142141939743>",
         "dashboard_icon": "bi-search",
         "found_field": "Found",
         "attempt_button": "Retrieve Item",
@@ -232,7 +227,7 @@ MINIGAMES = {
     "foraging": {
         "label": "Foraging",
         "command_description": "Go foraging for plants and natural resources!",
-        "emoji": "🌿",
+        "emoji": "<:foraging:1575490140552568884>",
         "dashboard_icon": "bi-flower1",
         "found_field": "Spotted",
         "attempt_button": "Gather",
@@ -267,15 +262,15 @@ INVENTORY_ITEMS_PER_PAGE = 15       # /profile inventory: items per page before 
 EMOJI = {
     "success": "<:6yes:1575234590149447790>",
     "error": "<:no:1575234605059932301>",
-    "profile": "⭐",
-    "inventory": "🎒",
-    "match": "⚔️",
-    "dice": "🎲",
-    "choose": "🎯",
-    "location": "🗺️",
-    "level_up": "⬆️",
-    "Hunter": "🗡️",
-    "Survivor": "🏃",
+    "profile": "<:home:1575499316120789062>",
+    "inventory": "<:inv:1575499317668479158>",
+    "match": "<:match:1575494717460844544>",
+    "dice": "<a:dice:1575495465435271220>",
+    "choose": "<:misc:1575496423128965250>",
+    "location": "<:misc:1575496423128965250>",
+    "level_up": "<:lvlup:1575498795511455784>",
+    "Hunter": "<:misc:1575496423128965250>",
+    "Survivor": "<:misc:1575496423128965250>",
 }
 
 # Between the emoji and the text in every embed title: "⭐  .  Norton"
@@ -291,7 +286,6 @@ STATUS_ROTATION_HOURS = 3
 STATUS_MESSAGES = [
     ("watching", "/help | Watching the matches unfold"),
     ("watching", "/help | Watching survivors decode ciphers"),
-    ("watching", "/help | Watching hunters stalk the manor"),
     ("playing", "/help | Playing with the survivors' hope"),
     ("watching", "/help | Watching the manor's secrets unravel"),
     ("playing", "/help | Playing an endless game of chase"),
