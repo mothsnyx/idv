@@ -158,8 +158,13 @@ CN_TIERS = {
     "EX": {"label": "Exquisite Classic", "weight": 4,  "value": 3000, "emoji": "🟡"},
 }
 
-# Chance (%) that the anomaly you run into kills you, by its danger level (1 = weak, 5 = deadliest)
+# Chance (%) that an anomaly kills you, by its danger level (1 = weak, 5 = deadliest).
+# With several anomalies, each one rolls on its own; the first that hits is the killer.
 CN_DANGER_KILL_CHANCE = {1: 3, 2: 6, 3: 10, 4: 15, 5: 22}
+
+# How many anomalies appear in one match: {count: weight}. The whole group meets the same ones.
+# (Never more than the map has.)
+CN_ANOMALY_COUNT_WEIGHTS = {1: 50, 2: 35, 3: 15}
 
 # How many classics a surviving character finds (1-9): weights, 5-6 most common
 CN_ITEM_COUNT_WEIGHTS = {1: 2, 2: 4, 3: 7, 4: 12, 5: 20, 6: 20, 7: 15, 8: 11, 9: 9}
@@ -182,7 +187,7 @@ CN_OUTCOMES = {
     "barely": "Barely made quota (1-3 items)",
     "normal": "Made quota",
     "great": "Big haul (7+ items or 2+ S-Tier/Exquisite)",
-    "death_anomaly": "Killed by the anomaly",
+    "death_anomaly": "Killed by an anomaly",
     "death_other": "Died another way (quota not met, fall, ...)",
 }
 CN_RESPAWN_TEXT = "No items were kept. Wakes up in the Manor's infirmary."

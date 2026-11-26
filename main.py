@@ -95,6 +95,13 @@ def add_block(embed, block):
     return embed
 
 
+def quote(text):
+    """Discord quote block (grey bar on the left) around every line of the text."""
+    if not text or not text.strip():
+        return ""
+    return "\n".join(f"> {line}" if line.strip() else ">" for line in text.strip().split("\n"))
+
+
 def rewards_block(heading, amounts):
     """A result line with the amounts indented underneath, one per line:
     'Escaped' / '⠀⠀🔍 1,000 Clues' / '⠀⠀🔔 2 Echoes'."""
@@ -590,54 +597,89 @@ def _cn_exhaustion_text(result):
     return text
 
 
-def _cn_outcome_blocks(r, story_limit=None, group=False):
-    """The blocks under one character: story, loot (+ rewards) or death, exhaustion."""
-    story = r['message'] if not story_limit or len(r['message']) <= story_limit else r['message'][:story_limit] + "…"
+def _cn_headline(r):
+    """'Big haul' / 'Killed by the Wraith' / "Didn't make it"."""
+    if r['outcome'] == 'death_anomaly' and r.get('killer'):
+        return f"Killed by the {r['killer']}"
+    return CN_SHORT[r['outcome']]
+
+
+def _cn_anomaly_line(anomalies):
+    """'-# Anomalies: Wraith ▰▰▰▱▱ · Shade ▰▱▱▱▱'"""
+    if not anomalies:
+        return ""
+    icons = config.CN_ICONS
+    parts = [f"{a['name']} {icons['danger_full'] * a['danger']}{icons['danger_empty'] * (5 - a['danger'])}"
+             for a in anomalies]
+    return small(f"{'Anomaly' if len(anomalies) == 1 else 'Anomalies'}: {parts[0]}", *parts[1:])
+
+
+def _cn_shorten(text, limit):
+    return text if not limit or len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def _cn_solo_blocks(r):
+    """Solo result: story, then loot with the rewards underneath (or the death), then exhaustion."""
     icons = config.CN_ICONS
     if r['died']:
-        return [story, f"{icons['died']} **{CN_SHORT[r['outcome']]}**\n{config.CN_RESPAWN_TEXT}",
-                _cn_exhaustion_text(r)]
+        outcome = f"{icons['died']} **{_cn_headline(r)}**\n{small(config.CN_RESPAWN_TEXT)}"
+        return [r['message'], outcome, _cn_exhaustion_text(r)]
     loot = section(f"Classics found ({len(r['items'])})", _cn_item_lines(r))
-    # In a group the outcome is already in the character's header line
-    rewards = _cn_value_block(r, "Rewards" if group else f"{icons['survived']} **{CN_SHORT[r['outcome']]}**")
-    return [story, loot, rewards, _cn_exhaustion_text(r)]
+    rewards = _cn_value_block(r, f"{icons['survived']} **{_cn_headline(r)}**")
+    return [r['message'], loot, rewards, _cn_exhaustion_text(r)]
+
+
+def _cn_card(r, story_limit=None):
+    """Group result: one card (embed) per character."""
+    icons = config.CN_ICONS
+    story = _cn_shorten(r['message'], story_limit)
+    if r['died']:
+        blocks = [story, small(config.CN_RESPAWN_TEXT)]
+        icon, color = icons['died'], COLOR_ERROR
+    else:
+        loot = rewards_block("\n".join(_cn_item_lines(r)), [
+            f"{amount_text('main', r['total_value'])} in classics",
+            f"{amount_text('main', r['reward'])} survival bonus" if r['reward'] else ""])
+        blocks = [story, loot]
+        icon, color = icons['survived'], COLOR_DEFAULT
+    return make_embed(icon, f"{r['character']} · {_cn_headline(r)}", *blocks, _cn_exhaustion_text(r), color=color)
+
+
+def _embeds_length(embeds):
+    return sum(len(e.title or "") + len(e.description or "") + len((e.footer.text if e.footer else None) or "")
+               for e in embeds)
 
 
 def run_cn_group(cn_map, names):
-    """Run Cryptic Notes for one or more characters (same anomaly for everyone) and build the result embed."""
-    anomaly = db.pick_cn_anomaly(cn_map['id'])
-    results = [r for r in (db.run_cryptic_notes(n, cn_map, anomaly) for n in names) if r]
+    """Run Cryptic Notes for one or more characters and build the result.
+
+    Returns a list of embeds: solo = one embed; group = a header card plus one card per character.
+    Everyone in the group meets the same 1-3 anomalies.
+    """
+    anomalies = db.pick_cn_anomalies(cn_map['id'])
+    results = [r for r in (db.run_cryptic_notes(n, cn_map, anomalies) for n in names) if r]
     all_dead = bool(results) and all(r['died'] for r in results)
-    color = COLOR_ERROR if all_dead else COLOR_DEFAULT
     title = f"Cryptic Notes · {cn_map['name']}"
-    icons = config.CN_ICONS
-    anomaly_line = (small(f"Anomaly: {anomaly['name']}",
-                          icons['danger_full'] * anomaly['danger'] + icons['danger_empty'] * (5 - anomaly['danger']))
-                    if anomaly else "")
 
-    if len(results) == 1:  # solo run: the story is the main text
-        embed = make_embed(config.CN_EMOJI, title, anomaly_line, *_cn_outcome_blocks(results[0]), color=color)
+    if len(results) <= 1:  # solo run: the story is the main text
+        blocks = _cn_solo_blocks(results[0]) if results else ["Nobody could enter."]
+        embed = make_embed(config.CN_EMOJI, title, _cn_anomaly_line(anomalies), *blocks,
+                           color=COLOR_ERROR if all_dead else COLOR_DEFAULT)
         embed.description = embed.description[:4096]
-        return embed
+        return [embed]
 
-    def group_blocks(story_limit=None):
-        blocks = [anomaly_line]
-        for r in results:  # one section per character
-            icon = icons['died'] if r['died'] else icons['survived']
-            story, *rest = _cn_outcome_blocks(r, story_limit, group=True)
-            blocks.append(f"{icon} **{r['character']}** · {CN_SHORT[r['outcome']]}\n{story}")
-            blocks.extend(rest)
-        return blocks
-
-    embed = make_embed(config.CN_EMOJI, title, *group_blocks(), color=color)
-    for limit in (400, 200, 80):  # a group of 4 with long stories: shorten the stories to fit one message
-        if len(embed.description) <= 4096:
-            break
-        embed.description = body(*group_blocks(limit))
-    embed.description = embed.description[:4096]
     survivors = sum(1 for r in results if not r['died'])
-    embed.set_footer(text=f"{survivors}/{len(results)} made it out")
-    return embed
+    header_lines = [_cn_anomaly_line(anomalies), small(f"{survivors}/{len(results)} made it out")]
+    header = make_embed(config.CN_EMOJI, title, "\n".join(line for line in header_lines if line),
+                        color=COLOR_ERROR if all_dead else COLOR_DEFAULT)
+    # Discord allows 6,000 characters across all cards of one message: shorten long stories if needed
+    for limit in (None, 500, 300, 150, 60):
+        cards = [_cn_card(r, limit) for r in results]
+        if _embeds_length([header] + cards) <= 5900:
+            break
+    for card in cards:
+        card.description = card.description[:4096]
+    return [header] + cards
 
 
 class CNGroupView(discord.ui.View):
@@ -676,7 +718,7 @@ class CNGroupView(discord.ui.View):
             return
         self.done = True
         self.stop()
-        await interaction.response.edit_message(content=None, embed=run_cn_group(self.cn_map, self.team()), view=None)
+        await interaction.response.edit_message(content=None, embeds=run_cn_group(self.cn_map, self.team()), view=None)
 
     async def answer(self, interaction, accept):
         mine = [n for n in self.pending() if self.owners[n] == interaction.user.id]
@@ -751,7 +793,7 @@ async def cn_match(interaction: discord.Interaction, location: str, character: s
 
     teammates = [t for t in (teammate1, teammate2, teammate3) if t][:config.CN_GROUP_MAX - 1]
     if not teammates:  # solo run
-        await interaction.response.send_message(embed=run_cn_group(cn_map, [leader['name']]))
+        await interaction.response.send_message(embeds=run_cn_group(cn_map, [leader['name']]))
         return
 
     members, owners = [leader['name']], {leader['name']: interaction.user.id}
@@ -775,7 +817,7 @@ async def cn_match(interaction: discord.Interaction, location: str, character: s
 
     view = CNGroupView(interaction.user.id, cn_map, members, owners)
     if not view.pending():  # all teammates belong to the leader
-        await interaction.response.send_message(embed=run_cn_group(cn_map, view.team()))
+        await interaction.response.send_message(embeds=run_cn_group(cn_map, view.team()))
         return
     invited = " ".join(sorted({f"<@{owners[n]}>" for n in view.pending()}))
     await interaction.response.send_message(content=f"{invited} you're invited to a Cryptic Notes match!",
@@ -963,6 +1005,8 @@ class MinigameView(discord.ui.View):
         self.item_name = item_name
         self.difficulty = result['difficulty']
         self.flee_message = result['flee_message'] or self.cfg['default_flee'].format(item=item_name)
+        # The original find stays visible as a quote at the top of the result
+        self.found_quote = quote(result.get('description') or result.get('message'))
         self.fail_message = result['fail_message'] or self.cfg['default_fail'].format(item=item_name)
         self.attempt_button.label = self.cfg['attempt_button']
         self.leave_button.label = self.cfg['leave_button']
@@ -1000,7 +1044,7 @@ class MinigameView(discord.ui.View):
             result_text = "No item obtained"
 
         xp_result = db.add_xp(self.character_name, xp_reward, self.game)
-        embed = make_embed(self.cfg['emoji'], title, roll_text, text,
+        embed = make_embed(self.cfg['emoji'], title, self.found_quote, roll_text, text,
                            small(result_text, f"+{xp_reward} XP"), _level_up_line(xp_result), color=color)
         _xp_footer(embed, xp_result)
         await self._finish(interaction, embed)
@@ -1010,7 +1054,7 @@ class MinigameView(discord.ui.View):
         xp_reward = config.MINIGAME_XP_LEAVE
         xp_result = db.add_xp(self.character_name, xp_reward, self.game)
         leave_text = self.cfg['leave_text'].format(name=self.character_name, item=self.item_name)
-        embed = make_embed(self.cfg['emoji'], self.cfg['leave_title'], leave_text, self.flee_message,
+        embed = make_embed(self.cfg['emoji'], self.cfg['leave_title'], self.found_quote, leave_text, self.flee_message,
                            small("No item obtained", f"+{xp_reward} XP"), _level_up_line(xp_result))
         _xp_footer(embed, xp_result)
         await self._finish(interaction, embed)

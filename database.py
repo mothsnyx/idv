@@ -1286,18 +1286,42 @@ class Database:
             conn.commit()
         return True, "Message deleted."
 
-    def pick_cn_anomaly(self, map_id):
-        """A random anomaly that can appear on this map (the whole group meets the same one), or None."""
+    def pick_cn_anomalies(self, map_id):
+        """The anomalies of one match (1-3 different ones, see CN_ANOMALY_COUNT_WEIGHTS), deadliest first.
+        The whole group meets the same ones. Empty list if the map has none."""
         with self._conn() as conn:
-            row = conn.execute(
+            rows = conn.execute(
                 "SELECT a.id, a.name, a.danger FROM cn_anomalies a JOIN cn_spawns s "
-                "ON s.kind = 'anomaly' AND s.entry_id = a.id WHERE s.map_id = ? ORDER BY RANDOM() LIMIT 1",
-                (map_id,)).fetchone()
-        return {'id': row[0], 'name': row[1], 'danger': row[2] or 1} if row else None
+                "ON s.kind = 'anomaly' AND s.entry_id = a.id WHERE s.map_id = ?", (map_id,)).fetchall()
+        available = [{'id': r[0], 'name': r[1], 'danger': r[2] or 1} for r in rows]
+        if not available:
+            return []
+        weights = getattr(config, 'CN_ANOMALY_COUNT_WEIGHTS', {1: 1})
+        count = min(random.choices(list(weights), weights=list(weights.values()))[0], len(available))
+        return sorted(random.sample(available, count), key=lambda a: -a['danger'])
+
+    def pick_cn_anomaly(self, map_id):
+        """One random anomaly of this map, or None (kept for older code)."""
+        anomalies = self.pick_cn_anomalies(map_id)
+        return anomalies[0] if anomalies else None
+
+    @staticmethod
+    def _anomaly_names(anomalies):
+        """['Wraith', 'Shade', 'Hag'] -> 'Wraith, Shade and Hag'."""
+        names = [a['name'] for a in anomalies]
+        return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " and " + names[-1] if names else ""
 
     @_serialize_writes
-    def run_cryptic_notes(self, name, cn_map, anomaly):
-        """One character's Cryptic Notes run. Returns a result dict, or None if the profile doesn't exist."""
+    def run_cryptic_notes(self, name, cn_map, anomalies):
+        """One character's Cryptic Notes run. Returns a result dict, or None if the profile doesn't exist.
+
+        anomalies: the list from pick_cn_anomalies() (a single anomaly dict or None also works).
+        Each anomaly rolls its own kill chance in random order; the first that hits is the killer.
+        """
+        if anomalies is None:
+            anomalies = []
+        elif isinstance(anomalies, dict):
+            anomalies = [anomalies]
         now = int(time.time())
         with self._conn() as conn:
             cursor = conn.cursor()
@@ -1310,11 +1334,13 @@ class Database:
             earlier_runs = cursor.fetchone()[0]
             exhausted = earlier_runs >= config.CN_EXHAUSTION_RUNS   # 4th run within the hour or later
 
-            # 1) Does the character die? The anomaly (by its danger) or something else (quota, fall, ...)
-            anomaly_kill = config.CN_DANGER_KILL_CHANCE.get(anomaly['danger'], 0) if anomaly else 0
+            # 1) Does the character die? Each anomaly rolls by its danger (first hit = killer),
+            #    then something else (quota, fall, ...)
+            killer = next((a for a in random.sample(anomalies, len(anomalies))
+                           if random.random() * 100 < config.CN_DANGER_KILL_CHANCE.get(a['danger'], 0)), None)
             other_death = cn_map['other_death_chance'] + (config.CN_EXHAUSTED_EXTRA_DEATH if exhausted else 0)
             items, reward = [], 0
-            if random.random() * 100 < anomaly_kill:
+            if killer:
                 outcome = 'death_anomaly'
             elif random.random() * 100 < other_death:
                 outcome = 'death_other'
@@ -1346,8 +1372,11 @@ class Database:
                            "ORDER BY RANDOM() LIMIT 1", (outcome, cn_map['id']))
             row = cursor.fetchone()
             text = row[0] if row else config.CN_OUTCOMES[outcome]
+            # {anomaly} = the killer, or else the deadliest anomaly present; {anomalies} = all of them
+            main_anomaly = killer or (anomalies[0] if anomalies else None)
             for key, value in {'{character}': stored, '{map}': cn_map['name'], '{count}': str(len(items)),
-                               '{anomaly}': anomaly['name'] if anomaly else 'unknown anomaly'}.items():
+                               '{anomaly}': main_anomaly['name'] if main_anomaly else 'unknown anomaly',
+                               '{anomalies}': self._anomaly_names(anomalies) or 'unknown anomaly'}.items():
                 text = text.replace(key, value)
 
             cursor.execute("INSERT INTO cn_runs (profile_name, map_id, outcome, created_at) VALUES (?, ?, ?, ?)",
@@ -1359,6 +1388,7 @@ class Database:
             'outcome': outcome,
             'died': outcome.startswith('death'),
             'message': text,
+            'killer': killer['name'] if killer else None,
             'items': items,
             'total_value': sum(i['sell_value'] for i in items),
             'reward': reward,

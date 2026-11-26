@@ -238,7 +238,9 @@ Anomalies and classics only appear on the maps that are ticked for them.</p>
     <div class="card-body">
         <p class="text-muted small">
             For every run the bot picks a random text for the result type, from the texts for that map or for both maps.
-            Placeholders: <code>{character}</code> <code>{map}</code> <code>{anomaly}</code> <code>{count}</code> (number of classics).
+            Placeholders: <code>{character}</code> <code>{map}</code> <code>{count}</code> (number of classics),
+            <code>{anomaly}</code> (the killer, or the deadliest anomaly present) and
+            <code>{anomalies}</code> (all anomalies of the match, e.g. "Wraith and Shade").
             The infirmary line is added automatically to deaths.
         </p>
         <form method="POST" action="{{ url_for('cn_save_message') }}" class="mb-4">
