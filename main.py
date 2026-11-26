@@ -95,6 +95,12 @@ def add_block(embed, block):
     return embed
 
 
+def rewards_block(heading, amounts):
+    """A result line with the amounts indented underneath, one per line:
+    'Escaped' / '⠀⠀🔍 1,000 Clues' / '⠀⠀🔔 2 Echoes'."""
+    return "\n".join([heading] + [f"⠀⠀{a}" for a in amounts if a])
+
+
 def make_embed(emoji, title, *blocks, color=None):
     return discord.Embed(title=f"{emoji}{TITLE_SEP}{title}", description=body(*blocks),
                          color=color or COLOR_DEFAULT)
@@ -509,8 +515,8 @@ async def match(interaction: discord.Interaction, name: str):
         await interaction.response.send_message(embed=error_embed(f"Profile **{name}** not found!"))
         return
     embed = make_embed(EMOJI['match'], f"{name}'s {result['role']} Match", result['message'],
-                       small(result['performance_text'], amount_text('main', result['main']),
-                             amount_text('premium', result['premium'])),
+                       rewards_block(result['performance_text'],
+                                     [amount_text('main', result['main']), amount_text('premium', result['premium'])]),
                        color=COLOR_ERROR)
     await interaction.response.send_message(embed=embed)
 
@@ -528,8 +534,9 @@ async def match_reward(interaction: discord.Interaction, name: str, count: app_c
     if not success:
         await interaction.response.send_message(embed=error_embed(message), ephemeral=True)
         return
-    embed = success_embed("Match Rewards Granted!", f"**{name}** received their match rewards!",
-                          small(amount_text('main', main_reward), amount_text('premium', premium_reward)))
+    embed = success_embed("Match Rewards Granted!",
+                          rewards_block(f"**{name}** received their match rewards!",
+                                        [amount_text('main', main_reward), amount_text('premium', premium_reward)]))
     await interaction.response.send_message(embed=embed)
 
 
@@ -566,10 +573,11 @@ def _cn_item_lines(result):
     return lines
 
 
-def _cn_value_line(result):
-    """'-# Worth 2,150 Clues · Survival bonus 2,000 Clues'"""
-    return small(f"Worth {amount_text('main', result['total_value'], bold=False)}",
-                 f"Survival bonus {amount_text('main', result['reward'], bold=False)}" if result['reward'] else "")
+def _cn_value_block(result, heading):
+    """'Made quota' with the classics' value and the survival bonus underneath, one per line."""
+    return rewards_block(heading, [
+        f"{amount_text('main', result['total_value'])} in classics",
+        f"{amount_text('main', result['reward'])} survival bonus" if result['reward'] else ""])
 
 
 def _cn_exhaustion_text(result):
@@ -582,16 +590,17 @@ def _cn_exhaustion_text(result):
     return text
 
 
-def _cn_outcome_blocks(r, story_limit=None):
-    """The blocks under one character: story, loot or death, exhaustion."""
+def _cn_outcome_blocks(r, story_limit=None, group=False):
+    """The blocks under one character: story, loot (+ rewards) or death, exhaustion."""
     story = r['message'] if not story_limit or len(r['message']) <= story_limit else r['message'][:story_limit] + "…"
     icons = config.CN_ICONS
     if r['died']:
-        outcome = f"{icons['died']} **{CN_SHORT[r['outcome']]}**\n{config.CN_RESPAWN_TEXT}"
-    else:
-        outcome = section(f"Classics found ({len(r['items'])})",
-                          _cn_item_lines(r) + [_cn_value_line(r)])
-    return [story, outcome, _cn_exhaustion_text(r)]
+        return [story, f"{icons['died']} **{CN_SHORT[r['outcome']]}**\n{config.CN_RESPAWN_TEXT}",
+                _cn_exhaustion_text(r)]
+    loot = section(f"Classics found ({len(r['items'])})", _cn_item_lines(r))
+    # In a group the outcome is already in the character's header line
+    rewards = _cn_value_block(r, "Rewards" if group else f"{icons['survived']} **{CN_SHORT[r['outcome']]}**")
+    return [story, loot, rewards, _cn_exhaustion_text(r)]
 
 
 def run_cn_group(cn_map, names):
@@ -615,7 +624,7 @@ def run_cn_group(cn_map, names):
         blocks = [anomaly_line]
         for r in results:  # one section per character
             icon = icons['died'] if r['died'] else icons['survived']
-            story, *rest = _cn_outcome_blocks(r, story_limit)
+            story, *rest = _cn_outcome_blocks(r, story_limit, group=True)
             blocks.append(f"{icon} **{r['character']}** · {CN_SHORT[r['outcome']]}\n{story}")
             blocks.extend(rest)
         return blocks
