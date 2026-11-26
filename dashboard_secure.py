@@ -438,9 +438,15 @@ def matches():
 def add_match_message():
     values = _match_form()
     if values:
+        role, level, text = values
+        # Every non-empty line is its own message, so several can be pasted at once
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
         try:
-            execute("INSERT INTO match_messages (role, performance_level, message) VALUES (?, ?, ?)", values)
-            flash(f'{values[0]} message for result {values[1]} added!', 'success')
+            for line in lines:
+                execute("INSERT INTO match_messages (role, performance_level, message) VALUES (?, ?, ?)",
+                        (role, level, line))
+            what = 'message' if len(lines) == 1 else f'{len(lines)} messages'
+            flash(f'{role} {what} for result {level} added!', 'success')
         except Exception as e:
             flash(f'Error: {e}', 'danger')
     return redirect(url_for('matches'))
