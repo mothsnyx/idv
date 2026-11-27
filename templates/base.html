@@ -242,6 +242,7 @@
                         </ul>
                     </li>
                     <li class="nav-item"><a class="nav-link {% if endpoint == 'embeds' %}active{% endif %}" href="{{ url_for('embeds') }}">Embeds</a></li>
+                    <li class="nav-item"><a class="nav-link {% if endpoint == 'sticky_messages' %}active{% endif %}" href="{{ url_for('sticky_messages') }}">Sticky Messages</a></li>
                     <li class="nav-item"><a class="nav-link {% if endpoint == 'reaction_roles' %}active{% endif %}" href="{{ url_for('reaction_roles') }}">Reaction Roles</a></li>
                 </ul>
                 <a class="nav-link ms-lg-auto" href="{{ url_for('logout') }}" title="Log out"><i class="bi bi-box-arrow-right"></i> Log out</a>

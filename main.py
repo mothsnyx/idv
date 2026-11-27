@@ -210,7 +210,7 @@ async def resolve_channel(channel_id):
 async def create_profile(interaction: discord.Interaction, name: str, role: app_commands.Choice[str]):
     success, message = db.create_profile(name, role.value, interaction.user.id)
     if success:
-        embed = success_embed("Profile Created!", f"Successfully created profile for **{name}** as **{role.value}**!")
+        embed = success_embed("Profile Created!", f"Successfully created profile for **{name}** as a **{role.value}**!")
     else:
         embed = error_embed(message)
     await interaction.response.send_message(embed=embed)
@@ -1668,6 +1668,87 @@ async def release_character(interaction: discord.Interaction, character: str):
 @bot.event
 async def on_ready():
     print(f'{bot.user} has connected to Discord!')
+    if not getattr(bot, 'stickies_checked', False):  # on_ready can fire again after reconnects
+        bot.stickies_checked = True
+        for sticky in db.get_stickies():  # messages sent while the bot was offline
+            schedule_sticky(int(sticky['channel_id']), delay=0)
+
+
+# ==================== STICKY MESSAGES ====================
+
+_sticky_timers = {}   # channel_id -> waiting task (restarted by every new message)
+_sticky_locks = {}    # channel_id -> lock, so a channel is never reposted twice at once
+
+
+def _sticky_kwargs(sticky):
+    """content / embed for channel.send(); None if there's nothing left to post."""
+    kwargs = {}
+    if sticky['content']:
+        kwargs['content'] = sticky['content']
+    if sticky['embed_id']:
+        data = db.get_sticky_embed(sticky['embed_id'])
+        if data:
+            kwargs['embed'] = build_embed(data)
+    return kwargs or None
+
+
+async def repost_sticky(channel_id, force=False):
+    """Move the sticky to the bottom of the channel (unless it's already the last message).
+    Returns an error text or None."""
+    lock = _sticky_locks.setdefault(channel_id, asyncio.Lock())
+    async with lock:
+        sticky = db.get_sticky(channel_id)
+        if not sticky:
+            return "No sticky message for this channel."
+        channel = await resolve_channel(channel_id)
+        if not channel:
+            return "Channel not found. Check the ID and that the bot can see the channel."
+        old_id = int(sticky['message_id']) if sticky['message_id'] else None
+        if not force and old_id and channel.last_message_id == old_id:
+            return None  # already at the bottom
+        kwargs = _sticky_kwargs(sticky)
+        if not kwargs:
+            return "The saved embed of this sticky was deleted. Choose another one or add text."
+        message = await channel.send(**kwargs, allowed_mentions=discord.AllowedMentions.none())
+        db.set_sticky_message(channel_id, message.id)
+        if old_id:
+            try:
+                await channel.get_partial_message(old_id).delete()
+            except discord.HTTPException:
+                pass  # already deleted by someone
+        return None
+
+
+def schedule_sticky(channel_id, delay=None):
+    """(Re)start the quiet timer of a channel; the sticky moves down when it runs out."""
+    old = _sticky_timers.get(channel_id)
+    if old and not old.done():
+        old.cancel()
+
+    async def wait_then_repost():
+        await asyncio.sleep(config.STICKY_DELAY_SECONDS if delay is None else delay)
+        _sticky_timers.pop(channel_id, None)
+        try:
+            # shield: a new message must not cancel a repost that is already happening
+            error = await asyncio.shield(repost_sticky(channel_id))
+            if error:
+                print(f"[STICKY] #{channel_id}: {error}")
+        except Exception as e:
+            print(f"[STICKY] #{channel_id}: {e}")
+
+    _sticky_timers[channel_id] = asyncio.create_task(wait_then_repost())
+
+
+@bot.event
+async def on_message(message):
+    if not message.guild:
+        return
+    sticky = db.get_sticky(message.channel.id)
+    if not sticky or str(message.id) == sticky['message_id']:
+        return  # no sticky here, or it's the sticky itself
+    # Even if the sticky's own message lands here before its id is saved, the repost
+    # sees it's already the last message and does nothing, so this can't loop.
+    schedule_sticky(message.channel.id)
 
 
 @bot.tree.command(name="testwelcome", description="[ADMIN] Test the welcome message system")
@@ -2019,6 +2100,43 @@ def api_refresh_roster():
         error = run_on_bot(refresh_roster(roles), timeout=60)
         if error:
             return jsonify({'status': 'error', 'message': error}), 400
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api.route('/sticky_post', methods=['POST'])
+def api_sticky_post():
+    """Post (or re-post) a channel's sticky right away, after it was saved on the dashboard."""
+    try:
+        channel_id = int((request.get_json(silent=True) or {}).get('channel_id'))
+        error = run_on_bot(repost_sticky(channel_id, force=True))
+        if error:
+            return jsonify({'status': 'error', 'message': error}), 400
+        return jsonify({'status': 'success'}), 200
+    except Exception as e:
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+@api.route('/sticky_remove', methods=['POST'])
+def api_sticky_remove():
+    """Delete the posted sticky of a removed sticky message."""
+    try:
+        data = request.get_json(silent=True) or {}
+        channel_id, message_id = int(data['channel_id']), data.get('message_id')
+
+        async def remove():
+            timer = _sticky_timers.pop(channel_id, None)
+            if timer:
+                timer.cancel()
+            channel = await resolve_channel(channel_id)
+            if channel and message_id:
+                try:
+                    await channel.get_partial_message(int(message_id)).delete()
+                except discord.NotFound:
+                    pass
+
+        run_on_bot(remove())
         return jsonify({'status': 'success'}), 200
     except Exception as e:
         return jsonify({'status': 'error', 'message': str(e)}), 500

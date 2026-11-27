@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+
+{% block title %}Sticky Messages{% endblock %}
+
+{% block content %}
+<h1><i class="bi bi-pin-angle-fill"></i> Sticky Messages</h1>
+<p class="lead">A sticky message stays at the bottom of its channel: when people write there, the bot moves it back down
+    after {{ delay }} seconds of quiet. One sticky per channel.</p>
+
+<div class="card mb-4">
+    <div class="card-header"><i class="bi bi-plus-circle"></i> Add or Replace a Sticky Message</div>
+    <div class="card-body">
+        <form method="POST" action="{{ url_for('save_sticky') }}">
+            <div class="row g-3">
+                <div class="col-md-4">
+                    <label class="form-label">Channel ID</label>
+                    <input type="text" name="channel_id" class="form-control" required inputmode="numeric" pattern="[0-9]+"
+                           placeholder="e.g. 1574169279601967184">
+                    <small class="text-muted">Right-click the channel → Copy Channel ID. A channel that already has a sticky gets the new one instead.</small>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Saved embed <small class="text-muted">(optional)</small></label>
+                    <select name="embed_id" class="form-select">
+                        <option value="">— no embed —</option>
+                        {% for id, name in embed_names.items() %}<option value="{{ id }}">{{ name }}</option>{% endfor %}
+                    </select>
+                    <small class="text-muted">Design it on the <a href="{{ url_for('embeds') }}">Embeds</a> page. Changes there show up the next time the sticky moves.</small>
+                </div>
+                <div class="col-md-4">
+                    <label class="form-label">Text <small class="text-muted">(optional, shown above the embed)</small></label>
+                    <textarea name="content" class="form-control" rows="3" maxlength="2000" placeholder="e.g. Please read the pinned rules before posting!"></textarea>
+                </div>
+            </div>
+            <div class="mt-3 text-end">
+                <button type="submit" class="btn btn-primary"><i class="bi bi-pin-angle"></i> Save and post</button>
+            </div>
+        </form>
+    </div>
+</div>
+
+<div class="card">
+    <div class="card-header"><i class="bi bi-list-ul"></i> Active Sticky Messages ({{ stickies|length }})</div>
+    <div class="card-body">
+        <div class="table-responsive">
+            <table class="table table-dark table-sm align-middle">
+                <thead><tr><th>Channel ID</th><th>Embed</th><th>Text</th><th class="text-end">Actions</th></tr></thead>
+                <tbody>
+                    {% for s in stickies %}
+                    <tr>
+                        <td><code>{{ s.channel_id }}</code></td>
+                        <td>
+                            {% if s.embed_id and embed_names.get(s.embed_id) %}{{ embed_names[s.embed_id] }}
+                            {% elif s.embed_id %}<span class="text-danger">deleted embed</span>
+                            {% else %}<span class="text-muted">—</span>{% endif %}
+                        </td>
+                        <td style="white-space: pre-wrap;">{{ s.content or '' }}</td>
+                        <td class="text-end text-nowrap">
+                            <form method="POST" action="{{ url_for('repost_sticky', channel_id=s.channel_id) }}" style="display:inline;">
+                                <button class="btn btn-sm btn-outline-primary" title="Post it again now (e.g. after editing the embed)"><i class="bi bi-arrow-repeat"></i> Repost</button>
+                            </form>
+                            <form method="POST" action="{{ url_for('delete_sticky', channel_id=s.channel_id) }}" style="display:inline;"
+                                  onsubmit="return confirm('Remove this sticky message? Its message in Discord is deleted too.');">
+                                <button class="btn btn-sm btn-outline-danger" title="Remove"><i class="bi bi-trash"></i></button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr><td colspan="4" class="text-muted p-3">No sticky messages yet.</td></tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+</div>
+{% endblock %}

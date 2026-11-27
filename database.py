@@ -415,6 +415,15 @@ class Database:
                     UNIQUE(message_id, emoji)
                 )''')
 
+            # Sticky messages: one per channel, reposted at the bottom after new messages
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS sticky_messages (
+                    channel_id TEXT PRIMARY KEY,
+                    content TEXT,                      -- plain text (optional)
+                    embed_id INTEGER,                  -- saved embed from the Embeds page (optional)
+                    message_id TEXT                    -- the sticky currently posted in Discord
+                )''')
+
             conn.commit()
 
     def populate_initial_data(self):
@@ -1444,6 +1453,55 @@ class Database:
             conn.executemany("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
                              [(prefix + key, value) for key, value in values.items()])
             conn.commit()
+
+    # ==================== STICKY MESSAGES ====================
+
+    _STICKY_FIELDS = ("channel_id", "content", "embed_id", "message_id")
+
+    def get_stickies(self):
+        with self._conn() as conn:
+            rows = conn.execute("SELECT " + ", ".join(self._STICKY_FIELDS) + " FROM sticky_messages").fetchall()
+        return [dict(zip(self._STICKY_FIELDS, r)) for r in rows]
+
+    def get_sticky(self, channel_id):
+        with self._conn() as conn:
+            row = conn.execute("SELECT " + ", ".join(self._STICKY_FIELDS) + " FROM sticky_messages "
+                               "WHERE channel_id = ?", (str(channel_id),)).fetchone()
+        return dict(zip(self._STICKY_FIELDS, row)) if row else None
+
+    def get_sticky_embed(self, embed_id):
+        """The saved embed a sticky uses, as a dict for building the Discord embed (None if deleted)."""
+        with self._conn() as conn:
+            row = conn.execute("SELECT title, description, color, footer_text, image_url, thumbnail_url "
+                               "FROM embeds WHERE id = ?", (embed_id,)).fetchone()
+        keys = ("title", "description", "color", "footer_text", "image_url", "thumbnail_url")
+        return dict(zip(keys, row)) if row else None
+
+    @_serialize_writes
+    def set_sticky(self, channel_id, content, embed_id):
+        """Create or replace the sticky of a channel. Keeps the posted message id so the old one can be removed."""
+        with self._conn() as conn:
+            conn.execute("INSERT INTO sticky_messages (channel_id, content, embed_id) VALUES (?, ?, ?) "
+                         "ON CONFLICT(channel_id) DO UPDATE SET content = excluded.content, embed_id = excluded.embed_id",
+                         (str(channel_id), content, embed_id))
+            conn.commit()
+
+    @_serialize_writes
+    def set_sticky_message(self, channel_id, message_id):
+        with self._conn() as conn:
+            conn.execute("UPDATE sticky_messages SET message_id = ? WHERE channel_id = ?",
+                         (str(message_id) if message_id else None, str(channel_id)))
+            conn.commit()
+
+    @_serialize_writes
+    def delete_sticky(self, channel_id):
+        """Remove a sticky. Returns the removed row (to delete its message in Discord) or None."""
+        sticky = self.get_sticky(channel_id)
+        if sticky:
+            with self._conn() as conn:
+                conn.execute("DELETE FROM sticky_messages WHERE channel_id = ?", (str(channel_id),))
+                conn.commit()
+        return sticky
 
     # ==================== RESERVATIONS ====================
 

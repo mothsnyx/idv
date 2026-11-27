@@ -96,6 +96,12 @@ MATCH_RESULT_TEXT = {
 # /matchreward: reward per escape/elimination -> (main, premium)
 MATCH_REWARD_PER_COUNT = (5000, 1)
 
+# ==================== STICKY MESSAGES ====================
+
+# Seconds of quiet in a channel before its sticky is moved back to the bottom
+# (so a busy chat moves it once instead of after every message)
+STICKY_DELAY_SECONDS = 5
+
 # ==================== RESERVATIONS & ROSTER ====================
 
 def _id_list(value):

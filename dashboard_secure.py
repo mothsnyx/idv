@@ -1105,6 +1105,76 @@ def update_embed_message(embed_id):
     return redirect(url_for('embeds'))
 
 
+# ==================== STICKY MESSAGES ====================
+
+def _post_sticky(channel_id):
+    """Ask the bot to post the sticky now. Problems only produce a warning (the bot posts it later)."""
+    try:
+        response = bot_api('sticky_post', json={'channel_id': channel_id})
+        if response.status_code == 200:
+            return True
+        flash(f"Saved, but it couldn't be posted: {response.json().get('message')}", 'warning')
+    except Exception as e:
+        flash(f"Saved, but the bot didn't respond (is it running?). It's posted when the bot starts. ({e})",
+              'warning')
+    return False
+
+
+@app.route('/sticky')
+@login_required
+def sticky_messages():
+    embed_names = {row[0]: row[1] for row in query("SELECT id, name FROM embeds ORDER BY name")}
+    return render_template('sticky.html', stickies=db.get_stickies(), embed_names=embed_names,
+                           delay=config.STICKY_DELAY_SECONDS)
+
+
+@app.route('/sticky/save', methods=['POST'])
+@login_required
+def save_sticky():
+    channel_id = (request.form.get('channel_id') or '').strip()
+    content = (request.form.get('content') or '').strip() or None
+    embed_id = (request.form.get('embed_id') or '').strip()
+    embed_id = int(embed_id) if embed_id.isdigit() else None
+    if not channel_id.isdigit():
+        flash('The channel ID must be a number (right-click the channel → Copy Channel ID)!', 'danger')
+    elif not content and not embed_id:
+        flash('Add some text, choose an embed, or both!', 'danger')
+    elif content and len(content) > 2000:
+        flash('The text can be at most 2000 characters (a Discord limit).', 'danger')
+    else:
+        db.set_sticky(channel_id, content, embed_id)
+        if _post_sticky(channel_id):
+            flash('Sticky message saved and posted!', 'success')
+    return redirect(url_for('sticky_messages'))
+
+
+@app.route('/sticky/repost/<channel_id>', methods=['POST'])
+@login_required
+def repost_sticky(channel_id):
+    if _post_sticky(channel_id):
+        flash('Sticky message posted again!', 'success')
+    return redirect(url_for('sticky_messages'))
+
+
+@app.route('/sticky/delete/<channel_id>', methods=['POST'])
+@login_required
+def delete_sticky(channel_id):
+    sticky = db.delete_sticky(channel_id)
+    if not sticky:
+        flash('Sticky message not found!', 'danger')
+        return redirect(url_for('sticky_messages'))
+    try:
+        response = bot_api('sticky_remove', json={'channel_id': channel_id, 'message_id': sticky['message_id']})
+        if response.status_code == 200:
+            flash('Sticky message removed!', 'success')
+        else:
+            flash(f"Removed, but the message in Discord wasn't deleted: {response.json().get('message')}", 'warning')
+    except Exception as e:
+        flash(f"Removed, but the bot didn't respond, so please delete the message in Discord yourself. ({e})",
+              'warning')
+    return redirect(url_for('sticky_messages'))
+
+
 # ==================== REACTION ROLES ====================
 
 def _sync_reactions(message_id):
