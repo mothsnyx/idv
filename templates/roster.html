@@ -244,6 +244,10 @@
                         </td>
                         <td class="text-end text-nowrap">
                             {% if c.status != 'taken' %}
+                            <button class="btn btn-sm btn-outline-info" data-bs-toggle="modal" data-bs-target="#reserveModal{{ c.id }}"
+                                    title="{{ 'Change who reserved it or until when' if c.status == 'reserved' else 'Reserve for someone with your own end date' }}">
+                                <i class="bi bi-calendar-plus"></i> {{ 'Edit reservation' if c.status == 'reserved' else 'Reserve' }}
+                            </button>
                             <button class="btn btn-sm btn-outline-success" data-bs-toggle="modal" data-bs-target="#takenModal{{ c.id }}" title="Submission approved: mark as taken">
                                 <i class="bi bi-check-lg"></i> Taken
                             </button>
@@ -310,6 +314,43 @@
 </div>
 
 {% if c.status != 'taken' %}
+<div class="modal fade" id="reserveModal{{ c.id }}" tabindex="-1">
+    <div class="modal-dialog">
+        <div class="modal-content">
+            <div class="modal-header">
+                <h5 class="modal-title">{{ 'Edit reservation for' if c.status == 'reserved' else 'Reserve' }} {{ c.name }}</h5>
+                <button type="button" class="btn-close" data-bs-dismiss="modal"></button>
+            </div>
+            <form method="POST" action="{{ url_for('roster_reserve', character_id=c.id) }}">
+                <div class="modal-body">
+                    <p class="text-muted small mb-3">
+                        Works like an approved <code>/reserve</code>: they get the "ends soon" reminder with the Extend button and the expiry ping.
+                        {% if c.status == 'reserved' %}Saving replaces the current reservation.{% else %}An open request for this character is cancelled.{% endif %}
+                    </p>
+                    <div class="mb-3">
+                        <label class="form-label">Discord user ID</label>
+                        <input type="text" name="player_id" class="form-control" required inputmode="numeric" pattern="[0-9]+"
+                               value="{{ c.player_id or '' }}" placeholder="e.g. 790588177240555561">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Name <small class="text-muted">(optional, filled in automatically from Discord)</small></label>
+                        <input type="text" name="player_name" class="form-control" value="{{ c.player_name or '' }}" placeholder="e.g. Lark">
+                    </div>
+                    <div class="mb-3">
+                        <label class="form-label">Reserved until</label>
+                        <input type="datetime-local" name="expires_at" class="form-control" required
+                               value="{{ end_inputs.get(c.id, default_end) }}">
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Cancel</button>
+                    <button type="submit" class="btn btn-info">Save reservation</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</div>
+
 <div class="modal fade" id="takenModal{{ c.id }}" tabindex="-1">
     <div class="modal-dialog">
         <div class="modal-content">

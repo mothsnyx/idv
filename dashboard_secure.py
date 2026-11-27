@@ -725,8 +725,13 @@ def roster_page(role_slug):
     all_characters = db.get_roster()
     characters = [c for c in all_characters if c['role'] == role]
     counts = {status: sum(1 for c in characters if c['status'] == status) for status in ('free', 'reserved', 'taken')}
+    raw_end_dates = db.get_reservation_end_dates()
     end_dates = {roster_id: datetime.datetime.fromtimestamp(ts).strftime('%d %b %Y, %H:%M')
-                 for roster_id, ts in db.get_reservation_end_dates().items()}
+                 for roster_id, ts in raw_end_dates.items()}
+    # Values for the date picker in the Reserve form (current end date, or the normal length from now)
+    end_inputs = {roster_id: datetime.datetime.fromtimestamp(ts).strftime('%Y-%m-%dT%H:%M')
+                  for roster_id, ts in raw_end_dates.items()}
+    default_end = (datetime.datetime.now() + datetime.timedelta(days=config.RESERVATION_DAYS)).strftime('%Y-%m-%dT%H:%M')
     names = {c['id']: c['display'] for c in all_characters}
     # For the live preview: Discord shows real mentions, the preview shows "@Name"
     preview_characters = [{'display': c['display'], 'name': c['name'], 'title': c['title'] or '',
@@ -734,7 +739,8 @@ def roster_page(role_slug):
                            'player': ('@' + (c['player_name'] or c['player_id'])) if c['player_id'] else ''}
                           for c in characters]
     return render_template('roster.html', role=role, characters=characters, all_characters=all_characters,
-                           counts=counts, end_dates=end_dates, names=names,
+                           counts=counts, end_dates=end_dates, end_inputs=end_inputs, default_end=default_end,
+                           names=names,
                            layout=roster_format.get_layout(db, role), preview_characters=preview_characters,
                            indent=roster_format.INDENT, limits=roster_format.LIMITS)
 
@@ -808,6 +814,19 @@ def roster_mark_taken(character_id):
         return _back_to_roster()
     return _roster_result(*db.set_roster_taken(character_id, player_id or None,
                                                (request.form.get('player_name') or '').strip() or None))
+
+
+@app.route('/roster/reserve/<int:character_id>', methods=['POST'])
+@login_required
+def roster_reserve(character_id):
+    try:  # <input type="datetime-local"> sends e.g. 2026-12-10T18:00 (the Pi's local time)
+        until = datetime.datetime.strptime(request.form.get('expires_at') or '', '%Y-%m-%dT%H:%M')
+    except ValueError:
+        flash('Please choose a valid end date!', 'danger')
+        return _back_to_roster()
+    return _roster_result(*db.set_roster_reserved(character_id, request.form.get('player_id'),
+                                                  (request.form.get('player_name') or '').strip() or None,
+                                                  int(until.timestamp())))
 
 
 @app.route('/roster/release/<int:character_id>', methods=['POST'])

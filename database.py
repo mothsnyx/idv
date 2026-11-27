@@ -1,3 +1,4 @@
+import datetime
 import sqlite3
 import random
 import threading
@@ -1910,6 +1911,42 @@ class Database:
                            f"AND status = 'pending'", ids)
             conn.commit()
         return True, f"{character['display']} is now taken!"
+
+    @_serialize_writes
+    def set_roster_reserved(self, character_id, player_id, player_name, expires_at, staff_id=None):
+        """Staff reserve a character from the dashboard with their own end date.
+
+        Replaces any reservation or open request the character already has, so it also
+        works for changing the end date or restoring a deleted reservation.
+        """
+        character = self.get_roster_character(character_id)
+        if not character:
+            return False, "Character not found!"
+        if character['status'] == 'taken':
+            return False, f"{character['display']} is taken. Release it first if it should be reserved instead."
+        player = str(player_id or '').strip()
+        if not player.isdigit():
+            return False, "Please enter the Discord user ID (a number)."
+        now = int(time.time())
+        if expires_at <= now:
+            return False, "The end date has to be in the future."
+        if not player_name and player == character['player_id']:
+            player_name = character['player_name']
+        with self._conn() as conn:
+            cursor = conn.cursor()
+            self._cancel_character_reservations(cursor, character_id)
+            cursor.execute(
+                "INSERT INTO reservations (guild_id, channel_id, user_id, title, created_at, expires_at, active, "
+                "notified, status, roster_id, player_name, decided_by) "
+                "VALUES (?, ?, ?, ?, ?, ?, 1, 0, 'active', ?, ?, ?)",
+                (str(config.GUILD_ID), str(config.RESERVE_CHANNEL_ID), player, character['display'], now,
+                 int(expires_at), character_id, player_name, str(staff_id) if staff_id else None))
+            cursor.execute("UPDATE roster SET status = 'reserved', player_id = ?, player_name = ? WHERE id = ?",
+                           (player, player_name, character_id))
+            self._sync_linked(cursor, character_id)
+            conn.commit()
+        until = datetime.datetime.fromtimestamp(expires_at).strftime('%d %b %Y, %H:%M')
+        return True, f"{character['display']} is reserved until {until}!"
 
     @_serialize_writes
     def delete_roster_character(self, character_id):
